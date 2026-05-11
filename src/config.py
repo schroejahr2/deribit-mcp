@@ -43,11 +43,6 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
-    # CallMeBot (for Telegram calls with TTS)
-    callmebot_username: str = ""  # Telegram username (with @) or phone number
-    callmebot_default_lang: str = "en-US-Standard-B"  # TTS voice/language
-    callmebot_repeat_count: int = 1  # Number of times to repeat the message
-
     # Alert settings
     alert_check_interval: float = 1.0
     max_alerts: int = 100

@@ -16,8 +16,6 @@
 >
 > 🧠 **Tell Opus your strategy. Walk away. It runs the book.**
 >
-> 📞 **Telegram messages or phone calls when things get serious.**
->
 > 📰 **Pipe your own news, signals, or regime models into the session via webhook.**
 >
 > 🖥️ **Watch health, positions, alerts, decisions, trades, news, and outbox state in a browser dashboard.**
@@ -460,10 +458,6 @@ Telegram for the human user, outbox for the agent wakeup pipeline:
 |-----|---------|
 | `TELEGRAM_BOT_TOKEN` | Bot token for startup heartbeat + alerts with `notification_channel="telegram"` |
 | `TELEGRAM_CHAT_ID` | Where to deliver |
-| `CALLMEBOT_USERNAME` | Optional — phone call alerts via `notification_channel="telegram_call"` |
-| `CALLMEBOT_DEFAULT_LANG` | TTS voice/language used when a call alert does not override `lang` |
-| `CALLMEBOT_REPEAT_COUNT` | Number of times CallMeBot repeats the message |
-
 ### Market streams
 
 | Var | Default | Purpose |
@@ -632,26 +626,6 @@ docker exec deribit-mcp sqlite3 'file:/data/deribit.db?mode=ro' \
   "SELECT consumer_id,event_id,delivered_at,acked_at,attempts \
    FROM event_deliveries ORDER BY delivered_at DESC LIMIT 5"
 
-# Trigger a real Telegram call smoke (requires CALLMEBOT_USERNAME and restart)
-docker exec deribit-mcp python3 -c "
-import asyncio
-from src.notifications import NotificationManager
-
-async def main():
-    mgr = NotificationManager()
-    if 'telegram_call' not in mgr.channels:
-        raise SystemExit('telegram_call channel is not configured')
-    ok = await mgr.send_notification(
-        'telegram_call',
-        'Deribit MCP call smoke',
-        lang='en-US-Standard-B',
-        rpt=1,
-    )
-    print('sent' if ok else 'failed')
-
-asyncio.run(main())
-"
-
 # Trigger a synthetic outbox event (server-side, useful for sidecar tests)
 docker exec deribit-mcp python3 -c "
 import asyncio
@@ -696,8 +670,8 @@ src/
 ├── event_outbox.py      # Outbox repo, severity mapping, payload allowlist,
 │                        # consumer lifecycle, claim/ack/heartbeat/reaper
 ├── events_api.py        # FastAPI routes for /events/*
-├── notifications.py     # TelegramChannel, TelegramCallChannel,
-│                        # OutboxNotificationChannel, NotificationManager
+├── notifications.py     # TelegramChannel, OutboxNotificationChannel,
+│                        # NotificationManager
 ├── market_streams.py    # WS-cached order books, trade tape, liquidations
 ├── scheduler.py         # TimeAlertScheduler asyncio loop
 ├── lifespan.py          # combined_lifespan, environment fail-fast,

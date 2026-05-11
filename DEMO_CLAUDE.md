@@ -182,7 +182,7 @@ Alerts replace external watcher daemons and log polling. Architecture:
 - The `deribit-alert` channel-plugin (running in Claude Code) streams outbox events into the active Claude session as `<channel source="deribit-alert" event_type="..." severity="..." alert_id="..." instrument="...">` events.
 - Each new event wakes Claude up in the same session — no separate Monitor needed.
 
-`notification_channel` options: `console`, `outbox`, `telegram`, `telegram_call`. Use **`outbox`** for Claude-session-injection; **`telegram`** for user-facing notifications.
+`notification_channel` options: `console`, `outbox`, `telegram`. Use **`outbox`** for Claude-session-injection; **`telegram`** for user-facing notifications.
 
 Each alert's `message` should embed: rationale, linked `decision_id`, and exact follow-up action expected on fire.
 

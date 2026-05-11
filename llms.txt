@@ -41,7 +41,6 @@ missing, stop and instruct them how to get it.
 | A Deribit **testnet** account | https://test.deribit.com — sign up, request testnet funds in BTC / ETH / USDC |
 | Deribit testnet **API key + secret** | https://test.deribit.com → Settings → API → New API key |
 | (Optional) Telegram bot token + chat ID | Talk to `@BotFather` on Telegram for a token; chat ID via `@userinfobot` |
-| (Optional) CallMeBot username | https://callmebot.com — for phone-call alerts |
 | A host with a stable IP/hostname reachable from the MCP client | LAN, Tailscale, Wireguard, etc. |
 | Their MCP client of choice (Claude Code session, MCP gateway, …) | — |
 
@@ -107,7 +106,6 @@ table; **do not put values in yourself.**
 | `DERIBIT_EVENT_ADMIN_TOKEN` | hex from step 2 (#2) | |
 | `TELEGRAM_BOT_TOKEN` | from @BotFather | Optional — leave blank to disable Telegram channel |
 | `TELEGRAM_CHAT_ID` | from @userinfobot | Optional |
-| `CALLMEBOT_USERNAME` | from callmebot.com | Optional — phone calls |
 | `DERIBIT_MCP_IMAGE` | `ghcr.io/schroejahr2/deribit-mcp:latest` | Published container image used by Compose |
 
 Sanity check:

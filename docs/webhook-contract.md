@@ -74,7 +74,7 @@ Tailnet interface.
 | `model` | string | no | Producer model attribution. |
 | `status` | string | no | `processed` (default) or `failed`. Use `failed` for ingest errors you want to record but not act on. |
 | `error` | string | no | When `status="failed"`, free-form description. |
-| `notification_channel` | string | no | `outbox` (default), `telegram`, `console`, `telegram_call`. |
+| `notification_channel` | string | no | `outbox` (default), `telegram`, `console`. |
 | `push` | bool | no | `true` (default). Set `false` to persist without pushing. |
 
 ---

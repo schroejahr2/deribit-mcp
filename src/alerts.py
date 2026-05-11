@@ -271,9 +271,7 @@ class AlertManager:
         if alert.message:
             message = alert.message
         else:
-            # Check if this is a call notification to create TTS-friendly message
-            is_call = alert.notification_channel == "telegram_call"
-            message = self._build_alert_message(alert, current_price, is_call)
+            message = self._build_alert_message(alert, current_price)
 
         # Send notification
         try:
@@ -316,15 +314,12 @@ class AlertManager:
         if self.repo:
             await self.repo.mark_triggered(alert)
 
-    def _build_alert_message(
-        self, alert: PriceAlert, current_price: float, is_call: bool = False
-    ) -> str:
+    def _build_alert_message(self, alert: PriceAlert, current_price: float) -> str:
         """Build a default alert message.
 
         Args:
             alert: The alert being triggered
             current_price: Current price that triggered the alert
-            is_call: If True, create a shorter TTS-friendly message
         """
         condition_text = {
             AlertCondition.ABOVE: "is above",
@@ -337,37 +332,20 @@ class AlertManager:
 
         condition = condition_text.get(alert.condition, alert.condition.value)
 
-        # Create shorter, voice-friendly message for calls
-        if is_call:
-            # Remove instrument suffix for cleaner speech
-            instrument_name = alert.instrument.replace("-PERPETUAL", "").replace("-", " ")
-
-            if alert.condition == AlertCondition.PERCENTAGE_CHANGE:
-                message = (
-                    f"Alert! {instrument_name} {condition} {alert.threshold} percent. "
-                    f"Current price is {current_price:,.0f} dollars."
-                )
-            else:
-                message = (
-                    f"Alert! {instrument_name} {condition} {alert.threshold:,.0f} dollars. "
-                    f"Current price is {current_price:,.0f} dollars."
-                )
+        if alert.condition == AlertCondition.PERCENTAGE_CHANGE:
+            message = (
+                f"🚨 PRICE ALERT\n\n"
+                f"{alert.instrument} {condition} {alert.threshold}%\n"
+                f"Current Price: ${current_price:,.2f}\n"
+                f"Triggered: {alert.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         else:
-            # Standard detailed message for text notifications
-            if alert.condition == AlertCondition.PERCENTAGE_CHANGE:
-                message = (
-                    f"🚨 PRICE ALERT\n\n"
-                    f"{alert.instrument} {condition} {alert.threshold}%\n"
-                    f"Current Price: ${current_price:,.2f}\n"
-                    f"Triggered: {alert.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            else:
-                message = (
-                    f"🚨 PRICE ALERT\n\n"
-                    f"{alert.instrument} {condition} ${alert.threshold:,.2f}\n"
-                    f"Current Price: ${current_price:,.2f}\n"
-                    f"Triggered: {alert.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+            message = (
+                f"🚨 PRICE ALERT\n\n"
+                f"{alert.instrument} {condition} ${alert.threshold:,.2f}\n"
+                f"Current Price: ${current_price:,.2f}\n"
+                f"Triggered: {alert.triggered_at.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
         return message
 
