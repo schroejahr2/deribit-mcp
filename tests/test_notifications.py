@@ -54,6 +54,7 @@ class FakeCallMeBotResponse:
 
 class CapturingAsyncClient:
     instances = []
+    response = FakeCallMeBotResponse()
 
     def __init__(self, *, timeout):
         self.timeout = timeout
@@ -68,12 +69,13 @@ class CapturingAsyncClient:
 
     async def get(self, url, *, params):
         self.requests.append((url, params))
-        return FakeCallMeBotResponse()
+        return self.response
 
 
 @pytest.mark.asyncio
 async def test_telegram_call_channel_posts_to_callmebot(monkeypatch):
     CapturingAsyncClient.instances = []
+    CapturingAsyncClient.response = FakeCallMeBotResponse()
     monkeypatch.setattr("src.notifications.httpx.AsyncClient", CapturingAsyncClient)
     channel = TelegramCallChannel(
         username="demo-user",
@@ -102,6 +104,7 @@ async def test_telegram_call_channel_posts_to_callmebot(monkeypatch):
 @pytest.mark.asyncio
 async def test_telegram_call_channel_truncates_tts_message(monkeypatch):
     CapturingAsyncClient.instances = []
+    CapturingAsyncClient.response = FakeCallMeBotResponse()
     monkeypatch.setattr("src.notifications.httpx.AsyncClient", CapturingAsyncClient)
     channel = TelegramCallChannel(username="demo-user")
 
@@ -111,3 +114,20 @@ async def test_telegram_call_channel_truncates_tts_message(monkeypatch):
     _, params = CapturingAsyncClient.instances[0].requests[0]
     assert len(params["text"]) == 256
     assert params["text"].endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_telegram_call_channel_treats_spam_response_as_failure(monkeypatch):
+    CapturingAsyncClient.instances = []
+    CapturingAsyncClient.response = FakeCallMeBotResponse(
+        text=(
+            "Someone reported CallMeBot as spammer, please add "
+            "@CallMeBot_API16 in your Telegram contacts."
+        )
+    )
+    monkeypatch.setattr("src.notifications.httpx.AsyncClient", CapturingAsyncClient)
+    channel = TelegramCallChannel(username="demo-user")
+
+    sent = await channel.send("Deribit MCP call smoke")
+
+    assert sent is False

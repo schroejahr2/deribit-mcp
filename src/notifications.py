@@ -31,6 +31,24 @@ def validate_channel_name(channel: str) -> None:
         )
 
 
+def _callmebot_response_is_success(text: str) -> bool:
+    """CallMeBot sometimes returns API errors with HTTP 200."""
+    normalized = text.lower()
+    failure_fragments = (
+        "error",
+        "spam",
+        "spammer",
+        "not authorized",
+        "not allowed",
+        "not found",
+        "does not exist",
+        "invalid",
+        "failed",
+        "disabled",
+    )
+    return not any(fragment in normalized for fragment in failure_fragments)
+
+
 class NotificationChannel(ABC):
     """Abstract base class for notification channels.
 
@@ -131,14 +149,16 @@ class TelegramCallChannel(NotificationChannel):
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(self.api_url, params=params)
 
-                if response.status_code == 200:
+                if response.status_code == 200 and _callmebot_response_is_success(response.text):
                     logger.info(f"Successfully initiated call to {self.username}")
                     return True
-                else:
-                    logger.error(
-                        f"CallMeBot API returned status {response.status_code}: {response.text}"
-                    )
-                    return False
+
+                logger.error(
+                    "CallMeBot API returned status %s: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                return False
 
         except Exception as e:
             logger.error(f"Failed to initiate Telegram call: {e}")
