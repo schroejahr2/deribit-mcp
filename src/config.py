@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     deribit_orderbook_diff_retention_seconds: int = 300
     deribit_orderbook_idle_unsubscribe_seconds: int = 300
     deribit_liquidation_buffer_size: int = 1000
+    deribit_ws_max_active_channels: int = 450
 
     # Logging
     log_level: str = "INFO"
@@ -90,6 +91,8 @@ class Settings(BaseSettings):
             raise ValueError("DERIBIT_ORDERBOOK_IDLE_UNSUBSCRIBE_SECONDS must be > 0")
         if self.deribit_liquidation_buffer_size <= 0:
             raise ValueError("DERIBIT_LIQUIDATION_BUFFER_SIZE must be > 0")
+        if not 1 <= self.deribit_ws_max_active_channels <= 500:
+            raise ValueError("DERIBIT_WS_MAX_ACTIVE_CHANNELS must be between 1 and 500")
 
     @property
     def deribit_ws_url(self) -> str:

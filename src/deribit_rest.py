@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
@@ -15,6 +16,17 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_ERROR_CODE = 10028
 MAX_RETRIES = 3
 MAX_BACKOFF_SECONDS = 30.0
+PROJECT_URL = "https://github.com/schroejahr2/deribit-mcp"
+
+
+def _package_version() -> str:
+    try:
+        return version("deribit-mcp-server")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+USER_AGENT = f"deribit-mcp/{_package_version()} (+{PROJECT_URL})"
 
 
 class DeribitAuthError(RuntimeError):
@@ -45,7 +57,7 @@ class DeribitRestClient:
     async def connect(self) -> None:
         """Initialize HTTP session."""
         if not self.session:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
             logger.info("Initialized Deribit REST client")
 
             # Authenticate if credentials provided

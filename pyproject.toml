@@ -3,7 +3,7 @@ name = "deribit-mcp-server"
 version = "0.1.0"
 description = "MCP server for Deribit exchange integration with price alerts and notifications"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-or-later OR Commercial" }
 authors = [
     { name = "Georg Schröjahr" },
 ]

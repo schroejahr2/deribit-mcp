@@ -15,6 +15,7 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 StateCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
+DERIBIT_DOCUMENTED_CHANNEL_LIMIT = 500
 
 
 class DeribitWebSocketClient:
@@ -354,6 +355,20 @@ class DeribitWebSocketClient:
         self._subscribed_channels.add(channel)
         logger.info(f"Subscribed to {channel}")
 
+    def _ensure_subscription_capacity(self, channel: str) -> None:
+        """Fail locally before excessive WS subscriptions reach Deribit."""
+        if channel in self._subscribed_channels:
+            return
+        active = len(self._subscribed_channels)
+        configured_limit = settings.deribit_ws_max_active_channels
+        if active >= configured_limit:
+            raise RuntimeError(
+                "Deribit WebSocket active channel cap reached "
+                f"({active}/{configured_limit}; documented hard cap "
+                f"{DERIBIT_DOCUMENTED_CHANNEL_LIMIT}). "
+                f"Unsubscribe unused streams before subscribing to {channel!r}."
+            )
+
     async def _send_unsubscribe(self, channel: str) -> None:
         """Send a `public/unsubscribe` for one channel."""
         msg_id = self._get_next_id()
@@ -393,6 +408,7 @@ class DeribitWebSocketClient:
             return
 
         try:
+            self._ensure_subscription_capacity(channel)
             await self._send_subscribe(channel)
         except Exception as e:
             # Roll back the callback registration so a future retry can't

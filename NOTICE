@@ -1,6 +1,13 @@
 Deribit MCP Server
 ==================
 
+Trademark Notice
+----------------
+
+"Deribit" is a trademark of Deribit B.V. / Coinbase. This project is
+independent and is not affiliated with, endorsed by, or sponsored by
+Deribit, Deribit B.V., Coinbase, or Coinbase Global, Inc.
+
 This project was originally based on telegram-signal-mcp-server by Oishh
 (https://github.com/Oishh/telegram-signal-mcp-server), licensed under MIT.
 
@@ -40,3 +47,11 @@ preserved in LICENSE-MIT. Combination of the upstream MIT-licensed code
 with the AGPL-3.0-licensed additions is permitted because the MIT License
 is compatible with AGPL-3.0; the resulting combined work is distributed
 under AGPL-3.0 or, alternatively, under the commercial license.
+
+Exchange / API Access
+---------------------
+
+Licensing this software does not grant exchange access rights. Hosting it
+for third parties, or operating it with third-party Deribit API keys, may
+require separate exchange, KYC, API-usage, or commercial agreements with
+Deribit/Coinbase. Contact the exchange directly for those obligations.

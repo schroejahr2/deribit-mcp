@@ -46,6 +46,42 @@ async def test_generic_subscribe_is_channel_keyed_and_deduped():
 
 
 @pytest.mark.asyncio
+async def test_subscribe_rejects_new_channel_at_configured_cap(monkeypatch):
+    monkeypatch.setattr("src.deribit_ws.settings.deribit_ws_max_active_channels", 1)
+    client = RecordingWS()
+
+    async def cb(channel, data):
+        return None
+
+    await client.subscribe("book.BTC-PERPETUAL.100ms", cb)
+
+    with pytest.raises(RuntimeError, match="active channel cap"):
+        await client.subscribe("book.ETH-PERPETUAL.100ms", cb)
+
+    assert client.sent_subscribes == ["book.BTC-PERPETUAL.100ms"]
+    assert "book.ETH-PERPETUAL.100ms" not in client.subscriptions
+
+
+@pytest.mark.asyncio
+async def test_subscribe_allows_shared_channel_at_configured_cap(monkeypatch):
+    monkeypatch.setattr("src.deribit_ws.settings.deribit_ws_max_active_channels", 1)
+    client = RecordingWS()
+
+    async def cb1(channel, data):
+        return None
+
+    async def cb2(channel, data):
+        return None
+
+    channel = "book.BTC-PERPETUAL.100ms"
+    await client.subscribe(channel, cb1)
+    await client.subscribe(channel, cb2)
+
+    assert client.sent_subscribes == [channel]
+    assert len(client.subscriptions[channel]) == 2
+
+
+@pytest.mark.asyncio
 async def test_subscribe_ticker_wraps_old_instrument_callback_shape():
     client = RecordingWS()
     calls = []

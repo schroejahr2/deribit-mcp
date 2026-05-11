@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from src.deribit_rest import DeribitRestClient
+from src.deribit_rest import DeribitRestClient, PROJECT_URL, USER_AGENT
 
 
 class CapturingSession:
@@ -41,6 +41,27 @@ class _CtxResp:
 
     async def json(self):
         return self._payload
+
+
+@pytest.mark.asyncio
+async def test_rest_client_sets_identifying_user_agent(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class FakeClientSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("src.deribit_rest.aiohttp.ClientSession", FakeClientSession)
+
+    client = DeribitRestClient()
+    client.api_key = ""
+    client.api_secret = ""
+
+    await client.connect()
+
+    assert captured["headers"]["User-Agent"] == USER_AGENT
+    assert USER_AGENT.startswith("deribit-mcp/")
+    assert PROJECT_URL in USER_AGENT
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,10 @@
 
 # Deribit MCP Server
 
+> "Deribit" is a trademark of Deribit B.V. / Coinbase. This project is
+> independent and not affiliated with, endorsed by, or sponsored by
+> Deribit or Coinbase.
+
 **Hand Claude Opus the keys to a Deribit account.**
 
 > 🤖 **Fully automatic crypto spot, futures, and options trading from a single prompt.**
@@ -453,6 +457,16 @@ Telegram for the human user, outbox for the agent wakeup pipeline:
 | `TELEGRAM_CHAT_ID` | Where to deliver |
 | `CALLMEBOT_USERNAME` | Optional — phone call alerts via `notification_channel="telegram_call"` |
 
+### Market streams
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `DERIBIT_ORDERBOOK_INTERVAL` | `100ms` | Orderbook subscription cadence: `raw`, `100ms`, or `agg2` |
+| `DERIBIT_ORDERBOOK_DIFF_RETENTION_SECONDS` | `300` | How long live orderbook diffs stay queryable |
+| `DERIBIT_ORDERBOOK_IDLE_UNSUBSCRIBE_SECONDS` | `300` | Drop idle orderbook WS subscriptions |
+| `DERIBIT_LIQUIDATION_BUFFER_SIZE` | `1000` | Per liquidation stream ring buffer size |
+| `DERIBIT_WS_MAX_ACTIVE_CHANNELS` | `450` | Local WebSocket active-channel guard; Deribit documents a 500-channel limit |
+
 ---
 
 ## Wakeup architecture (sidecar pipeline)
@@ -686,6 +700,11 @@ attribution in [NOTICE](NOTICE).
   buy a commercial license from **GS Technik GmbH**. See
   [COMMERCIAL.md](COMMERCIAL.md) — also covers managed High-Performance
   hosting and 24/7 operation. Contact: info@schroejahr.de.
+- **Third-party hosting:** AGPL or a commercial license governs your rights
+  to this code only. Hosting this software for other users, or operating it
+  with third-party Deribit API keys, may require separate exchange, KYC,
+  API-usage, or commercial agreements with Deribit/Coinbase. Contact the
+  exchange directly; this project cannot grant those rights.
 
 Upstream portions derived from
 [telegram-signal-mcp-server by Oishh](https://github.com/Oishh/telegram-signal-mcp-server)
@@ -695,6 +714,10 @@ trading, news ingestion, market streams, gateway integration — is the
 AGPL-3.0 work. Full attribution in [NOTICE](NOTICE).
 
 ## Disclaimer
+
+Deribit and Coinbase are trademarks of their respective owners. This
+project is independent and is not affiliated with, endorsed by, or
+sponsored by Deribit, Deribit B.V., Coinbase, or Coinbase Global, Inc.
 
 This software talks to a live derivatives exchange. Trading
 cryptocurrency derivatives carries substantial risk of loss. Nothing
