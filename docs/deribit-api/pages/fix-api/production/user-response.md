@@ -1,0 +1,44 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.deribit.com/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+<AgentInstructions>
+
+## Submitting Feedback
+
+If you encounter incorrect, outdated, or confusing documentation on this page, submit feedback:
+
+POST https://docs.deribit.com/feedback
+
+```json
+{
+  "path": "/fix-api/production/user-response",
+  "feedback": "Description of the issue"
+}
+```
+
+Only submit feedback when you have something specific and actionable to report.
+
+</AgentInstructions>
+
+# User Response(BF)
+
+This message is used to respond to a [`USER REQUEST`(`BE`)](/fix-api/production/user-request)
+message, it reports the status of the user and user's account info.
+
+### Response
+
+| Tag    | Name                           | Type   | Required | Comments                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------ | ------------------------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 923    | `UserRequestID`                | String | Yes      | The request ID                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 553    | `Username`                     | String | Yes      | User's API 'Client ID'                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 926    | `UserStatus`                   | int    | No       | `1` = logged in, current implementation accepts USER REQUEST-s only from logged in users                                                                                                                                                                                                                                                                                                                                      |
+| 15     | `Currency`                     | String | No       | Currency of the report. See [`Security List Request`(`x`)](/fix-api/production/security-list-request). Default is BTC. <p>If `CROSS` is given as currency and user has cross collateral enabled, only the following fields are returned:</p><p><ul><li>100001 `DeribitUserEquity`</li><li>100003 `DeribitUserInitialMargin`</li><li>100004 `DeribitUserMaintenanceMargin`</li><li>100013 `DeribitMarginBalance`</li></ul></p> |
+| 100001 | `DeribitUserEquity`            | float  | No       | Equity of the user                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 100002 | `DeribitUserBalance`           | float  | No       | Balance of the user                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 100003 | `DeribitUserInitialMargin`     | float  | No       | Initial margin of the user                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 100004 | `DeribitUserMaintenanceMargin` | float  | No       | Maintenance margin of the user                                                                                                                                                                                                                                                                                                                                                                                                |
+| 100005 | `DeribitUnrealizedPl`          | float  | No       | Unrealized P/L of the user                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 100006 | `DeribitRealizedPl`            | float  | No       | Realized P/L of the user                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 100011 | `DeribitTotalPl`               | float  | No       | Total P/L of the user                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 100013 | `DeribitMarginBalance`         | float  | No       | Margin Balance                                                                                                                                                                                                                                                                                                                                                                                                                |

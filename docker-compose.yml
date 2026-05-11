@@ -1,0 +1,35 @@
+services:
+  deribit-mcp:
+    build: .
+    image: deribit-mcp-server:local
+    container_name: deribit-mcp
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HTTP_JSON_RESPONSE: ${MCP_HTTP_JSON_RESPONSE:-false}
+      MCP_SHARED_SECRET: ${MCP_SHARED_SECRET}
+      DERIBIT_DB_PATH: /data/deribit.db
+      DERIBIT_EVENT_ADMIN_TOKEN: ${DERIBIT_EVENT_ADMIN_TOKEN}
+      DERIBIT_TRADING_ENABLED: ${DERIBIT_TRADING_ENABLED:-false}
+      DERIBIT_MAX_AMOUNT_INVERSE: ${DERIBIT_MAX_AMOUNT_INVERSE}
+      DERIBIT_MAX_AMOUNT_LINEAR: ${DERIBIT_MAX_AMOUNT_LINEAR}
+      DERIBIT_MAX_AMOUNT_OPTION: ${DERIBIT_MAX_AMOUNT_OPTION}
+      DERIBIT_MAX_NOTIONAL_USD: ${DERIBIT_MAX_NOTIONAL_USD}
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+    ports:
+      # Defaults to loopback (127.0.0.1) so a fresh clone never accidentally
+      # exposes the API. Override BIND_IP in .env to publish on a LAN
+      # interface (e.g. 0.0.0.0 for all, or a specific subnet IP).
+      - "${BIND_IP:-127.0.0.1}:8000:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

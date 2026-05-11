@@ -1,0 +1,36 @@
+# Secrets and local runtime state
+.env
+.env.local
+.env.*.local
+data/
+logs/
+*.log
+
+# Python/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# VCS, editor, and agent-local state not needed in the image
+.git/
+.gitignore
+.dockerignore
+.DS_Store
+.idea/
+.vscode/
+.cache/
+.caliber/
+.agents/
+downloads/

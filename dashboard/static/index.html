@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deribit MCP Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/static/styles.css" />
+    <script defer src="/dashboard/static/app.js"></script>
+  </head>
+  <body>
+    <div id="dashboard-root" class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Deribit MCP</p>
+          <h1>Dashboard</h1>
+        </div>
+        <div class="topbar-actions">
+          <span id="overallStatus" class="status-pill status-muted">Loading</span>
+          <span id="updatedAt" class="subtle"></span>
+          <label class="toggle">
+            <input id="autoRefresh" type="checkbox" checked />
+            <span>Auto</span>
+          </label>
+          <button id="refreshButton" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section id="authPanel" class="auth-panel" hidden>
+        <div>
+          <strong>Dashboard-Token</strong>
+          <p>JSON access uses the configured admin token.</p>
+        </div>
+        <form id="tokenForm" class="token-form">
+          <input id="tokenInput" type="password" autocomplete="off" placeholder="Bearer Token" />
+          <button type="submit">Save</button>
+          <button id="clearTokenButton" type="button" class="secondary">Clear</button>
+        </form>
+      </section>
+
+      <section id="errorPanel" class="error-panel" hidden></section>
+
+      <main>
+        <section id="metricGrid" class="metric-grid" aria-label="Metrics"></section>
+
+        <section class="layout-grid">
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Account</p>
+                <h2>Held Symbols</h2>
+              </div>
+              <span id="environmentBadge" class="status-pill status-muted"></span>
+            </div>
+            <div id="heldSymbols" class="symbol-strip"></div>
+            <div id="positionsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Health</p>
+                <h2>Status</h2>
+              </div>
+            </div>
+            <div id="healthList" class="key-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Brain</p>
+                <h2>Registration</h2>
+              </div>
+            </div>
+            <div id="brainList" class="key-list"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Wakeups</p>
+                <h2>Alerts, Timer, Cron</h2>
+              </div>
+            </div>
+            <div id="schedulerList" class="key-list compact"></div>
+            <div id="alertsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Decisions</p>
+                <h2>Latest Decisions</h2>
+              </div>
+            </div>
+            <div id="decisionsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Trading</p>
+                <h2>Latest Trades and Orders</h2>
+              </div>
+            </div>
+            <div id="tradesTable" class="table-wrap"></div>
+            <div id="auditTable" class="table-wrap secondary-table"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">News</p>
+                <h2>News Push</h2>
+              </div>
+            </div>
+            <form id="newsPushForm" class="news-push-form">
+              <div class="form-row">
+                <label>
+                  <span>Headline</span>
+                  <input id="newsHeadline" name="headline" required placeholder="BTC funding update" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label>
+                  <span>Summary</span>
+                  <textarea id="newsSummary" name="summary" rows="4"></textarea>
+                </label>
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>Instrument</span>
+                  <input id="newsInstrument" name="instrument" placeholder="BTC-PERPETUAL" />
+                </label>
+                <label>
+                  <span>Source</span>
+                  <input id="newsSource" name="source" value="dashboard" />
+                </label>
+                <label>
+                  <span>URL</span>
+                  <input id="newsUrl" name="url" type="url" />
+                </label>
+                <label>
+                  <span>Score</span>
+                  <input id="newsScore" name="score" type="number" min="0" max="1" step="0.01" />
+                </label>
+              </div>
+              <div class="form-actions">
+                <button id="newsPushButton" type="submit">Push to Session</button>
+                <span id="newsPushStatus" class="subtle"></span>
+              </div>
+            </form>
+            <div class="section-divider"></div>
+            <div class="panel-header table-heading">
+              <div>
+                <p class="eyebrow">News</p>
+                <h2>Latest News</h2>
+              </div>
+            </div>
+            <div id="newsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Outbox</p>
+                <h2>Consumers and Events</h2>
+              </div>
+            </div>
+            <div id="consumersTable" class="table-wrap"></div>
+            <div id="eventsTable" class="table-wrap secondary-table"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

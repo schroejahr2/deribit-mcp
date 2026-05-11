@@ -1,0 +1,327 @@
+# Deribit MCP Server — Install Guide for LLM Agents
+
+You are about to install and verify the **Deribit MCP Server** on
+behalf of a human operator. This file is the canonical install
+runbook for an autonomous Claude Code (or any capable LLM) agent.
+
+By the end of this guide the server should be:
+
+1. Running in Docker on the operator's host.
+2. Reachable from the operator's MCP client via streamable-http.
+3. End-to-end verified against the **Deribit testnet** using
+   [`SMOKE-PLAYBOOK.md`](SMOKE-PLAYBOOK.md).
+
+The operator only fills in the secrets. Everything else is on you.
+
+---
+
+## Ground rules
+
+- **Never enable mainnet trading without explicit, in-session
+  confirmation from the operator.** The default is testnet. Keep it
+  that way.
+- **Never invent secrets, API keys, or chat IDs.** Ask the operator
+  to paste them, or instruct them to generate/obtain them.
+- **Never `git push`, `git commit`, or modify the user's local repo
+  state** unless the operator asks for it.
+- Quote any error output verbatim before suggesting a fix.
+- After every install step, verify with the explicit health check
+  given in that step before moving on. Do not assume success.
+
+---
+
+## Prerequisites the operator must have
+
+Ask the operator to confirm each before starting. If anything is
+missing, stop and instruct them how to get it.
+
+| Requirement | Where it comes from |
+|------|-------|
+| Docker + Docker Compose | https://docs.docker.com/get-docker/ |
+| A Deribit **testnet** account | https://test.deribit.com — sign up, request testnet funds in BTC / ETH / USDC |
+| Deribit testnet **API key + secret** | https://test.deribit.com → Settings → API → New API key |
+| (Optional) Telegram bot token + chat ID | Talk to `@BotFather` on Telegram for a token; chat ID via `@userinfobot` |
+| (Optional) CallMeBot username | https://callmebot.com — for phone-call alerts |
+| A host with a stable IP/hostname reachable from the MCP client | LAN, Tailscale, Wireguard, etc. |
+| Their MCP client of choice (Claude Code session, MCP gateway, …) | — |
+
+---
+
+## Step 1 — Clone the repository
+
+```bash
+git clone https://github.com/schroejahr2/deribit-mcp.git
+cd deribit-mcp
+```
+
+Verify:
+
+```bash
+ls README.md docker-compose.yml SMOKE-PLAYBOOK.md
+```
+
+All three files must exist. If not, stop — wrong directory.
+
+---
+
+## Step 2 — Generate secrets
+
+The operator needs two random hex tokens. Generate them and ask the
+operator to keep them safe — **you will not store them**, you will
+only paste them into `.env` in step 3.
+
+```bash
+openssl rand -hex 32   # MCP_SHARED_SECRET
+openssl rand -hex 32   # DERIBIT_EVENT_ADMIN_TOKEN
+```
+
+If `openssl` is not available, use:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+---
+
+## Step 3 — Fill `.env`
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and have the operator fill the following. Show them this
+table; **do not put values in yourself.**
+
+| Variable | Source | Notes |
+|----------|--------|-------|
+| `DERIBIT_API_KEY` | testnet API key | Step 0 prereq |
+| `DERIBIT_API_SECRET` | testnet API secret | Step 0 prereq |
+| `DERIBIT_TEST_MODE` | `true` | **Keep `true` for the entire install + smoke phase** |
+| `DERIBIT_TRADING_ENABLED` | `true` | Required for the smoke test to exercise mutating tools |
+| `DERIBIT_MAX_AMOUNT_INVERSE` | `10000` | Per-call USD-notional cap on inverse perps (BTC/ETH-PERPETUAL) |
+| `DERIBIT_MAX_AMOUNT_LINEAR` | `100` | Per-call coin-count cap on linear perps (`*_USDC-PERPETUAL`) |
+| `DERIBIT_MAX_AMOUNT_OPTION` | `5` | Per-call contract cap on options |
+| `DERIBIT_MAX_NOTIONAL_USD` | `50000` | Per-call USD-notional cap |
+| `MCP_TRANSPORT` | `http` | Use `stdio` only for direct stdio launchers |
+| `MCP_SHARED_SECRET` | hex from step 2 (#1) | |
+| `DERIBIT_EVENT_ADMIN_TOKEN` | hex from step 2 (#2) | |
+| `TELEGRAM_BOT_TOKEN` | from @BotFather | Optional — leave blank to disable Telegram channel |
+| `TELEGRAM_CHAT_ID` | from @userinfobot | Optional |
+| `CALLMEBOT_USERNAME` | from callmebot.com | Optional — phone calls |
+
+Sanity check:
+
+```bash
+grep -E "^(DERIBIT_API_KEY|DERIBIT_API_SECRET|MCP_SHARED_SECRET|DERIBIT_EVENT_ADMIN_TOKEN)=" .env | grep -v "your_\|=$"
+```
+
+Must print four lines. If fewer, something is unfilled.
+
+---
+
+## Step 4 — Build and start the container
+
+```bash
+docker compose up -d --build
+```
+
+Verify:
+
+```bash
+docker compose ps
+docker logs deribit-mcp --tail 30
+```
+
+The logs should show the FastAPI server bound to port `8000` and an
+"alert rehydrate" line. If you see any `ERROR` or `Traceback`, stop
+and quote the error to the operator.
+
+Health check:
+
+```bash
+curl -s http://localhost:8000/health
+# expected: {"ok":true}
+```
+
+Dashboard check:
+
+```bash
+curl -s http://localhost:8000/dashboard/ | grep "Deribit MCP Dashboard"
+# expected: one matching HTML title line
+```
+
+The browser dashboard is available at `http://<host>:8000/dashboard/`.
+It asks for `DERIBIT_EVENT_ADMIN_TOKEN` before loading dashboard JSON
+or using the news-push form.
+
+If the operator's MCP client runs on a different host, ask them for
+the host's reachable address (LAN IP, Tailscale name, etc.) and use
+that instead of `localhost`.
+
+---
+
+## Step 5 — Wire the MCP client
+
+The operator's MCP client (Claude Code session, MCP gateway, etc.)
+needs three things:
+
+| Setting | Value |
+|---------|-------|
+| Transport | `streamable-http` |
+| URL | `http://<host>:8000/mcp/` (trailing slash matters) |
+| Header | `X-Deribit-MCP-Secret: <MCP_SHARED_SECRET from step 3>` |
+
+If the operator uses **Claude Code with stdio**, switch
+`MCP_TRANSPORT=stdio` in `.env` and configure their `mcp_servers`
+config to spawn `python -m src` with the same `.env` loaded.
+
+Verify the tool list is reachable:
+
+```bash
+curl -s -X POST http://<host>:8000/mcp/ \
+  -H "X-Deribit-MCP-Secret: <MCP_SHARED_SECRET>" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -50
+```
+
+You should see ~60 tool names including `get_current_price`, `buy`,
+`sell`, `set_price_alert`, `daily_briefings`. If you see
+`unauthorized`, the shared secret header is wrong.
+
+---
+
+## Step 6 — Run the smoke playbook against testnet
+
+This is **the** verification step. The smoke playbook
+([`SMOKE-PLAYBOOK.md`](SMOKE-PLAYBOOK.md)) is designed for
+autonomous execution by another Claude Code session that has the
+Deribit MCP loaded.
+
+Procedure:
+
+1. Make sure the MCP client (a fresh Claude Code session) has the
+   Deribit MCP loaded per step 5.
+2. In that session, paste the prompt at the top of
+   `SMOKE-PLAYBOOK.md`.
+3. The session walks every phase: tier-0 environment check, every
+   read-only tool, every mutating order lifecycle, all four trading
+   safety negatives, channel burst, time alert wakeup, cleanup.
+4. At the end the session prints a structured PASS / FAIL summary.
+
+**Acceptance:** every phase PASS. If any phase fails, stop. Do **not**
+recommend enabling mainnet.
+
+If the operator is the same session you are in right now, you can
+run the playbook directly. Otherwise, hand off and tell the operator
+to run it in a session that has the MCP attached.
+
+The smoke playbook **must** run with:
+
+- `DERIBIT_TEST_MODE=true`
+- `DERIBIT_TRADING_ENABLED=true`
+- A funded Deribit testnet account (testnet faucet button on
+  test.deribit.com gives 100 BTC / 1000 ETH / 100k USDC).
+
+Never run the playbook against mainnet.
+
+---
+
+## Step 7 — (Optional) Channel sidecar for wakeup notifications
+
+If the operator wants Claude Code to be **woken up** by alerts (the
+core "no polling loops" feature), set up the channel sidecar plugin:
+
+1. The sidecar lives in [`channel-plugin/`](channel-plugin/) — see
+   [`channel-plugin/HANDOFF.md`](channel-plugin/HANDOFF.md) for the
+   full build instructions. It is a Bun/TypeScript MCP plugin that
+   the operator runs on the **same machine as their Claude Code
+   session**.
+2. Mint a per-consumer Bearer token with the admin token from step 2:
+
+   ```bash
+   curl -sS -X POST http://<host>:8000/events/register \
+     -H "Authorization: Bearer $DERIBIT_EVENT_ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"consumer_id":"<uuid4>","display_name":"<machine-name>"}'
+   ```
+
+3. Bake the returned token into the sidecar's config.
+4. The sidecar opens a long stream against
+   `GET http://<host>:8000/events/stream?consumer_id=<id>` and emits
+   `notifications/claude/channel` notifications into the session.
+
+The Channels feature this depends on is an **alpha/Research Preview**
+inside Claude Code. Expect the contract to evolve. See the README
+"⚠️ Experimental" section.
+
+---
+
+## Step 8 — (Optional, dangerous) Mainnet enable
+
+**Do not perform this step without explicit, in-session
+confirmation from the operator.** Quote them this paragraph and ask
+them to confirm by pasting back the words `I confirm mainnet enable`.
+
+Only after that confirmation:
+
+1. Switch `DERIBIT_TEST_MODE=false` in `.env`.
+2. Re-issue mainnet API key/secret on https://www.deribit.com (NOT
+   the testnet site).
+3. Restart: `docker compose up -d --build`.
+4. Verify the logs say "deribit_test_mode=false".
+5. Tell the operator that **every mutating tool call now requires
+   `confirm_live_trade=true`** and that the trading caps in `.env`
+   are now real-money limits.
+
+---
+
+## Common failures and quoted fixes
+
+- **`unauthorized` from `/mcp/`** — The `X-Deribit-MCP-Secret` header
+  is missing or doesn't match `.env`. Re-check step 5.
+- **`DERIBIT_TRADING_ENABLED is false; mutating trade tools are
+  disabled`** — The smoke needs `DERIBIT_TRADING_ENABLED=true` in
+  `.env`. Restart the container after changing.
+- **`DERIBIT_TEST_MODE=false requires confirm_live_trade=True for
+  mutating tools`** — You're on mainnet without the per-call
+  confirmation. Either set `DERIBIT_TEST_MODE=true` (and restart) or
+  pass `confirm_live_trade=true` in every mutating tool call.
+- **`Could not load instrument metadata for <X>`** — Wrong
+  instrument name or the instrument has expired. List instruments
+  with `get_instruments(currency='BTC', kind='option')` first.
+- **Container exits immediately** — Run
+  `docker logs deribit-mcp --tail 50`, quote the error to the
+  operator. Most common cause is missing `MCP_SHARED_SECRET` when
+  `MCP_TRANSPORT=http`.
+
+---
+
+## Where to look for more
+
+- [`README.md`](README.md) — full feature catalogue, architecture,
+  dashboard, full configuration reference, the ~60-tool list.
+- [`SMOKE-PLAYBOOK.md`](SMOKE-PLAYBOOK.md) — the autonomous testnet
+  verification suite.
+- [`channel-plugin/HANDOFF.md`](channel-plugin/HANDOFF.md) — sidecar
+  build and contract.
+- [`AGENTS.md`](AGENTS.md) — internal agent conventions for this
+  repo.
+- [`NOTICE`](NOTICE) — upstream attribution.
+
+---
+
+## When you're done
+
+Hand the operator a short report containing:
+
+1. Container status (`docker compose ps` output).
+2. Health endpoint result.
+3. Dashboard URL and whether `/dashboard/` loads.
+4. Number of MCP tools visible to the client.
+5. Smoke playbook result (PASS / FAIL per phase, plus the model's
+   own end-of-run summary).
+6. Any failures you saw, quoted.
+7. Whether mainnet was enabled (default: **no**).
+
+That report is the operator's signoff that the install is complete.

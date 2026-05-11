@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# MCP
+.claude/
+
+# Temporary files
+*.tmp
+*.bak
+.cache/
+
+# Runtime data (SQLite DB, mounted volume content)
+data/
+
+# Caliber local state
+.caliber/
+
+# Local agent/runtime metadata
+AGENTS.md
+.agents/
+.github/
+
+# Local planning notes
+todo.md
+TIER-*.md

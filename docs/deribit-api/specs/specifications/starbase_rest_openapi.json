@@ -1,0 +1,184 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Starbase REST API",
+    "version": "2.0",
+    "description": "Portfolio-scoped REST API for the Starbase direct-access trading platform."
+  },
+  "servers": [
+    {
+      "url": "https://{environment}.deribit.com",
+      "variables": {
+        "environment": {
+          "default": "www",
+          "enum": [
+            "www",
+            "test"
+          ],
+          "description": "Trading environment"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/api/v2/private/cancel_all": {
+      "get": {
+        "operationId": "cancel_all",
+        "summary": "Mass Cancel",
+        "description": "Cancels all open orders and quotes belonging to the authenticated portfolio. No filter parameters are accepted — the cancel applies to every instrument and every side.",
+        "tags": [
+          "Portfolio Management"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All open orders and quotes cancelled successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelAllResponse"
+                },
+                "example": {
+                  "jsonrpc": "2.0",
+                  "id": 1,
+                  "result": 42
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/private/lock_portfolio": {
+      "get": {
+        "operationId": "lock_portfolio",
+        "summary": "Lock Portfolio",
+        "description": "Locks the authenticated portfolio. All currently open `DIRECT_ACCESS` orders and quotes for this portfolio are cancelled immediately. New `DIRECT_ACCESS` orders and quotes are rejected until the portfolio is unlocked.\n\nREST-submitted orders are not affected by the lock state.",
+        "tags": [
+          "Portfolio Management"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Portfolio locked successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                },
+                "example": {
+                  "jsonrpc": "2.0",
+                  "id": 1,
+                  "result": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/private/unlock_portfolio": {
+      "get": {
+        "operationId": "unlock_portfolio",
+        "summary": "Unlock Portfolio",
+        "description": "Unlocks the authenticated portfolio, resuming normal acceptance of `DIRECT_ACCESS` orders and quotes.\n\nUnlocking the portfolio does **not** restore any previously cancelled orders.",
+        "tags": [
+          "Portfolio Management"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Portfolio unlocked successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                },
+                "example": {
+                  "jsonrpc": "2.0",
+                  "id": 1,
+                  "result": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OkResponse": {
+        "type": "object",
+        "required": [
+          "jsonrpc",
+          "result"
+        ],
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "enum": [
+              "2.0"
+            ],
+            "description": "The JSON-RPC version (2.0)"
+          },
+          "id": {
+            "type": "integer",
+            "description": "The id that was sent in the request"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ],
+            "description": "Result of method execution. `ok` in case of success"
+          }
+        }
+      },
+      "CancelAllResponse": {
+        "type": "object",
+        "required": [
+          "jsonrpc",
+          "result"
+        ],
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "enum": [
+              "2.0"
+            ],
+            "description": "The JSON-RPC version (2.0)"
+          },
+          "id": {
+            "type": "integer",
+            "description": "The id that was sent in the request"
+          },
+          "result": {
+            "type": "number",
+            "example": 7,
+            "description": "Total number of successfully cancelled orders"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key passed as a Bearer token. The authenticated session determines the portfolio that operations are applied to."
+      }
+    }
+  }
+}

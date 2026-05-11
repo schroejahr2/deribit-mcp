@@ -1,0 +1,42 @@
+Deribit MCP Server
+==================
+
+This project was originally based on telegram-signal-mcp-server by Oishh
+(https://github.com/Oishh/telegram-signal-mcp-server), licensed under MIT.
+
+The Deribit REST and WebSocket client foundations were retained from
+upstream and adapted. The following modules are substantially new work
+not present in upstream:
+
+  - Cloud channel / event outbox streaming (src/event_outbox.py,
+    src/events_api.py)
+  - Persistent alert storage with restart survival (src/persistence.py,
+    src/alerts.py rewrite)
+  - Audited trading tools with pre-trade decisions (src/trading.py)
+  - Daily briefings (src/briefings.py, src/briefings_api.py)
+  - Market data streams and consumer lifecycle (src/market_streams.py)
+  - Bifrost gateway integration and Tailscale-friendly transport
+  - HTTP application layer and lifespan management (src/http_app.py,
+    src/lifespan.py)
+  - Scheduler and notification manager rewrite
+
+Per the MIT License, the upstream copyright notice and permission notice
+are preserved in the LICENSE-MIT file. This NOTICE provides additional
+attribution context but is not itself required by the MIT License.
+
+Licensing
+---------
+
+This project is dual-licensed:
+
+  - Default: GNU Affero General Public License v3.0 (see LICENSE).
+    Applies to the project as a whole, including all substantial new
+    work listed above.
+  - Commercial: see COMMERCIAL.md for terms and contact information for
+    a commercial license from GS Technik GmbH.
+
+Upstream-derived portions (originally MIT) remain under the MIT License
+preserved in LICENSE-MIT. Combination of the upstream MIT-licensed code
+with the AGPL-3.0-licensed additions is permitted because the MIT License
+is compatible with AGPL-3.0; the resulting combined work is distributed
+under AGPL-3.0 or, alternatively, under the commercial license.
