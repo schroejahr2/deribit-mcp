@@ -4,7 +4,7 @@
 
 # Deribit MCP Server
 
-> "Deribit" is a trademark of Deribit B.V. / Coinbase. This project is
+> "Deribit" is a trademark of Deribit. This project is
 > independent and not affiliated with, endorsed by, or sponsored by
 > Deribit or Coinbase.
 
