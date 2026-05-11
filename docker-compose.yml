@@ -1,7 +1,6 @@
 services:
   deribit-mcp:
-    build: .
-    image: deribit-mcp-server:local
+    image: ${DERIBIT_MCP_IMAGE:-ghcr.io/schroejahr2/deribit-mcp:latest}
     container_name: deribit-mcp
     env_file: .env
     environment:

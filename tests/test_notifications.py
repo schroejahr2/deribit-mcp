@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.notifications import OutboxNotificationChannel
+from src.notifications import OutboxNotificationChannel, TelegramCallChannel
 
 
 class DedupeOutboxRepo:
@@ -44,3 +44,70 @@ async def test_outbox_channel_can_send_news_events():
 
     assert sent is True
     assert repo.calls == [({"id": "news-1"}, "News [BTC]: ETF inflows")]
+
+
+class FakeCallMeBotResponse:
+    def __init__(self, status_code=200, text="OK"):
+        self.status_code = status_code
+        self.text = text
+
+
+class CapturingAsyncClient:
+    instances = []
+
+    def __init__(self, *, timeout):
+        self.timeout = timeout
+        self.requests = []
+        CapturingAsyncClient.instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(self, url, *, params):
+        self.requests.append((url, params))
+        return FakeCallMeBotResponse()
+
+
+@pytest.mark.asyncio
+async def test_telegram_call_channel_posts_to_callmebot(monkeypatch):
+    CapturingAsyncClient.instances = []
+    monkeypatch.setattr("src.notifications.httpx.AsyncClient", CapturingAsyncClient)
+    channel = TelegramCallChannel(
+        username="demo-user",
+        default_lang="de-DE-Standard-A",
+        repeat_count=2,
+    )
+
+    sent = await channel.send("Deribit MCP call smoke", lang="en-US-Standard-B", rpt=1)
+
+    assert sent is True
+    client = CapturingAsyncClient.instances[0]
+    assert client.timeout == 30.0
+    assert client.requests == [
+        (
+            "https://api.callmebot.com/start.php",
+            {
+                "user": "demo-user",
+                "text": "Deribit MCP call smoke",
+                "lang": "en-US-Standard-B",
+                "rpt": 1,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_call_channel_truncates_tts_message(monkeypatch):
+    CapturingAsyncClient.instances = []
+    monkeypatch.setattr("src.notifications.httpx.AsyncClient", CapturingAsyncClient)
+    channel = TelegramCallChannel(username="demo-user")
+
+    sent = await channel.send("x" * 300)
+
+    assert sent is True
+    _, params = CapturingAsyncClient.instances[0].requests[0]
+    assert len(params["text"]) == 256
+    assert params["text"].endswith("...")

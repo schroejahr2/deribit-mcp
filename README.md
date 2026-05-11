@@ -362,8 +362,9 @@ cp .env.example .env
 # DERIBIT_EVENT_ADMIN_TOKEN (`openssl rand -hex 32`),
 # trading limits if you flip TRADING_ENABLED=true
 
-# 2) Start
-docker compose up -d --build
+# 2) Pull the published image and start
+docker compose pull
+docker compose up -d
 
 # 3) Health
 curl http://<deribit-host>:8000/health  # → {"ok":true}
@@ -382,6 +383,10 @@ curl http://<deribit-host>:8000/health  # → {"ok":true}
 #    another Claude Code session against test.deribit.com. Run it
 #    BEFORE you ever flip DERIBIT_TEST_MODE=false.
 ```
+
+For local development of the container image, set
+`DERIBIT_MCP_IMAGE=deribit-mcp-server:local` and run
+`docker compose up -d --build` from a checkout.
 
 `/mcp` and `/sse` are protected by `MCP_SHARED_SECRET` — only callers
 with the correct `X-Deribit-MCP-Secret` header reach the MCP surface.
@@ -456,6 +461,8 @@ Telegram for the human user, outbox for the agent wakeup pipeline:
 | `TELEGRAM_BOT_TOKEN` | Bot token for startup heartbeat + alerts with `notification_channel="telegram"` |
 | `TELEGRAM_CHAT_ID` | Where to deliver |
 | `CALLMEBOT_USERNAME` | Optional — phone call alerts via `notification_channel="telegram_call"` |
+| `CALLMEBOT_DEFAULT_LANG` | TTS voice/language used when a call alert does not override `lang` |
+| `CALLMEBOT_REPEAT_COUNT` | Number of times CallMeBot repeats the message |
 
 ### Market streams
 
@@ -466,6 +473,16 @@ Telegram for the human user, outbox for the agent wakeup pipeline:
 | `DERIBIT_ORDERBOOK_IDLE_UNSUBSCRIBE_SECONDS` | `300` | Drop idle orderbook WS subscriptions |
 | `DERIBIT_LIQUIDATION_BUFFER_SIZE` | `1000` | Per liquidation stream ring buffer size |
 | `DERIBIT_WS_MAX_ACTIVE_CHANNELS` | `450` | Local WebSocket active-channel guard; Deribit documents a 500-channel limit |
+
+### Docker compose
+
+These variables are consumed by `docker-compose.yml`, not by the
+Python app itself:
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `DERIBIT_MCP_IMAGE` | `ghcr.io/schroejahr2/deribit-mcp:latest` | Published runtime image to pull |
+| `BIND_IP` | `127.0.0.1` | Host interface for port 8000; set `0.0.0.0` only when you intend to expose it |
 
 ---
 
@@ -574,12 +591,14 @@ semantics, http_app shared-secret middleware, lifespan passthrough,
 GET-array bracket encoding.
 
 ```bash
-docker compose run --rm deribit-mcp pytest tests/ -v
-# or with a local venv:
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest tests/
 ```
+
+The published GHCR runtime image intentionally does not include the
+test suite or development dependencies. Use the local venv for unit
+tests, or build a temporary development image from the checkout.
 
 **End-to-end smoke playbook** ([SMOKE-PLAYBOOK.md](SMOKE-PLAYBOOK.md)):
 multi-phase autonomous execution by another Claude session, covering
@@ -612,6 +631,26 @@ docker exec deribit-mcp sqlite3 'file:/data/deribit.db?mode=ro' \
 docker exec deribit-mcp sqlite3 'file:/data/deribit.db?mode=ro' \
   "SELECT consumer_id,event_id,delivered_at,acked_at,attempts \
    FROM event_deliveries ORDER BY delivered_at DESC LIMIT 5"
+
+# Trigger a real Telegram call smoke (requires CALLMEBOT_USERNAME and restart)
+docker exec deribit-mcp python3 -c "
+import asyncio
+from src.notifications import NotificationManager
+
+async def main():
+    mgr = NotificationManager()
+    if 'telegram_call' not in mgr.channels:
+        raise SystemExit('telegram_call channel is not configured')
+    ok = await mgr.send_notification(
+        'telegram_call',
+        'Deribit MCP call smoke',
+        lang='en-US-Standard-B',
+        rpt=1,
+    )
+    print('sent' if ok else 'failed')
+
+asyncio.run(main())
+"
 
 # Trigger a synthetic outbox event (server-side, useful for sidecar tests)
 docker exec deribit-mcp python3 -c "
@@ -657,8 +696,8 @@ src/
 ├── event_outbox.py      # Outbox repo, severity mapping, payload allowlist,
 │                        # consumer lifecycle, claim/ack/heartbeat/reaper
 ├── events_api.py        # FastAPI routes for /events/*
-├── notifications.py     # TelegramChannel, OutboxNotificationChannel,
-│                        # NotificationManager
+├── notifications.py     # TelegramChannel, TelegramCallChannel,
+│                        # OutboxNotificationChannel, NotificationManager
 ├── market_streams.py    # WS-cached order books, trade tape, liquidations
 ├── scheduler.py         # TimeAlertScheduler asyncio loop
 ├── lifespan.py          # combined_lifespan, environment fail-fast,
@@ -669,8 +708,10 @@ src/
 └── __main__.py          # MCP_TRANSPORT switch (http vs stdio)
 
 dashboard/               # Browser dashboard: FastAPI router + static UI
-tests/                   # 207 pytest cases covering the layers above
+tests/                   # pytest cases covering the layers above
 channel-plugin/          # Sidecar handoff & build instructions
+DEMO_CLAUDE.md           # Example Claude Code operating prompt
+llms.txt                 # Install guide for LLM agents
 SMOKE-PLAYBOOK.md        # End-to-end test catalogue
 ```
 

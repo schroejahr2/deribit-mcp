@@ -108,6 +108,7 @@ table; **do not put values in yourself.**
 | `TELEGRAM_BOT_TOKEN` | from @BotFather | Optional — leave blank to disable Telegram channel |
 | `TELEGRAM_CHAT_ID` | from @userinfobot | Optional |
 | `CALLMEBOT_USERNAME` | from callmebot.com | Optional — phone calls |
+| `DERIBIT_MCP_IMAGE` | `ghcr.io/schroejahr2/deribit-mcp:latest` | Published container image used by Compose |
 
 Sanity check:
 
@@ -119,10 +120,15 @@ Must print four lines. If fewer, something is unfilled.
 
 ---
 
-## Step 4 — Build and start the container
+## Step 4 — Pull and start the container
+
+The default `docker-compose.yml` pulls the published GHCR image.
+Use a local image only when the operator explicitly asks for local
+development or fork testing.
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Verify:
@@ -268,7 +274,7 @@ Only after that confirmation:
 1. Switch `DERIBIT_TEST_MODE=false` in `.env`.
 2. Re-issue mainnet API key/secret on https://www.deribit.com (NOT
    the testnet site).
-3. Restart: `docker compose up -d --build`.
+3. Restart: `docker compose up -d`.
 4. Verify the logs say "deribit_test_mode=false".
 5. Tell the operator that **every mutating tool call now requires
    `confirm_live_trade=true`** and that the trading caps in `.env`
