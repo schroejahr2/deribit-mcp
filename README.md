@@ -34,6 +34,12 @@ later. Records every decision into an audit trail before the order hits
 the wire. Survives container restarts with full state intact.
 
 - Just prompt your strategy.
+
+<p align="center">
+  <img src="docs/screenshots/claude-session.png" alt="Claude Code trading session with Deribit MCP channel wakeups" width="48%" />
+  <img src="docs/screenshots/dashboard-live.png" alt="Deribit MCP browser dashboard with health, alerts, decisions, and outbox state" width="48%" />
+</p>
+
 ---
 
 ## ⚠️ Experimental — Read This First
