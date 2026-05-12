@@ -77,6 +77,38 @@ def _position_is_open(position: dict[str, Any]) -> bool:
     )
 
 
+CASH_FIELDS = ("balance", "available_funds", "equity", "margin_balance")
+
+
+def _cash_balances_from_summaries(
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Synthesize per-currency cash positions from account summaries."""
+    rows: list[dict[str, Any]] = []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        currency = summary.get("currency")
+        if not currency:
+            continue
+        if not any(_is_nonzero(summary.get(field)) for field in CASH_FIELDS):
+            continue
+        rows.append(
+            {
+                "currency": str(currency).upper(),
+                "balance": summary.get("balance"),
+                "available_funds": summary.get("available_funds"),
+                "available_withdrawal_funds": summary.get("available_withdrawal_funds"),
+                "equity": summary.get("equity"),
+                "margin_balance": summary.get("margin_balance"),
+                "initial_margin": summary.get("initial_margin"),
+                "maintenance_margin": summary.get("maintenance_margin"),
+            }
+        )
+    rows.sort(key=lambda row: row["currency"])
+    return rows
+
+
 def _timestamp_sort_value(item: dict[str, Any]) -> int:
     for key in ("timestamp", "last_update_timestamp", "creation_timestamp"):
         value = item.get(key)
@@ -147,6 +179,7 @@ async def _collect_deribit_account(ctx: Any, errors: list[dict[str, str]]) -> di
 
     user_trades.sort(key=_timestamp_sort_value, reverse=True)
     open_positions = [position for position in positions if _position_is_open(position)]
+    cash_balances = _cash_balances_from_summaries(account_summaries)
     held_symbols = sorted(
         {
             str(position.get("instrument_name") or position.get("instrument") or "")
@@ -154,11 +187,11 @@ async def _collect_deribit_account(ctx: Any, errors: list[dict[str, str]]) -> di
             if position.get("instrument_name") or position.get("instrument")
         }
     )
-
     return {
         "account_summaries": account_summaries,
         "positions": positions,
         "open_positions": open_positions,
+        "cash_balances": cash_balances,
         "held_symbols": held_symbols,
         "open_orders": open_orders,
         "user_trades": user_trades[:50],

@@ -265,13 +265,32 @@ function renderSymbols(data) {
 }
 
 function renderPositions(data) {
+  const cashRows = (data.account?.cash_balances || []).map((c) => ({
+    __cash: true,
+    instrument_name: `${c.currency} Cash`,
+    kind: "cash",
+    size: c.balance,
+    available_funds: c.available_funds,
+    direction: "cash",
+    mark_price: c.equity,
+    floating_profit_loss:
+      Number.isFinite(Number(c.equity)) && Number.isFinite(Number(c.balance))
+        ? Number(c.equity) - Number(c.balance)
+        : null,
+  }));
+  const rows = [...cashRows, ...(data.account?.open_positions || [])];
+
   renderTable(
     els.positionsTable,
-    data.account?.open_positions || [],
+    rows,
     [
       {
         label: "Symbol",
-        value: (p) => mainSub(p.instrument_name || p.instrument, p.kind || p.direction || ""),
+        value: (p) =>
+          mainSub(
+            p.instrument_name || p.instrument,
+            p.__cash ? `available ${formatNumber(p.available_funds)}` : p.kind || p.direction || ""
+          ),
       },
       { label: "Size", value: (p) => formatNumber(p.size ?? p.size_currency) },
       { label: "Side", value: (p) => p.direction || p.side || "-" },
