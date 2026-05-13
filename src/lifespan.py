@@ -67,6 +67,14 @@ async def _maintenance_reaper_loop(
         logger.error("Maintenance reaper crashed: %s", exc, exc_info=True)
 
 
+def _trading_event_channels() -> list[str]:
+    return [
+        channel.strip()
+        for channel in settings.deribit_trading_event_channels.split(",")
+        if channel.strip()
+    ]
+
+
 @asynccontextmanager
 async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
     """Manage application lifecycle with persistent connections and repositories."""
@@ -158,12 +166,56 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 exc_info=True,
             )
 
+    async def on_deribit_user_change(channel: str, data: Dict[str, Any]) -> None:
+        try:
+            event_ids = await event_outbox_repo.insert_deribit_subscription_events(channel, data)
+            if event_ids:
+                logger.info(
+                    "Wrote %d Deribit trading event(s) from %s to outbox",
+                    len(event_ids),
+                    channel,
+                )
+        except Exception as exc:
+            logger.error(
+                "Failed to write Deribit trading event from %s to outbox: %s",
+                channel,
+                exc,
+                exc_info=True,
+            )
+
     try:
         ws_client.set_price_update_callback(on_price_update)
         ws_client.set_state_callback(on_ws_state)
         await ws_client.connect()
         await rest_client.connect()
         await market_stream_manager.start()
+
+        if (
+            settings.deribit_trading_event_outbox_enabled
+            and settings.deribit_api_key
+            and settings.deribit_api_secret
+        ):
+            for channel in _trading_event_channels():
+                try:
+                    await ws_client.subscribe(channel, on_deribit_user_change)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to subscribe Deribit trading event channel %s: %s",
+                        channel,
+                        exc,
+                        exc_info=True,
+                    )
+                    await event_outbox_repo.insert_connection_event(
+                        "trading_events_subscription_failed",
+                        message=f"Deribit trading event channel subscription failed: {channel}",
+                        severity="warning",
+                        reason=str(exc),
+                    )
+        elif settings.deribit_trading_event_outbox_enabled:
+            logger.info(
+                "Deribit trading-event outbox is enabled but API credentials are absent; "
+                "skipping user.* subscriptions"
+            )
 
         active_alerts = await alert_repo.load_active()
         await alert_manager.load_active(active_alerts)

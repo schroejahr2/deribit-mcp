@@ -455,6 +455,8 @@ Mainnet calls from a session configured for testnet.
 | `DERIBIT_EVENT_ADMIN_TOKEN` | `""` | Required for `POST /events/register`, `POST /news`, `POST /news/{id}/push`, and dashboard JSON/news-push actions |
 | `DERIBIT_EVENT_RETENTION_DAYS` | `7` | How long to keep ACKed events in the outbox |
 | `DERIBIT_EVENT_STREAM_CLAIM_SECONDS` | `90` | How long a sidecar's stream-claim survives without renewal |
+| `DERIBIT_TRADING_EVENT_OUTBOX_ENABLED` | `true` | Mirror authenticated Deribit `user.*` order/fill lifecycle events into the outbox |
+| `DERIBIT_TRADING_EVENT_CHANNELS` | `user.changes.future.any.100ms,user.changes.option.any.100ms,user.changes.spot.any.100ms,user.changes.future_combo.any.100ms,user.changes.option_combo.any.100ms` | Comma-separated Deribit `user.*` channels to stream into session wakeups |
 
 ### Notifications
 
@@ -522,6 +524,13 @@ events. They are deduped server-side by `news:{url}` when the news row
 has a URL, otherwise by `news:{news_id}`. They carry only allowlisted
 news metadata: `news_id`, `source`, `instrument`, `headline`,
 `summary`, `url`, `score`, `tags`, `message`.
+
+Authenticated Deribit trading events use the same sidecar path when
+`DERIBIT_TRADING_EVENT_OUTBOX_ENABLED=true`: the server subscribes to
+the configured `DERIBIT_TRADING_EVENT_CHANNELS`, converts order
+lifecycle updates and fills into sanitized `deribit_order_update` /
+`deribit_trade_update` events, and skips raw position snapshots to avoid
+mark-price spam in the session.
 
 ---
 

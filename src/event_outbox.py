@@ -7,7 +7,7 @@ import json
 import secrets
 import uuid
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .config import settings
 from .persistence import Database, to_iso, utc_now
@@ -34,7 +34,84 @@ ALLOWED_PAYLOAD_KEYS = {
     "tags",
     "attempt",
     "reason",
+    "channel",
+    "order_id",
+    "trade_id",
+    "order_state",
+    "order_type",
+    "direction",
+    "amount",
+    "filled_amount",
+    "contracts",
+    "price",
+    "average_price",
+    "triggered",
+    "trigger",
+    "trigger_price",
+    "trigger_offset",
+    "reduce_only",
+    "fee",
+    "fee_currency",
+    "label",
+    "timestamp",
+    "last_update_timestamp",
+    "creation_timestamp",
+    "liquidity",
+    "profit_loss",
+    "mark_price",
+    "index_price",
+    "cancel_reason",
+    "oco_ref",
+    "primary_order_id",
+    "trigger_order_id",
 }
+
+ORDER_PAYLOAD_KEYS = (
+    "order_id",
+    "instrument_name",
+    "order_state",
+    "state",
+    "order_type",
+    "direction",
+    "amount",
+    "filled_amount",
+    "contracts",
+    "price",
+    "average_price",
+    "triggered",
+    "trigger",
+    "trigger_price",
+    "trigger_offset",
+    "reduce_only",
+    "label",
+    "last_update_timestamp",
+    "creation_timestamp",
+    "cancel_reason",
+    "oco_ref",
+    "primary_order_id",
+    "trigger_order_id",
+)
+
+TRADE_PAYLOAD_KEYS = (
+    "trade_id",
+    "order_id",
+    "instrument_name",
+    "order_type",
+    "state",
+    "direction",
+    "amount",
+    "contracts",
+    "price",
+    "fee",
+    "fee_currency",
+    "label",
+    "timestamp",
+    "liquidity",
+    "profit_loss",
+    "mark_price",
+    "index_price",
+    "reduce_only",
+)
 
 
 def token_hash(token: str) -> str:
@@ -52,6 +129,102 @@ def severity_for_alert(condition: str, threshold: Optional[float] = None) -> str
     if condition == "percentage_change" and threshold is not None and abs(float(threshold)) >= 5:
         return "warning"
     return "info"
+
+
+def _as_dict_items(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _pick(source: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
+    return {key: source.get(key) for key in keys if source.get(key) is not None}
+
+
+def _fmt(value: Any) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _dedupe_fragment(*parts: Any) -> str:
+    raw = "|".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _order_severity(order: dict[str, Any]) -> str:
+    state = str(order.get("order_state") or order.get("state") or "").lower()
+    cancel_reason = str(order.get("cancel_reason") or "").lower()
+    if state == "rejected" or order.get("is_liquidation"):
+        return "warning"
+    if cancel_reason and cancel_reason not in {"user_request", "oco_other_closed"}:
+        return "warning"
+    return "info"
+
+
+def _trade_severity(trade: dict[str, Any]) -> str:
+    if trade.get("liquidation"):
+        return "warning"
+    return "info"
+
+
+def _order_message(order: dict[str, Any]) -> str:
+    state = order.get("order_state") or order.get("state") or "update"
+    instrument = order.get("instrument_name") or order.get("instrument") or "unknown-instrument"
+    parts = [
+        f"DERIBIT ORDER {str(state).upper()}",
+        f"{instrument}",
+        f"{_fmt(order.get('direction'))} {_fmt(order.get('order_type'))}",
+        f"amount={_fmt(order.get('amount'))}",
+    ]
+    if order.get("filled_amount") is not None:
+        parts.append(f"filled={_fmt(order.get('filled_amount'))}")
+    if order.get("average_price") is not None:
+        parts.append(f"avg={_fmt(order.get('average_price'))}")
+    elif order.get("price") is not None:
+        parts.append(f"price={_fmt(order.get('price'))}")
+    if order.get("trigger_price") is not None:
+        trigger = order.get("trigger") or "trigger"
+        parts.append(f"{trigger}={_fmt(order.get('trigger_price'))}")
+    if order.get("reduce_only") is not None:
+        parts.append(f"reduce_only={_fmt(order.get('reduce_only')).lower()}")
+    if order.get("label"):
+        parts.append(f"label={order['label']}")
+    if order.get("order_id"):
+        parts.append(f"order_id={order['order_id']}")
+    if order.get("cancel_reason"):
+        parts.append(f"reason={order['cancel_reason']}")
+    return " | ".join(parts)
+
+
+def _trade_message(trade: dict[str, Any]) -> str:
+    instrument = trade.get("instrument_name") or trade.get("instrument") or "unknown-instrument"
+    parts = [
+        "DERIBIT TRADE",
+        f"{instrument}",
+        f"{_fmt(trade.get('direction'))} amount={_fmt(trade.get('amount'))}",
+    ]
+    if trade.get("price") is not None:
+        parts.append(f"price={_fmt(trade.get('price'))}")
+    if trade.get("profit_loss") is not None:
+        parts.append(f"pnl={_fmt(trade.get('profit_loss'))}")
+    if trade.get("fee") is not None:
+        fee = _fmt(trade.get("fee"))
+        currency = trade.get("fee_currency")
+        parts.append(f"fee={fee}{' ' + currency if currency else ''}")
+    if trade.get("label"):
+        parts.append(f"label={trade['label']}")
+    if trade.get("order_id"):
+        parts.append(f"order_id={trade['order_id']}")
+    if trade.get("trade_id"):
+        parts.append(f"trade_id={trade['trade_id']}")
+    return " | ".join(parts)
 
 
 class EventOutboxRepo:
@@ -172,6 +345,114 @@ class EventOutboxRepo:
             severity="info",
             dedupe_key=dedupe_key,
         )
+
+    async def insert_deribit_order_event(
+        self,
+        channel: str,
+        order: dict[str, Any],
+    ) -> Optional[str]:
+        """Write one sanitized Deribit order lifecycle event to the outbox."""
+        payload = _pick(order, ORDER_PAYLOAD_KEYS)
+        if "instrument_name" in payload:
+            payload["instrument"] = payload.pop("instrument_name")
+        if "state" in payload and "order_state" not in payload:
+            payload["order_state"] = payload.pop("state")
+        else:
+            payload.pop("state", None)
+        payload["source"] = "deribit_ws"
+        payload["channel"] = channel
+        payload["message"] = _order_message(payload)
+        dedupe_key = "deribit-order:" + _dedupe_fragment(
+            channel,
+            payload.get("order_id"),
+            payload.get("order_state"),
+            payload.get("last_update_timestamp"),
+            payload.get("filled_amount"),
+            payload.get("average_price"),
+        )
+        return await self.insert_event(
+            "deribit_order_update",
+            payload,
+            severity=_order_severity(payload),
+            dedupe_key=dedupe_key,
+        )
+
+    async def insert_deribit_trade_event(
+        self,
+        channel: str,
+        trade: dict[str, Any],
+    ) -> Optional[str]:
+        """Write one sanitized Deribit trade/fill event to the outbox."""
+        payload = _pick(trade, TRADE_PAYLOAD_KEYS)
+        if "instrument_name" in payload:
+            payload["instrument"] = payload.pop("instrument_name")
+        if "state" in payload and "order_state" not in payload:
+            payload["order_state"] = payload.pop("state")
+        else:
+            payload.pop("state", None)
+        payload["source"] = "deribit_ws"
+        payload["channel"] = channel
+        payload["message"] = _trade_message(payload)
+        dedupe_key = "deribit-trade:" + _dedupe_fragment(
+            channel,
+            payload.get("trade_id"),
+            payload.get("order_id"),
+            payload.get("timestamp"),
+            payload.get("direction"),
+            payload.get("amount"),
+            payload.get("price"),
+        )
+        return await self.insert_event(
+            "deribit_trade_update",
+            payload,
+            severity=_trade_severity(payload),
+            dedupe_key=dedupe_key,
+        )
+
+    async def insert_deribit_subscription_events(
+        self,
+        channel: str,
+        data: dict[str, Any] | list[Any],
+    ) -> list[str]:
+        """Translate Deribit user.* subscription payloads into trading wakeups.
+
+        `user.changes.*` may contain orders, trades, and position snapshots.
+        Position snapshots can update on mark-price movement, so the wakeup path
+        intentionally emits only order lifecycle and trade/fill events.
+        """
+        event_ids: list[str] = []
+        emitted_order_ids: set[str] = set()
+
+        if channel.startswith("user.changes.") and isinstance(data, dict):
+            orders = _as_dict_items(data.get("orders"))
+            trades = _as_dict_items(data.get("trades"))
+        elif channel.startswith("user.orders."):
+            orders = _as_dict_items(data)
+            trades = []
+        elif channel.startswith("user.trades."):
+            orders = []
+            trades = _as_dict_items(data)
+        else:
+            return event_ids
+
+        for order in orders:
+            event_id = await self.insert_deribit_order_event(channel, order)
+            if event_id:
+                event_ids.append(event_id)
+            if order.get("order_id"):
+                emitted_order_ids.add(str(order["order_id"]))
+
+        for trade in trades:
+            # `user.changes` commonly sends an order update and the matching
+            # trade in the same notification. Prefer the order lifecycle event
+            # to avoid multiple session wakeups for one fill burst.
+            if str(trade.get("order_id")) in emitted_order_ids:
+                continue
+            event_id = await self.insert_deribit_trade_event(channel, trade)
+            if event_id:
+                event_ids.append(event_id)
+
+        return event_ids
 
     async def register_consumer(
         self,

@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     deribit_event_admin_token: str = ""
     deribit_event_retention_days: int = 7
     deribit_event_stream_claim_seconds: int = 90
+    deribit_trading_event_outbox_enabled: bool = True
+    deribit_trading_event_channels: str = (
+        "user.changes.future.any.100ms,"
+        "user.changes.option.any.100ms,"
+        "user.changes.spot.any.100ms,"
+        "user.changes.future_combo.any.100ms,"
+        "user.changes.option_combo.any.100ms"
+    )
 
     # Telegram
     telegram_bot_token: str = ""
@@ -88,6 +96,23 @@ class Settings(BaseSettings):
             raise ValueError("DERIBIT_LIQUIDATION_BUFFER_SIZE must be > 0")
         if not 1 <= self.deribit_ws_max_active_channels <= 500:
             raise ValueError("DERIBIT_WS_MAX_ACTIVE_CHANNELS must be between 1 and 500")
+        if self.deribit_trading_event_outbox_enabled:
+            channels = [
+                channel.strip()
+                for channel in self.deribit_trading_event_channels.split(",")
+                if channel.strip()
+            ]
+            if not channels:
+                raise ValueError(
+                    "DERIBIT_TRADING_EVENT_CHANNELS must contain at least one user.* channel "
+                    "when DERIBIT_TRADING_EVENT_OUTBOX_ENABLED=true"
+                )
+            invalid = [channel for channel in channels if not channel.startswith("user.")]
+            if invalid:
+                raise ValueError(
+                    "DERIBIT_TRADING_EVENT_CHANNELS may only contain Deribit user.* channels: "
+                    + ", ".join(invalid)
+                )
 
     @property
     def deribit_ws_url(self) -> str:

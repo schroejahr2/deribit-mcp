@@ -331,6 +331,14 @@ def _health(ctx: Any) -> dict[str, Any]:
             "max_notional_usd": settings.deribit_max_notional_usd,
         },
         "notifications": ctx.notification_manager.list_channels(),
+        "trading_events": {
+            "outbox_enabled": settings.deribit_trading_event_outbox_enabled,
+            "channels": [
+                channel.strip()
+                for channel in settings.deribit_trading_event_channels.split(",")
+                if channel.strip()
+            ],
+        },
         "price_cache_count": len(getattr(ctx, "price_cache", {}) or {}),
     }
 

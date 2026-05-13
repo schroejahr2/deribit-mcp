@@ -138,6 +138,113 @@ async def test_payload_allowlist_strips_disallowed_fields():
     await db.close()
 
 
+@pytest.mark.asyncio
+async def test_deribit_user_change_order_update_enters_outbox_once():
+    db, repo, _ = await _setup()
+    event_ids = await repo.insert_deribit_subscription_events(
+        "user.changes.future.any.100ms",
+        {
+            "orders": [
+                {
+                    "order_id": "USDC-1",
+                    "order_state": "filled",
+                    "order_type": "stop_market",
+                    "instrument_name": "BTC_USDC-PERPETUAL",
+                    "direction": "buy",
+                    "amount": 0.1,
+                    "filled_amount": 0.1,
+                    "average_price": 80111.86,
+                    "trigger": "mark_price",
+                    "trigger_price": 80100.0,
+                    "reduce_only": True,
+                    "label": "decision-1",
+                    "last_update_timestamp": 1778676268882,
+                    "user_id": "must-be-stripped",
+                }
+            ],
+            "trades": [
+                {
+                    "trade_id": "trade-1",
+                    "order_id": "USDC-1",
+                    "instrument_name": "BTC_USDC-PERPETUAL",
+                    "direction": "buy",
+                    "amount": 0.1,
+                    "price": 80111.86,
+                    "timestamp": 1778676268882,
+                    "user_id": "must-be-stripped",
+                }
+            ],
+        },
+    )
+
+    assert len(event_ids) == 1
+    pending = await repo.pending_events("c1")
+    assert len(pending) == 1
+    event = pending[0]
+    payload = event["payload"]
+    assert event["type"] == "deribit_order_update"
+    assert payload["instrument"] == "BTC_USDC-PERPETUAL"
+    assert payload["order_state"] == "filled"
+    assert payload["order_type"] == "stop_market"
+    assert payload["order_id"] == "USDC-1"
+    assert payload["trigger_price"] == 80100.0
+    assert payload["reduce_only"] is True
+    assert "user_id" not in payload
+    assert "DERIBIT ORDER FILLED" in payload["message"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_deribit_trade_update_enters_outbox_when_no_order_update_present():
+    db, repo, _ = await _setup()
+    event_ids = await repo.insert_deribit_subscription_events(
+        "user.trades.future.any.100ms",
+        {
+            "trade_id": "trade-2",
+            "order_id": "USDC-2",
+            "instrument_name": "BTC_USDC-PERPETUAL",
+            "direction": "sell",
+            "amount": 0.2,
+            "price": 80200.5,
+            "fee": 1.23,
+            "fee_currency": "USDC",
+            "timestamp": 1778676269000,
+            "client_info": {"user_id": "must-be-stripped"},
+        },
+    )
+
+    assert len(event_ids) == 1
+    pending = await repo.pending_events("c1")
+    payload = pending[0]["payload"]
+    assert pending[0]["type"] == "deribit_trade_update"
+    assert payload["trade_id"] == "trade-2"
+    assert payload["fee_currency"] == "USDC"
+    assert "client_info" not in payload
+    assert "DERIBIT TRADE" in payload["message"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_deribit_order_updates_are_deduped_by_order_state_and_timestamp():
+    db, repo, _ = await _setup()
+    data = {
+        "order_id": "USDC-3",
+        "order_state": "cancelled",
+        "instrument_name": "BTC_USDC-PERPETUAL",
+        "last_update_timestamp": 1778676269999,
+    }
+
+    first = await repo.insert_deribit_subscription_events("user.orders.future.any.raw", data)
+    second = await repo.insert_deribit_subscription_events("user.orders.future.any.raw", data)
+
+    assert len(first) == 1
+    assert second == []
+    pending = await repo.pending_events("c1")
+    assert len(pending) == 1
+    assert pending[0]["payload"]["order_state"] == "cancelled"
+    await db.close()
+
+
 async def _force_expired(db: Database, event_id: str) -> None:
     """Backdate an event's expires_at so the reaper considers it expired."""
     conn = db.require_conn()

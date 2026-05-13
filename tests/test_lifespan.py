@@ -99,3 +99,23 @@ def test_invalid_ws_channel_guard_fails():
         s = _settings(deribit_ws_max_active_channels=value)
         with pytest.raises(ValueError, match="DERIBIT_WS_MAX_ACTIVE_CHANNELS"):
             s.validate_startup()
+
+
+def test_trading_event_outbox_requires_user_channels_when_enabled():
+    s = _settings(deribit_trading_event_channels="")
+    with pytest.raises(ValueError, match="DERIBIT_TRADING_EVENT_CHANNELS"):
+        s.validate_startup()
+
+
+def test_trading_event_outbox_rejects_non_user_channels():
+    s = _settings(deribit_trading_event_channels="ticker.BTC-PERPETUAL.100ms")
+    with pytest.raises(ValueError, match="user"):
+        s.validate_startup()
+
+
+def test_trading_event_outbox_can_be_disabled_without_channels():
+    s = _settings(
+        deribit_trading_event_outbox_enabled=False,
+        deribit_trading_event_channels="",
+    )
+    s.validate_startup()
