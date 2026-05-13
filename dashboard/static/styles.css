@@ -78,7 +78,8 @@ button:disabled {
 }
 
 .topbar h1,
-.panel h2 {
+.panel h2,
+.inline-section-heading h3 {
   margin: 0;
   letter-spacing: 0;
 }
@@ -90,6 +91,17 @@ button:disabled {
 
 .panel h2 {
   font-size: 17px;
+  line-height: 1.25;
+}
+
+.inline-section-heading {
+  margin: 16px 0 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.inline-section-heading h3 {
+  font-size: 14px;
   line-height: 1.25;
 }
 
@@ -288,6 +300,80 @@ button:disabled {
   font-weight: 700;
 }
 
+.held-alert-list {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.held-alert-group {
+  min-width: 0;
+  border: 1px dashed #aeb8aa;
+  border-radius: 8px;
+  background: rgba(241, 245, 238, 0.45);
+  padding: 10px;
+}
+
+.held-alert-group + .held-alert-group {
+  margin-top: 2px;
+}
+
+.held-alert-header,
+.held-alert-row {
+  display: grid;
+  align-items: start;
+  gap: 10px;
+}
+
+.held-alert-header {
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.held-alert-header span:first-child {
+  font-weight: 800;
+}
+
+.held-alert-header span:last-child,
+.held-alert-message,
+.held-alert-channel {
+  color: var(--muted);
+}
+
+.held-alert-rows {
+  display: grid;
+  gap: 0;
+}
+
+.held-alert-row {
+  grid-template-columns: minmax(150px, 0.8fr) minmax(190px, 1fr) minmax(70px, auto);
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+.held-alert-row:last-child {
+  border-bottom: 0;
+}
+
+.held-alert-trigger,
+.held-alert-message,
+.held-alert-channel {
+  min-width: 0;
+}
+
+.held-alert-message,
+.held-alert-channel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.held-alert-channel {
+  text-align: right;
+  white-space: nowrap;
+}
+
 .key-list {
   display: grid;
   gap: 8px;
@@ -482,7 +568,9 @@ td {
   .metric-grid,
   .layout-grid,
   .key-list.compact,
-  .form-grid {
+  .form-grid,
+  .held-alert-header,
+  .held-alert-row {
     grid-template-columns: 1fr;
   }
 
@@ -492,5 +580,9 @@ td {
 
   table {
     min-width: 560px;
+  }
+
+  .held-alert-channel {
+    text-align: left;
   }
 }

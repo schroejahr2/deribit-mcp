@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Deribit MCP Dashboard</title>
-    <link rel="stylesheet" href="/dashboard/static/styles.css" />
-    <script defer src="/dashboard/static/app.js"></script>
+    <link rel="stylesheet" href="/dashboard/static/styles.css?v=20260513-alerts-1" />
+    <script defer src="/dashboard/static/app.js?v=20260513-alerts-1"></script>
   </head>
   <body>
     <div id="dashboard-root" class="app-shell">
@@ -53,6 +53,11 @@
             </div>
             <div id="heldSymbols" class="symbol-strip"></div>
             <div id="positionsTable" class="table-wrap"></div>
+            <div class="inline-section-heading">
+              <p class="eyebrow">Wakeups</p>
+              <h3>Active Alerts</h3>
+            </div>
+            <div id="heldAlerts" class="held-alert-list"></div>
           </section>
 
           <section class="panel">

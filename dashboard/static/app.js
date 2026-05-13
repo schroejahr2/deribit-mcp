@@ -20,6 +20,7 @@ const els = {
   environmentBadge: document.getElementById("environmentBadge"),
   metricGrid: document.getElementById("metricGrid"),
   heldSymbols: document.getElementById("heldSymbols"),
+  heldAlerts: document.getElementById("heldAlerts"),
   positionsTable: document.getElementById("positionsTable"),
   healthList: document.getElementById("healthList"),
   brainList: document.getElementById("brainList"),
@@ -67,6 +68,26 @@ function formatTime(value) {
     minute: "2-digit",
     second: "2-digit",
   }).format(date);
+}
+
+function formatRelativeTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  const diffSeconds = Math.round((date.getTime() - Date.now()) / 1000);
+  const absSeconds = Math.abs(diffSeconds);
+  const units = [
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+  ];
+  for (const [label, seconds] of units) {
+    if (absSeconds >= seconds) {
+      const value = Math.round(absSeconds / seconds);
+      return diffSeconds >= 0 ? `in ${value}${label}` : `${value}${label} ago`;
+    }
+  }
+  return diffSeconds >= 0 ? "in <1m" : "<1m ago";
 }
 
 function short(value, max = 92) {
@@ -253,15 +274,158 @@ function renderSymbols(data) {
   const symbols = data.account?.held_symbols || [];
   if (symbols.length === 0) {
     renderEmpty(els.heldSymbols, "No open symbols");
+  } else {
+    const chips = symbols.map((symbol) => {
+      const chip = document.createElement("span");
+      chip.className = "symbol-chip";
+      chip.textContent = symbol;
+      return chip;
+    });
+    els.heldSymbols.replaceChildren(...chips);
+  }
+  renderHeldAlerts(data, symbols);
+}
+
+function instrumentName(row) {
+  return row?.instrument_name || row?.instrument || "";
+}
+
+function priceReferenceForInstrument(data, symbol) {
+  const positions = data.account?.open_positions || [];
+  const position = positions.find((p) => instrumentName(p) === symbol);
+  const price = Number(
+    position?.mark_price ??
+      position?.index_price ??
+      position?.average_price ??
+      position?.settlement_price
+  );
+  if (Number.isFinite(price) && price !== 0) return price;
+
+  const alert = (data.alerts?.all || []).find(
+    (a) => a.instrument === symbol && Number.isFinite(Number(a.last_price))
+  );
+  const lastPrice = Number(alert?.last_price);
+  return Number.isFinite(lastPrice) && lastPrice !== 0 ? lastPrice : null;
+}
+
+function alertTriggerDistance(alert, referencePrice) {
+  const threshold = Number(alert.threshold);
+  const price = Number(referencePrice);
+  if (!Number.isFinite(threshold) || !Number.isFinite(price) || price === 0) return "-";
+  const distance = Math.abs(threshold - price);
+  const pct = (distance / price) * 100;
+  return `Δ ${formatNumber(distance, 2)} (${formatNumber(pct, 2)}%)`;
+}
+
+function renderHeldAlerts(data, symbols) {
+  const activeAlerts = (data.alerts?.all || []).filter((alert) => alert.status === "active");
+  const activePriceAlerts = activeAlerts.filter(
+    (alert) => alert.condition !== "time" && alert.instrument
+  );
+  const activeTimeAlerts = activeAlerts.filter((alert) => alert.condition === "time");
+
+  if (activeAlerts.length === 0) {
+    renderEmpty(els.heldAlerts, "No active alerts");
     return;
   }
-  const chips = symbols.map((symbol) => {
-    const chip = document.createElement("span");
-    chip.className = "symbol-chip";
-    chip.textContent = symbol;
-    return chip;
+
+  const alertSymbols = activePriceAlerts.map((alert) => alert.instrument);
+  const groupSymbols = [...new Set([...symbols, ...alertSymbols])];
+  const groups = groupSymbols
+    .map((symbol) => ({
+      symbol,
+      referencePrice: priceReferenceForInstrument(data, symbol),
+      alerts: activePriceAlerts.filter((alert) => alert.instrument === symbol),
+    }))
+    .filter((group) => group.alerts.length > 0);
+
+  const nodes = groups.map((group) => {
+    const section = document.createElement("section");
+    section.className = "held-alert-group";
+
+    const header = document.createElement("div");
+    header.className = "held-alert-header";
+    const title = document.createElement("span");
+    title.textContent = group.symbol;
+    const meta = document.createElement("span");
+    meta.textContent = `${group.alerts.length} price · ref ${formatNumber(group.referencePrice, 2)}`;
+    header.append(title, meta);
+
+    const rows = document.createElement("div");
+    rows.className = "held-alert-rows";
+    for (const alert of group.alerts) {
+      const row = document.createElement("div");
+      row.className = "held-alert-row";
+
+      const trigger = document.createElement("div");
+      trigger.className = "held-alert-trigger";
+      trigger.append(
+        mainSub(
+          `${alert.condition} ${formatNumber(alert.threshold, 2)}`,
+          alertTriggerDistance(alert, group.referencePrice)
+        )
+      );
+
+      const message = document.createElement("div");
+      message.className = "held-alert-message";
+      message.textContent = short(alert.message, 86);
+
+      const channel = document.createElement("div");
+      channel.className = "held-alert-channel";
+      channel.textContent = alert.notification_channel || "-";
+
+      row.append(trigger, message, channel);
+      rows.appendChild(row);
+    }
+
+    section.append(header, rows);
+    return section;
   });
-  els.heldSymbols.replaceChildren(...chips);
+
+  if (activeTimeAlerts.length > 0) {
+    const section = document.createElement("section");
+    section.className = "held-alert-group";
+
+    const header = document.createElement("div");
+    header.className = "held-alert-header";
+    const title = document.createElement("span");
+    title.textContent = "Time Alerts";
+    const meta = document.createElement("span");
+    meta.textContent = `${activeTimeAlerts.length} active`;
+    header.append(title, meta);
+
+    const rows = document.createElement("div");
+    rows.className = "held-alert-rows";
+    for (const alert of activeTimeAlerts) {
+      const row = document.createElement("div");
+      row.className = "held-alert-row";
+
+      const trigger = document.createElement("div");
+      trigger.className = "held-alert-trigger";
+      trigger.append(
+        mainSub(
+          formatTime(alert.fire_at),
+          `${alert.instrument || "timer"} · ${formatRelativeTime(alert.fire_at)}`
+        )
+      );
+
+      const message = document.createElement("div");
+      message.className = "held-alert-message";
+      message.textContent = short(alert.message, 86);
+
+      const channel = document.createElement("div");
+      channel.className = "held-alert-channel";
+      channel.textContent = alert.notification_channel || "-";
+
+      row.append(trigger, message, channel);
+      rows.appendChild(row);
+    }
+
+    section.append(header, rows);
+    nodes.push(section);
+  }
+
+  els.heldAlerts.replaceChildren(...nodes);
 }
 
 function renderPositions(data) {
