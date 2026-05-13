@@ -1738,11 +1738,18 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
 
     @server.tool()
     async def get_positions(
-        currency: Optional[str] = "BTC",
+        currency: Optional[str] = None,
         kind: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
-        """Get current open positions."""
+        """Get current open positions.
+
+        With `currency=None` (default), returns positions across all
+        currency buckets (BTC, ETH, USDC, USDT, ...). Pass an explicit
+        `currency` only when intentionally restricting to one bucket —
+        USDC-margined perps (e.g. BTC_USDC-PERPETUAL) live in the
+        `USDC` bucket and are invisible to `currency="BTC"`.
+        """
         app_ctx = _ctx(ctx)
         return _json(await app_ctx.rest_client.get_positions(currency, kind))
 
