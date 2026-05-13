@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -795,12 +796,67 @@ class FakePlaceOrderRest:
         }
         self.ticker = ticker or {"mark_price": 80_000}
         self.buy_response = buy_response or {
-            "order": {"order_id": "buy-1", "instrument_name": "BTC-PERPETUAL"},
-            "trades": [],
+            "order": {
+                "order_id": "buy-1",
+                "order_state": "filled",
+                "order_type": "market",
+                "instrument_name": "BTC-PERPETUAL",
+                "direction": "buy",
+                "amount": 10.0,
+                "filled_amount": 10.0,
+                "average_price": 80_040.0,
+                "user_id": 123456,
+            },
+            "trades": [
+                {
+                    "trade_id": "trade-buy-1",
+                    "amount": 5.0,
+                    "contracts": 5.0,
+                    "price": 80_000.0,
+                    "fee": 0.01,
+                    "fee_currency": "BTC",
+                    "profit_loss": 1.25,
+                    "timestamp": 1_778_680_001,
+                    "user_id": 123456,
+                },
+                {
+                    "trade_id": "trade-buy-2",
+                    "amount": 5.0,
+                    "contracts": 5.0,
+                    "price": 80_080.0,
+                    "fee": 0.02,
+                    "fee_currency": "BTC",
+                    "profit_loss": -0.25,
+                    "timestamp": 1_778_680_002,
+                    "user_id": 123456,
+                },
+            ],
         }
         self.sell_response = sell_response or {
-            "order": {"order_id": "sell-1", "instrument_name": "BTC-PERPETUAL"},
-            "trades": [],
+            "order": {
+                "order_id": "sell-1",
+                "order_state": "filled",
+                "order_type": "market",
+                "instrument_name": "BTC-PERPETUAL",
+                "direction": "sell",
+                "amount": 10.0,
+                "filled_amount": 10.0,
+                "average_price": 79_950.0,
+                "user_id": 123456,
+            },
+            "trades": [
+                {
+                    "trade_id": "trade-sell-1",
+                    "amount": 10.0,
+                    "contracts": 10.0,
+                    "price": 79_950.0,
+                    "fee": 0.03,
+                    "fee_currency": "BTC",
+                    "profit_loss": 0.0,
+                    "timestamp": 1_778_680_003,
+                    "user_id": 123456,
+                }
+            ],
         }
         self.buy_calls = []
         self.sell_calls = []
@@ -1008,6 +1064,19 @@ async def test_place_order_happy_path_audits_trigger_fields(monkeypatch):
 
     assert response["client_order_id"] == "cid-1"
     assert response["result"]["order"]["order_id"] == "buy-1"
+    assert "trades" not in response["result"]
+    assert response["result"]["trades_summary"] == {
+        "count": 2,
+        "amount": 10.0,
+        "contracts": 10.0,
+        "average_price": 80_040.0,
+        "fees": {"BTC": 0.03},
+        "profit_loss": 1.0,
+        "latest_timestamp": 1_778_680_002,
+    }
+    assert "user_id" not in json.dumps(response)
+    assert audit.records[0]["response"]["order"]["user_id"] == 123456
+    assert audit.records[0]["response"]["trades"][0]["user_id"] == 123456
 
     audit_request = audit.records[0]["request"]
     assert audit_request["side"] == "buy"
@@ -1240,9 +1309,29 @@ class FakeBracketRest(FakePlaceOrderRest):
         self.bracket_response = {
             "order": {
                 "order_id": "entry-1",
+                "order_state": "filled",
+                "order_type": "market",
                 "instrument_name": "BTC-PERPETUAL",
+                "direction": "buy",
+                "amount": 10.0,
+                "filled_amount": 10.0,
+                "average_price": 80_000.0,
                 "oto_order_ids": ["OTO-slot-sl", "OTO-slot-tp"],
-            }
+                "user_id": 456789,
+            },
+            "trades": [
+                {
+                    "trade_id": "entry-trade-1",
+                    "amount": 10.0,
+                    "contracts": 10.0,
+                    "price": 80_000.0,
+                    "fee": 0.01,
+                    "fee_currency": "BTC",
+                    "profit_loss": 0.0,
+                    "timestamp": 1_778_680_010,
+                    "user_id": 456789,
+                }
+            ],
         }
         self.trigger_history_response = {
             "entries": [
@@ -1305,11 +1394,22 @@ async def test_place_bracket_happy_path_audits_entry_and_children(monkeypatch):
     assert response["client_order_id"] == "bracket-cid"
     # Hydrated operative ids — entry from response, SL/TP from trigger_history.
     assert response["entry_order_id"] == "entry-1"
+    assert response["result"]["order"]["order_id"] == "entry-1"
+    assert response["result"]["trades_summary"]["count"] == 1
+    assert "oto_order_ids" not in response["result"]["order"]
+    assert "trades" not in response["result"]
+    assert "user_id" not in json.dumps(response)
     assert response["child_order_ids"] == {"sl": "sl-real-1", "tp": "tp-real-1"}
     assert response["child_order_ids_resolved"] is True
+    assert response["child_order_resolution"] == "resolved"
     assert response["deribit_order_ids"] == ["entry-1", "sl-real-1", "tp-real-1"]
     assert audit.records[0]["tool_name"] == "place_bracket"
     assert audit.records[0]["deribit_order_ids"] == ["entry-1", "sl-real-1", "tp-real-1"]
+    assert audit.records[0]["response"]["order"]["oto_order_ids"] == [
+        "OTO-slot-sl",
+        "OTO-slot-tp",
+    ]
+    assert audit.records[0]["response"]["order"]["user_id"] == 456789
     assert rest.place_otoco_calls[0]["side"] == "buy"
     children = rest.place_otoco_calls[0]["otoco_config"]
     assert children[0]["direction"] == "sell"
@@ -1363,6 +1463,7 @@ async def test_place_bracket_hydration_timeout_falls_back_to_oto_refs(monkeypatc
     assert response["entry_order_id"] == "entry-1"
     assert response["child_order_ids"] == {"sl": None, "tp": None}
     assert response["child_order_ids_resolved"] is False
+    assert response["child_order_resolution"] == "pending"
     # Operative ids carry only the entry; OTO slot refs land in the audit
     # fallback path so future find_by_client_order_id at least surfaces them.
     assert response["deribit_order_ids"] == ["entry-1"]

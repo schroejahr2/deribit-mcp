@@ -115,6 +115,162 @@ def _extract_order_ids(response: Any) -> tuple[Optional[str], Optional[list[str]
     return unique[0], unique
 
 
+ORDER_RESPONSE_FIELDS = (
+    "order_id",
+    "order_state",
+    "order_type",
+    "instrument_name",
+    "direction",
+    "amount",
+    "filled_amount",
+    "average_price",
+    "price",
+    "trigger",
+    "trigger_price",
+    "trigger_offset",
+    "trigger_fill_condition",
+    "reduce_only",
+    "post_only",
+    "time_in_force",
+    "label",
+    "creation_timestamp",
+    "last_update_timestamp",
+)
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_order(order: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(order, dict):
+        return None
+    compact = {
+        key: order[key] for key in ORDER_RESPONSE_FIELDS if key in order and order[key] is not None
+    }
+    return compact or None
+
+
+def _summarize_trades(trades: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(trades, list):
+        return None
+
+    summary: dict[str, Any] = {"count": len(trades)}
+    if not trades:
+        return summary
+
+    amount_sum = 0.0
+    amount_seen = False
+    contracts_sum = 0.0
+    contracts_seen = False
+    weighted_price_sum = 0.0
+    weighted_price_weight = 0.0
+    fees: dict[str, float] = {}
+    profit_loss = 0.0
+    profit_loss_seen = False
+    latest_timestamp: Optional[int] = None
+
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+
+        amount = _as_float(trade.get("amount"))
+        if amount is not None:
+            amount_sum += amount
+            amount_seen = True
+            price = _as_float(trade.get("price"))
+            if price is not None:
+                weighted_price_sum += price * amount
+                weighted_price_weight += amount
+
+        contracts = _as_float(trade.get("contracts"))
+        if contracts is not None:
+            contracts_sum += contracts
+            contracts_seen = True
+
+        fee = _as_float(trade.get("fee"))
+        fee_currency = trade.get("fee_currency")
+        if fee is not None and fee_currency:
+            currency_key = str(fee_currency)
+            fees[currency_key] = fees.get(currency_key, 0.0) + fee
+
+        trade_profit_loss = _as_float(trade.get("profit_loss"))
+        if trade_profit_loss is not None:
+            profit_loss += trade_profit_loss
+            profit_loss_seen = True
+
+        timestamp = trade.get("timestamp")
+        if isinstance(timestamp, int):
+            latest_timestamp = (
+                timestamp if latest_timestamp is None else max(latest_timestamp, timestamp)
+            )
+
+    if amount_seen:
+        summary["amount"] = amount_sum
+    if contracts_seen:
+        summary["contracts"] = contracts_sum
+    if weighted_price_weight:
+        summary["average_price"] = weighted_price_sum / weighted_price_weight
+    if fees:
+        summary["fees"] = fees
+    if profit_loss_seen:
+        summary["profit_loss"] = profit_loss
+    if latest_timestamp is not None:
+        summary["latest_timestamp"] = latest_timestamp
+    return summary
+
+
+def _looks_like_order(value: Any) -> bool:
+    return isinstance(value, dict) and any(
+        key in value for key in ("order_id", "order_state", "order_type", "instrument_name")
+    )
+
+
+def _compact_deribit_order_result(response: Any) -> dict[str, Any]:
+    """Keep trading-relevant response fields without raw Deribit trade dumps."""
+    if not isinstance(response, dict):
+        return {"result": response}
+
+    compact: dict[str, Any] = {}
+    order = response.get("order") if isinstance(response.get("order"), dict) else None
+    if order is None and _looks_like_order(response):
+        order = response
+
+    compact_order = _compact_order(order)
+    if compact_order is not None:
+        compact["order"] = compact_order
+
+    orders = response.get("orders")
+    if isinstance(orders, list):
+        compact_orders = [
+            item for item in (_compact_order(order_item) for order_item in orders) if item
+        ]
+        if compact_orders:
+            compact["orders"] = compact_orders
+
+    trades_summary = _summarize_trades(response.get("trades"))
+    if trades_summary is not None:
+        compact["trades_summary"] = trades_summary
+
+    for key in ("cancelled_count", "continuation", "has_more"):
+        if key in response:
+            compact[key] = response[key]
+
+    if compact:
+        return compact
+
+    return {
+        key: value
+        for key, value in response.items()
+        if value is None or isinstance(value, (str, int, float, bool))
+    }
+
+
 def _currency_from_instrument(instrument: str) -> str:
     """Derive Deribit settlement currency from instrument name.
 
@@ -483,7 +639,7 @@ async def _place_order_impl(
             trigger_offset=trigger_offset,
         ),
     )
-    envelope = {"client_order_id": actual_id, "result": result}
+    envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
     await _store_idempotent_response(app_ctx, actual_id, envelope)
     return envelope
 
@@ -816,11 +972,14 @@ async def _place_bracket_impl(
     fallback_ids = _extract_bracket_order_ids(result) or None
     envelope = {
         "client_order_id": actual_id,
-        "result": result,
+        "result": _compact_deribit_order_result(result),
         "deribit_order_ids": operative_ids or fallback_ids,
         "entry_order_id": entry_order_id,
         "child_order_ids": dict(hydration_holder),
         "child_order_ids_resolved": bool(hydration_holder.get("sl") and hydration_holder.get("tp")),
+        "child_order_resolution": (
+            "resolved" if hydration_holder.get("sl") and hydration_holder.get("tp") else "pending"
+        ),
     }
     await _store_idempotent_response(app_ctx, actual_id, envelope)
     return envelope
@@ -878,7 +1037,7 @@ async def _cancel_orders_by_label_impl(
         lambda: app_ctx.rest_client.cancel_by_label(decision_id, currency),
         deribit_order_ids_override=preflight_ids,
     )
-    envelope = {"client_order_id": actual_id, "result": result}
+    envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
     await _store_idempotent_response(app_ctx, actual_id, envelope)
     return envelope
 
@@ -1004,7 +1163,7 @@ async def _edit_order_by_label_impl(
             advanced=advanced,
         ),
     )
-    envelope = {"client_order_id": actual_id, "result": result}
+    envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
     await _store_idempotent_response(app_ctx, actual_id, envelope)
     return envelope
 
@@ -1756,10 +1915,9 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             resolved. If `false`, hydration timed out (Deribit history is
             asynchronous) — fall back to `get_trigger_order_history` or
             `get_open_orders_by_label` to pick up the children.
-          - `result.order.oto_order_ids`: `OTO-...` slot references from
-            Deribit. These are NOT operative ids — `get_order_state(OTO-...)`
-            returns `order_not_found`. Kept in the raw result for parity
-            with the Deribit response shape only.
+          - `result`: compact order + trade summary only. Raw Deribit
+            payloads, including non-operative `OTO-...` slot refs, stay in
+            `order_audit` for debugging without bloating the session.
         """
         app_ctx = _ctx(ctx)
         return _json(
@@ -1812,7 +1970,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_id,
             lambda: app_ctx.rest_client.cancel_order(order_id),
         )
-        envelope = {"client_order_id": actual_id, "result": result}
+        envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
         await _store_idempotent_response(app_ctx, actual_id, envelope)
         return _json(envelope)
 
@@ -1884,7 +2042,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 advanced=advanced,
             ),
         )
-        envelope = {"client_order_id": actual_id, "result": result}
+        envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
         await _store_idempotent_response(app_ctx, actual_id, envelope)
         return _json(envelope)
 
@@ -2005,7 +2163,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 confirm_cancel_all=confirm_cancel_all,
             ),
         )
-        return _json(result)
+        return _json(_compact_deribit_order_result(result))
 
     @server.tool()
     async def close_position(
@@ -2039,7 +2197,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_id,
             lambda: app_ctx.rest_client.close_position(instrument, order_type, price),
         )
-        return _json(result)
+        return _json(_compact_deribit_order_result(result))
 
     @server.tool()
     async def create_combo(

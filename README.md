@@ -317,6 +317,11 @@ Same backing table as the [News Webhook](#news-webhook).
 | `close_position(instrument, type, ...)` | Flatten a position |
 | `create_combo(...)` | Build a custom combo instrument |
 
+Mutating order responses are intentionally compact: they return order IDs,
+state, fill/average-price details, SL/TP child resolution, and aggregate
+trade summaries. Full Deribit payloads stay in `order_audit` for debugging
+and replay without flooding agent sessions.
+
 **Safety contract:**
 
 - `DERIBIT_TRADING_ENABLED=false` blocks every mutating tool by default.
