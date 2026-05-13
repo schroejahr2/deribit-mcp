@@ -153,8 +153,8 @@ GET /dashboard/ (admin Bearer token for JSON + news push)
 **Tool path:** Claude Code is the MCP client. It loads this server
 either directly over stdio (`MCP_TRANSPORT=stdio`) or over
 streamable-http — optionally through an MCP gateway in front. The HTTP
-transport is protected by an `X-Deribit-MCP-Secret` shared secret. The
-server is gateway-agnostic; wire it up however your setup prefers.
+transport is protected by an `X-Deribit-MCP-Secret` shared secret.
+The server is gateway-agnostic; wire it up however your setup prefers.
 
 **Wakeup path (sidecar plugin):** Alerts tagged
 `notification_channel="outbox"` write structured events to a durable
@@ -583,8 +583,8 @@ Single SQLite database mounted on a host volume. Tables:
 - `idempotency_keys` — per-call cache for `client_order_id`. 5 min TTL,
   reaped every 5 min. Survives container restart.
 - `event_outbox`, `event_consumers`, `event_deliveries` — sidecar
-  wakeup pipeline state. Reaper deletes only events whose deliveries
-  are all ACKed and whose `expires_at` has passed.
+  wakeup pipeline state. Reaper deletes only events whose deliveries are
+  all ACKed and whose `expires_at` has passed.
 - `news` — externally ingested news items with headline, summary,
   source, instrument scope, URL, score, tags, free-form JSON content,
   processing status, optional model attribution, and notification push
@@ -687,6 +687,8 @@ src/
 │                        # NoteRepo, NewsRepo
 ├── news.py              # compact/full response shaping + push formatting
 ├── news_api.py          # FastAPI routes for /news/*
+├── briefings.py         # briefing row formatting
+├── briefings_api.py    # FastAPI routes for /briefings/*
 ├── event_outbox.py      # Outbox repo, severity mapping, payload allowlist,
 │                        # consumer lifecycle, claim/ack/heartbeat/reaper
 ├── events_api.py        # FastAPI routes for /events/*
@@ -701,7 +703,7 @@ src/
 ├── config.py            # pydantic-settings; validate_startup()
 └── __main__.py          # MCP_TRANSPORT switch (http vs stdio)
 
-dashboard/               # Browser dashboard: FastAPI router + static UI
+dashboard/               # Browser dashboard: `dashboard/api.py` + `dashboard/static/`
 tests/                   # pytest cases covering the layers above
 channel-plugin/          # Sidecar handoff & build instructions
 DEMO_CLAUDE.md           # Example Claude Code operating prompt
