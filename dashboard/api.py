@@ -152,29 +152,32 @@ async def _collect_deribit_account(ctx: Any, errors: list[dict[str, str]]) -> di
     open_orders: list[dict[str, Any]] = []
     user_trades: list[dict[str, Any]] = []
 
-    for currency in currencies:
-        currency_positions = await _call_private(
-            f"positions:{currency}",
-            rest_client.get_positions(currency=currency),
-            errors,
-            [],
+    async def _fetch_currency(currency: str) -> tuple[list[Any], list[Any], list[Any]]:
+        return await asyncio.gather(
+            _call_private(
+                f"positions:{currency}",
+                rest_client.get_positions(currency=currency),
+                errors,
+                [],
+            ),
+            _call_private(
+                f"open_orders:{currency}",
+                rest_client.get_open_orders(currency=currency),
+                errors,
+                [],
+            ),
+            _call_private(
+                f"user_trades:{currency}",
+                rest_client.get_user_trades(currency=currency, count=25, sorting="desc"),
+                errors,
+                [],
+            ),
         )
+
+    currency_results = await asyncio.gather(*(_fetch_currency(c) for c in currencies))
+    for currency_positions, currency_orders, currency_trades in currency_results:
         positions.extend(position for position in currency_positions if isinstance(position, dict))
-
-        currency_orders = await _call_private(
-            f"open_orders:{currency}",
-            rest_client.get_open_orders(currency=currency),
-            errors,
-            [],
-        )
         open_orders.extend(order for order in currency_orders if isinstance(order, dict))
-
-        currency_trades = await _call_private(
-            f"user_trades:{currency}",
-            rest_client.get_user_trades(currency=currency, count=25, sorting="desc"),
-            errors,
-            [],
-        )
         user_trades.extend(trade for trade in currency_trades if isinstance(trade, dict))
 
     user_trades.sort(key=_timestamp_sort_value, reverse=True)
@@ -416,6 +419,11 @@ async def dashboard_summary(
             "consumers": len(consumers),
         },
         "account": account,
+        "prices": {
+            instrument: float(price)
+            for instrument, price in (getattr(ctx, "price_cache", {}) or {}).items()
+            if isinstance(price, (int, float))
+        },
         "alerts": {
             "all": alert_rows,
             "price": price_alert_rows,

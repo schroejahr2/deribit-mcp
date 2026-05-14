@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Deribit MCP Dashboard</title>
-    <link rel="stylesheet" href="/dashboard/static/styles.css?v=20260513-alerts-1" />
-    <script defer src="/dashboard/static/app.js?v=20260513-alerts-1"></script>
+    <link rel="stylesheet" href="/dashboard/static/styles.css?v=20260513-alerts-5" />
+    <script defer src="/dashboard/static/app.js?v=20260513-alerts-5"></script>
   </head>
   <body>
     <div id="dashboard-root" class="app-shell">
@@ -68,51 +68,15 @@
               </div>
             </div>
             <div id="healthList" class="key-list"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Brain</p>
-                <h2>Registration</h2>
-              </div>
+            <div class="inline-section-heading">
+              <p class="eyebrow">Brain</p>
+              <h3>Registration</h3>
             </div>
             <div id="brainList" class="key-list"></div>
           </section>
 
-          <section class="panel panel-wide">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Wakeups</p>
-                <h2>Alerts, Timer, Cron</h2>
-              </div>
-            </div>
-            <div id="schedulerList" class="key-list compact"></div>
-            <div id="alertsTable" class="table-wrap"></div>
-          </section>
-
-          <section class="panel panel-wide">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Decisions</p>
-                <h2>Latest Decisions</h2>
-              </div>
-            </div>
-            <div id="decisionsTable" class="table-wrap"></div>
-          </section>
-
-          <section class="panel panel-wide">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">Trading</p>
-                <h2>Latest Trades and Orders</h2>
-              </div>
-            </div>
-            <div id="tradesTable" class="table-wrap"></div>
-            <div id="auditTable" class="table-wrap secondary-table"></div>
-          </section>
-
-          <section class="panel panel-wide">
+          <div class="panel-row">
+          <section class="panel">
             <div class="panel-header">
               <div>
                 <p class="eyebrow">News</p>
@@ -165,7 +129,7 @@
             <div id="newsTable" class="table-wrap"></div>
           </section>
 
-          <section class="panel panel-wide">
+          <section class="panel">
             <div class="panel-header">
               <div>
                 <p class="eyebrow">Outbox</p>
@@ -174,6 +138,39 @@
             </div>
             <div id="consumersTable" class="table-wrap"></div>
             <div id="eventsTable" class="table-wrap secondary-table"></div>
+          </section>
+          </div>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Wakeups</p>
+                <h2>Alerts, Timer, Cron</h2>
+              </div>
+            </div>
+            <div id="schedulerList" class="key-list compact"></div>
+            <div id="alertsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Decisions</p>
+                <h2>Latest Decisions</h2>
+              </div>
+            </div>
+            <div id="decisionsTable" class="table-wrap"></div>
+          </section>
+
+          <section class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Trading</p>
+                <h2>Latest Trades and Orders</h2>
+              </div>
+            </div>
+            <div id="tradesTable" class="table-wrap"></div>
+            <div id="auditTable" class="table-wrap secondary-table"></div>
           </section>
         </section>
       </main>

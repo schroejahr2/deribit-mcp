@@ -61,12 +61,13 @@ function formatTime(value) {
   if (!value) return "-";
   const date = typeof value === "number" ? new Date(value) : new Date(value);
   if (Number.isNaN(date.getTime())) return text(value);
-  return new Intl.DateTimeFormat("en-US", {
+  return new Intl.DateTimeFormat("en-GB", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hour12: false,
   }).format(date);
 }
 
@@ -136,7 +137,8 @@ function renderEmpty(target, label) {
 }
 
 function renderTable(target, rows, columns, emptyLabel) {
-  if (!rows || rows.length === 0) {
+  const visibleRows = (rows || []).slice(0, 15);
+  if (!visibleRows || visibleRows.length === 0) {
     renderEmpty(target, emptyLabel);
     return;
   }
@@ -153,7 +155,7 @@ function renderTable(target, rows, columns, emptyLabel) {
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
-  for (const row of rows) {
+  for (const row of visibleRows) {
     const tr = document.createElement("tr");
     for (const column of columns) {
       const td = document.createElement("td");
@@ -168,7 +170,8 @@ function renderTable(target, rows, columns, emptyLabel) {
 }
 
 function renderKeyList(target, rows) {
-  const nodes = rows.map(([label, value]) => {
+  const visibleRows = (rows || []).slice(0, 15);
+  const nodes = visibleRows.map(([label, value]) => {
     const row = document.createElement("div");
     row.className = "key-row";
     const left = document.createElement("span");
@@ -271,7 +274,7 @@ function renderBrain(data) {
 }
 
 function renderSymbols(data) {
-  const symbols = data.account?.held_symbols || [];
+  const symbols = (data.account?.held_symbols || []).slice(0, 15);
   if (symbols.length === 0) {
     renderEmpty(els.heldSymbols, "No open symbols");
   } else {
@@ -291,6 +294,9 @@ function instrumentName(row) {
 }
 
 function priceReferenceForInstrument(data, symbol) {
+  const livePrice = Number(data.prices?.[symbol]);
+  if (Number.isFinite(livePrice) && livePrice !== 0) return livePrice;
+
   const positions = data.account?.open_positions || [];
   const position = positions.find((p) => instrumentName(p) === symbol);
   const price = Number(
@@ -318,7 +324,10 @@ function alertTriggerDistance(alert, referencePrice) {
 }
 
 function renderHeldAlerts(data, symbols) {
-  const activeAlerts = (data.alerts?.all || []).filter((alert) => alert.status === "active");
+  const activeAlerts = (data.alerts?.all || [])
+    .filter((alert) => alert.status === "active")
+    .sort((a, b) => alertCreatedTimestamp(b) - alertCreatedTimestamp(a))
+    .slice(0, 15);
   const activePriceAlerts = activeAlerts.filter(
     (alert) => alert.condition !== "time" && alert.instrument
   );
@@ -475,8 +484,17 @@ function renderScheduler(data) {
   ]);
 }
 
+function alertCreatedTimestamp(alert) {
+  const value = alert?.created_at;
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function renderAlerts(data) {
-  const rows = data.alerts?.all || [];
+  const rows = [...(data.alerts?.all || [])].sort(
+    (a, b) => alertCreatedTimestamp(b) - alertCreatedTimestamp(a)
+  );
   renderTable(
     els.alertsTable,
     rows,
