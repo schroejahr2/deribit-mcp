@@ -1202,7 +1202,11 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         await app_ctx.ws_client.subscribe_ticker(instrument, callback)
         try:
             ticker = await app_ctx.ws_client.get_ticker(instrument)
-            current_price = ticker.get("last_price")
+            current_price = (
+                ticker.get("mark_price")
+                or ticker.get("last_price")
+                or ticker.get("index_price")
+            )
             if current_price:
                 app_ctx.price_cache[instrument] = float(current_price)
                 await app_ctx.alert_manager.process_price_update(instrument, float(current_price))

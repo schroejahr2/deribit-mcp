@@ -138,7 +138,9 @@ sidecar can trust these fields exist for relevant events:
   "event_id": "uuid4",                           // STABLE; dedup key
   "event_type": "price_alert_triggered" | "time_alert_triggered",
   "severity": "info" | "warning",                // server-derived
-  "created_at": "2026-05-06T07:25:40+00:00",
+  "created_at": "2026-05-06T07:25:40+00:00",     // == delivered_at; outbox-insert moment
+  "triggered_at": "2026-05-06T07:25:39+00:00",   // event-source moment (see mapping below)
+  "delivered_at": "2026-05-06T07:25:40+00:00",   // server publish moment
   "type": "price_alert_triggered",               // duplicate of event_type — outer column
   "payload": {                                   // the JSON dict from payload_json
     "alert_id": "...",
@@ -152,10 +154,26 @@ sidecar can trust these fields exist for relevant events:
     "decision_id": "uuid4" | null,
     "event_id": "uuid4",
     "event_type": "...",
-    "created_at": "..."
+    "created_at": "...",
+    "triggered_at": "...",                       // mirrored from outer
+    "delivered_at": "..."                        // mirrored from outer
   }
 }
 ```
+
+### `triggered_at` source per event type
+
+| event_type | triggered_at = |
+|---|---|
+| `price_alert_triggered` | `alert.last_trigger_time` (alert-engine match moment) |
+| `time_alert_triggered` | `alert.last_trigger_time` (scheduler fire moment) |
+| `news_ready` | `news.created_at` (push moment) |
+| `deribit_order_update` | `last_update_timestamp` (Deribit ms → ISO) |
+| `deribit_trade_update` | `timestamp` (Deribit ms → ISO) |
+| `deribit_ws_*` (connection events) | falls back to `delivered_at` |
+
+`delivery_lag_ms = delivered_at − triggered_at`. Stale-filter on `delivered_at`
+(server clock), not `triggered_at` (source clock may drift).
 
 The server-derived `severity` mapping:
 - `percentage_change` with `|threshold| >= 5%` → `warning`
@@ -185,7 +203,10 @@ the spike (Phase D.0 below). The current best understanding:
       "event_id": "...",
       "event_type": "...",
       "severity": "info",
-      "instrument": "BTC_PERPETUAL"   // hyphens replaced with underscore
+      "instrument": "BTC_PERPETUAL",       // hyphens replaced with underscore
+      "created_at": "...",
+      "triggered_at": "...",                // event-source moment
+      "delivered_at": "..."                 // server publish moment
     }
   }
   ```

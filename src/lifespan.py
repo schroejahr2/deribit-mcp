@@ -52,6 +52,9 @@ class AppContext:
     market_stream_manager: MarketStreamManager
 
 
+CONSUMER_STALE_TTL_SECONDS = 3600
+
+
 async def _maintenance_reaper_loop(
     event_outbox_repo: EventOutboxRepo,
     idempotency_repo: IdempotencyRepo,
@@ -61,6 +64,11 @@ async def _maintenance_reaper_loop(
             await asyncio.sleep(300)
             await event_outbox_repo.reap_expired()
             await idempotency_repo.prune_expired()
+            reaped = await event_outbox_repo.reap_stale_consumers(
+                CONSUMER_STALE_TTL_SECONDS
+            )
+            if reaped:
+                logger.info("Reaped %d stale consumer(s)", reaped)
     except asyncio.CancelledError:
         pass
     except Exception as exc:
@@ -142,10 +150,14 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
 
     async def on_price_update(instrument: str, tick_data: Dict[str, Any]):
         try:
-            last_price = tick_data.get("last_price")
-            if last_price:
-                price_cache[instrument] = float(last_price)
-                await alert_manager.process_price_update(instrument, float(last_price))
+            price = (
+                tick_data.get("mark_price")
+                or tick_data.get("last_price")
+                or tick_data.get("index_price")
+            )
+            if price:
+                price_cache[instrument] = float(price)
+                await alert_manager.process_price_update(instrument, float(price))
         except Exception as exc:
             logger.error("Error processing price update for %s: %s", instrument, exc, exc_info=True)
 
@@ -230,7 +242,11 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             await ws_client.subscribe_ticker(instrument, on_price_update)
             try:
                 ticker = await ws_client.get_ticker(instrument)
-                current_price = ticker.get("last_price")
+                current_price = (
+                    ticker.get("mark_price")
+                    or ticker.get("last_price")
+                    or ticker.get("index_price")
+                )
                 if current_price:
                     price_cache[instrument] = float(current_price)
                     await alert_manager.process_price_update(instrument, float(current_price))

@@ -6,11 +6,22 @@ import hashlib
 import json
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 from .config import settings
 from .persistence import Database, to_iso, utc_now
+
+
+def _ms_to_iso(value: Any) -> Optional[str]:
+    """Convert a millisecond epoch (int|str|float) to ISO; None on failure."""
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    return to_iso(datetime.fromtimestamp(ms / 1000, tz=timezone.utc))
 
 ALLOWED_PAYLOAD_KEYS = {
     "event_id",
@@ -25,6 +36,8 @@ ALLOWED_PAYLOAD_KEYS = {
     "severity",
     "message",
     "created_at",
+    "triggered_at",
+    "delivered_at",
     "news_id",
     "source",
     "headline",
@@ -243,16 +256,20 @@ class EventOutboxRepo:
     ) -> Optional[str]:
         event_id = str(uuid.uuid4())
         created_at = utc_now()
+        created_at_iso = to_iso(created_at)
         expires_at = created_at + timedelta(
             days=retention_days or settings.deribit_event_retention_days
         )
+        triggered_at = payload.get("triggered_at") or created_at_iso
         payload = sanitize_payload(
             {
                 **payload,
                 "event_id": event_id,
                 "event_type": event_type,
                 "severity": severity,
-                "created_at": to_iso(created_at),
+                "created_at": created_at_iso,
+                "triggered_at": triggered_at,
+                "delivered_at": created_at_iso,
             }
         )
         conn = self.db.require_conn()
@@ -298,6 +315,7 @@ class EventOutboxRepo:
             "fire_at": to_iso(alert.fire_at),
             "severity": severity,
             "message": message,
+            "triggered_at": to_iso(alert.last_trigger_time),
         }
         return await self.insert_event(
             event_type, payload, severity=severity, dedupe_key=dedupe_key
@@ -338,6 +356,7 @@ class EventOutboxRepo:
             "score": news.get("score"),
             "tags": news.get("tags"),
             "message": message,
+            "triggered_at": news.get("created_at") or news.get("published_at"),
         }
         return await self.insert_event(
             "news_ready",
@@ -362,6 +381,10 @@ class EventOutboxRepo:
         payload["source"] = "deribit_ws"
         payload["channel"] = channel
         payload["message"] = _order_message(payload)
+        payload["triggered_at"] = (
+            _ms_to_iso(payload.get("last_update_timestamp"))
+            or _ms_to_iso(payload.get("creation_timestamp"))
+        )
         dedupe_key = "deribit-order:" + _dedupe_fragment(
             channel,
             payload.get("order_id"),
@@ -393,6 +416,7 @@ class EventOutboxRepo:
         payload["source"] = "deribit_ws"
         payload["channel"] = channel
         payload["message"] = _trade_message(payload)
+        payload["triggered_at"] = _ms_to_iso(payload.get("timestamp"))
         dedupe_key = "deribit-trade:" + _dedupe_fragment(
             channel,
             payload.get("trade_id"),
@@ -561,7 +585,10 @@ class EventOutboxRepo:
                 """,
                 (consumer_id, event["event_id"], now),
             )
-            event["payload"] = json.loads(event.pop("payload_json"))
+            payload = json.loads(event.pop("payload_json"))
+            event["payload"] = payload
+            event["triggered_at"] = payload.get("triggered_at")
+            event["delivered_at"] = payload.get("delivered_at")
         await conn.commit()
         return events
 
@@ -602,3 +629,17 @@ class EventOutboxRepo:
             (to_iso(utc_now()),),
         )
         await conn.commit()
+
+    async def reap_stale_consumers(self, ttl_seconds: int) -> int:
+        conn = self.db.require_conn()
+        cutoff = to_iso(utc_now() - timedelta(seconds=ttl_seconds))
+        cursor = await conn.execute(
+            """
+            DELETE FROM event_consumers
+            WHERE COALESCE(last_seen_at, created_at) < ?
+              AND (active_stream_until IS NULL OR active_stream_until < ?)
+            """,
+            (cutoff, to_iso(utc_now())),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
