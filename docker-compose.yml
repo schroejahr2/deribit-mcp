@@ -15,7 +15,7 @@ services:
       DERIBIT_MAX_AMOUNT_OPTION: ${DERIBIT_MAX_AMOUNT_OPTION}
       DERIBIT_MAX_NOTIONAL_USD: ${DERIBIT_MAX_NOTIONAL_USD}
     volumes:
-      - ./data:/data
+      - deribit_data:/data
     expose:
       - "8000"
     ports:
@@ -32,3 +32,6 @@ services:
       retries: 3
       start_period: 30s
     restart: unless-stopped
+
+volumes:
+  deribit_data:

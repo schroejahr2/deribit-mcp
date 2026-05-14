@@ -53,10 +53,16 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA foreign_keys = ON")
         await self.conn.execute("PRAGMA journal_mode = WAL")
+        await self.conn.execute("PRAGMA synchronous = FULL")
         await self.bootstrap()
 
     async def close(self) -> None:
         if self.conn:
+            try:
+                await self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await self.conn.commit()
+            except Exception:
+                pass
             await self.conn.close()
             self.conn = None
 
