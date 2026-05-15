@@ -68,7 +68,7 @@ def _ctx(ctx: Any = None) -> Any:
 
 
 def _json(data: Any) -> str:
-    return json.dumps(data, indent=2, sort_keys=True, default=str)
+    return json.dumps(data, separators=(",", ":"), sort_keys=True, default=str)
 
 
 def _parse_time_alert_fire_at(
