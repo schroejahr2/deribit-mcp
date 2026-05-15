@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     deribit_orderbook_idle_unsubscribe_seconds: int = 300
     deribit_liquidation_buffer_size: int = 1000
     deribit_ws_max_active_channels: int = 450
+    deribit_ws_reconnect_max_delay_seconds: float = 60.0
+    deribit_ws_reconnect_heartbeat_attempts: int = 10
+
+    # Max age for an in-memory cached price before get_current_price falls back to a
+    # fresh REST fetch. Keep small enough that WS-glitch staleness is caught.
+    deribit_price_cache_max_age_seconds: float = 3.0
 
     # Logging
     log_level: str = "INFO"
@@ -96,6 +102,12 @@ class Settings(BaseSettings):
             raise ValueError("DERIBIT_LIQUIDATION_BUFFER_SIZE must be > 0")
         if not 1 <= self.deribit_ws_max_active_channels <= 500:
             raise ValueError("DERIBIT_WS_MAX_ACTIVE_CHANNELS must be between 1 and 500")
+        if self.deribit_ws_reconnect_max_delay_seconds <= 0:
+            raise ValueError("DERIBIT_WS_RECONNECT_MAX_DELAY_SECONDS must be > 0")
+        if self.deribit_ws_reconnect_heartbeat_attempts < 0:
+            raise ValueError("DERIBIT_WS_RECONNECT_HEARTBEAT_ATTEMPTS must be >= 0")
+        if self.deribit_price_cache_max_age_seconds < 0:
+            raise ValueError("DERIBIT_PRICE_CACHE_MAX_AGE_SECONDS must be >= 0")
         if self.deribit_trading_event_outbox_enabled:
             channels = [
                 channel.strip()

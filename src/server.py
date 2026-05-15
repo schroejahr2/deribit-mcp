@@ -528,6 +528,86 @@ async def _store_idempotent_response(
         await app_ctx.idempotency_repo.set(client_order_id, response)
 
 
+async def _reject_already_triggered_entry(
+    app_ctx: Any,
+    *,
+    instrument: str,
+    side: str,
+    entry_trigger_price: Optional[float],
+) -> None:
+    """Reject stop-* bracket entries whose trigger is already past current price.
+
+    A ``buy`` stop-entry only makes sense if current price is *below* the
+    trigger (we want to enter when price breaks up through it). A ``sell``
+    stop-entry only makes sense if current price is *above* the trigger
+    (entry on a break down). Already-past triggers would fire immediately
+    and execute against current liquidity — defeating the operator intent
+    of a "wait for breakout" setup. The cache is bypassed so a stale WS
+    feed cannot mask the divergence.
+    """
+    if entry_trigger_price is None:
+        return
+    snapshot = await _get_current_price_impl(
+        app_ctx,
+        instrument=instrument,
+        skip_cache=True,
+    )
+    current = snapshot.get("last_price") or snapshot.get("mark_price")
+    if current is None:
+        return
+    current_float = float(current)
+    if side == "buy" and current_float >= entry_trigger_price:
+        raise TradingValidationError(
+            f"buy stop-entry trigger {entry_trigger_price} is already at or below "
+            f"current price {current_float}; trigger would fire immediately"
+        )
+    if side == "sell" and current_float <= entry_trigger_price:
+        raise TradingValidationError(
+            f"sell stop-entry trigger {entry_trigger_price} is already at or above "
+            f"current price {current_float}; trigger would fire immediately"
+        )
+
+
+async def _get_current_price_impl(
+    app_ctx: Any,
+    *,
+    instrument: str,
+    skip_cache: bool = False,
+    max_age_seconds: Optional[float] = None,
+) -> dict[str, Any]:
+    """Return current price with explicit freshness metadata.
+
+    Cache hits include ``age_seconds`` so callers can reason about staleness.
+    On cache miss (or when ``skip_cache=True``) a fresh REST ticker is fetched
+    and ``source="fresh"`` is stamped into the response.
+    """
+    cache = app_ctx.price_cache
+    threshold = (
+        max_age_seconds
+        if max_age_seconds is not None
+        else settings.deribit_price_cache_max_age_seconds
+    )
+    age_fn = getattr(cache, "age_seconds", None)
+    age: Optional[float] = None
+    if callable(age_fn):
+        raw_age = age_fn(instrument)
+        if isinstance(raw_age, (int, float)):
+            age = float(raw_age)
+    if not skip_cache and instrument in cache and age is not None and age <= threshold:
+        return {
+            "instrument": instrument,
+            "last_price": cache[instrument],
+            "source": "cache",
+            "age_seconds": round(age, 3),
+        }
+    ticker = await app_ctx.ws_client.get_ticker(instrument)
+    if ticker.get("last_price"):
+        cache[instrument] = float(ticker["last_price"])
+    payload = dict(ticker)
+    payload["source"] = "fresh"
+    return payload
+
+
 async def _place_order_impl(
     app_ctx: Any,
     *,
@@ -762,27 +842,67 @@ async def _create_combo_impl(
     return envelope
 
 
+BRACKET_ENTRY_TYPES = frozenset({"market", "limit", "stop_market", "stop_limit"})
+BRACKET_TRIGGER_ENTRY_TYPES = frozenset({"stop_market", "stop_limit"})
+
+
+def _resolve_bracket_trigger_sources(
+    *,
+    trigger_source: str,
+    entry_trigger_source: Optional[str],
+    sl_trigger_source: Optional[str],
+    tp_trigger_source: Optional[str],
+) -> dict[str, str]:
+    return {
+        "entry": entry_trigger_source or trigger_source,
+        "sl": sl_trigger_source or trigger_source,
+        "tp": tp_trigger_source or trigger_source,
+    }
+
+
 def _validate_bracket_params(
     *,
     side: str,
     entry_type: str,
     entry_price: Optional[float],
+    entry_trigger_price: Optional[float],
     sl_type: str,
     sl_trigger_price: float,
     sl_limit_price: Optional[float],
     tp_type: str,
     tp_trigger_price: float,
     trigger_source: str,
+    entry_trigger_source: Optional[str],
+    sl_trigger_source: Optional[str],
+    tp_trigger_source: Optional[str],
     trigger_fill_condition: str,
 ) -> None:
     if side not in {"buy", "sell"}:
         raise ValueError("side must be 'buy' or 'sell'")
-    if entry_type not in {"market", "limit"}:
-        raise ValueError("entry_type must be 'market' or 'limit'")
-    if entry_type == "limit" and entry_price is None:
-        raise ValueError("entry_price is required when entry_type='limit'")
-    if entry_type == "market" and entry_price is not None:
-        raise ValueError("entry_price is only valid when entry_type='limit'")
+    if entry_type not in BRACKET_ENTRY_TYPES:
+        raise ValueError(f"entry_type must be one of {sorted(BRACKET_ENTRY_TYPES)}")
+    # Entry-price / entry-trigger-price required-by-type matrix.
+    if entry_type == "market":
+        if entry_price is not None:
+            raise ValueError("entry_price is only valid for limit/stop_limit entries")
+        if entry_trigger_price is not None:
+            raise ValueError("entry_trigger_price is only valid for stop_market/stop_limit entries")
+    elif entry_type == "limit":
+        if entry_price is None:
+            raise ValueError("entry_price is required when entry_type='limit'")
+        if entry_trigger_price is not None:
+            raise ValueError("entry_trigger_price is only valid for stop_market/stop_limit entries")
+    elif entry_type == "stop_market":
+        if entry_price is not None:
+            raise ValueError("entry_price is only valid for limit/stop_limit entries")
+        if entry_trigger_price is None:
+            raise ValueError("entry_trigger_price is required when entry_type='stop_market'")
+    elif entry_type == "stop_limit":
+        if entry_price is None:
+            raise ValueError("entry_price is required when entry_type='stop_limit'")
+        if entry_trigger_price is None:
+            raise ValueError("entry_trigger_price is required when entry_type='stop_limit'")
+
     if sl_type not in {"stop_market", "stop_limit"}:
         raise ValueError("sl_type must be 'stop_market' or 'stop_limit'")
     if tp_type != "take_market":
@@ -791,16 +911,32 @@ def _validate_bracket_params(
         raise ValueError(
             "trigger_fill_condition must be one of incremental, complete_fill, first_hit"
         )
+
+    sources = _resolve_bracket_trigger_sources(
+        trigger_source=trigger_source,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+    )
+
+    if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
+        validate_trigger_params(
+            entry_type,
+            trigger=sources["entry"],
+            trigger_price=entry_trigger_price,
+            trigger_offset=None,
+            price=entry_price if entry_type == "stop_limit" else None,
+        )
     validate_trigger_params(
         sl_type,
-        trigger=trigger_source,
+        trigger=sources["sl"],
         trigger_price=sl_trigger_price,
         trigger_offset=None,
         price=sl_limit_price,
     )
     validate_trigger_params(
         tp_type,
-        trigger=trigger_source,
+        trigger=sources["tp"],
         trigger_price=tp_trigger_price,
         trigger_offset=None,
         price=None,
@@ -822,9 +958,13 @@ async def _place_bracket_impl(
     trigger_source: str,
     confirm_live_trade: bool,
     entry_price: Optional[float] = None,
+    entry_trigger_price: Optional[float] = None,
     entry_post_only: bool = False,
     sl_limit_price: Optional[float] = None,
     trigger_fill_condition: str = "incremental",
+    entry_trigger_source: Optional[str] = None,
+    sl_trigger_source: Optional[str] = None,
+    tp_trigger_source: Optional[str] = None,
     client_order_id: Optional[str] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
@@ -845,19 +985,37 @@ async def _place_bracket_impl(
             side=side,
             entry_type=entry_type,
             entry_price=entry_price,
+            entry_trigger_price=entry_trigger_price,
             sl_type=sl_type,
             sl_trigger_price=sl_trigger_price,
             sl_limit_price=sl_limit_price,
             tp_type=tp_type,
             tp_trigger_price=tp_trigger_price,
             trigger_source=trigger_source,
+            entry_trigger_source=entry_trigger_source,
+            sl_trigger_source=sl_trigger_source,
+            tp_trigger_source=tp_trigger_source,
             trigger_fill_condition=trigger_fill_condition,
         )
+        if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
+            await _reject_already_triggered_entry(
+                app_ctx,
+                instrument=instrument,
+                side=side,
+                entry_trigger_price=entry_trigger_price,
+            )
+        entry_effective_price = compute_effective_price(
+            entry_type,
+            entry_trigger_price,
+            entry_price,
+        )
+        if entry_effective_price is None and entry_type == "limit":
+            entry_effective_price = entry_price
         await _validate_order_amount(
             app_ctx,
             instrument,
             amount,
-            effective_price=entry_price if entry_type == "limit" else None,
+            effective_price=entry_effective_price,
         )
         await _validate_order_amount(
             app_ctx,
@@ -875,12 +1033,18 @@ async def _place_bracket_impl(
         await _try_mark_decision_rejected(app_ctx, decision_id, str(exc))
         raise
 
+    resolved_sources = _resolve_bracket_trigger_sources(
+        trigger_source=trigger_source,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+    )
     child_direction = "sell" if side == "buy" else "buy"
     stop_child: dict[str, Any] = {
         "amount": amount,
         "direction": child_direction,
         "type": sl_type,
-        "trigger": trigger_source,
+        "trigger": resolved_sources["sl"],
         "trigger_price": sl_trigger_price,
         "price": sl_limit_price,
         "reduce_only": True,
@@ -890,7 +1054,7 @@ async def _place_bracket_impl(
         "amount": amount,
         "direction": child_direction,
         "type": tp_type,
-        "trigger": trigger_source,
+        "trigger": resolved_sources["tp"],
         "trigger_price": tp_trigger_price,
         "reduce_only": True,
         "label": decision_id,
@@ -904,6 +1068,7 @@ async def _place_bracket_impl(
         "amount": amount,
         "entry_type": entry_type,
         "entry_price": entry_price,
+        "entry_trigger_price": entry_trigger_price,
         "entry_post_only": entry_post_only,
         "sl_type": sl_type,
         "sl_trigger_price": sl_trigger_price,
@@ -911,6 +1076,9 @@ async def _place_bracket_impl(
         "tp_type": tp_type,
         "tp_trigger_price": tp_trigger_price,
         "trigger_source": trigger_source,
+        "entry_trigger_source": resolved_sources["entry"],
+        "sl_trigger_source": resolved_sources["sl"],
+        "tp_trigger_source": resolved_sources["tp"],
         "trigger_fill_condition": trigger_fill_condition,
         "otoco_config": otoco_config,
     }
@@ -938,6 +1106,9 @@ async def _place_bracket_impl(
         # cases) fall back to the OTO slot refs so audit/lookup are not empty.
         return ids or _extract_bracket_order_ids(response)
 
+    rest_entry_trigger: Optional[str] = (
+        resolved_sources["entry"] if entry_type in BRACKET_TRIGGER_ENTRY_TYPES else None
+    )
     result = await _execute_audited(
         app_ctx,
         "place_bracket",
@@ -953,6 +1124,8 @@ async def _place_bracket_impl(
             entry_post_only=entry_post_only,
             trigger_fill_condition=trigger_fill_condition,
             otoco_config=otoco_config,
+            entry_trigger=rest_entry_trigger,
+            entry_trigger_price=entry_trigger_price,
         ),
         deribit_order_ids_async_extractor=_async_extractor,
     )
@@ -1203,9 +1376,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         try:
             ticker = await app_ctx.ws_client.get_ticker(instrument)
             current_price = (
-                ticker.get("mark_price")
-                or ticker.get("last_price")
-                or ticker.get("index_price")
+                ticker.get("mark_price") or ticker.get("last_price") or ticker.get("index_price")
             )
             if current_price:
                 app_ctx.price_cache[instrument] = float(current_price)
@@ -1474,21 +1645,35 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         )
 
     @server.tool()
-    async def get_current_price(instrument: str, ctx: Any = None) -> str:
-        """Get the current price for an instrument."""
+    async def get_current_price(
+        instrument: str,
+        skip_cache: bool = False,
+        max_age_seconds: Optional[float] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Get the current price for an instrument.
+
+        Args:
+            instrument: Deribit instrument name.
+            skip_cache: When True, bypass the in-memory price cache and force a
+                fresh REST ticker fetch. Use before time-sensitive decisions
+                where stale cached data could mislead (e.g. validating a
+                trigger price right before placing an order).
+            max_age_seconds: Reject cached values older than this. ``None``
+                falls back to ``DERIBIT_PRICE_CACHE_MAX_AGE_SECONDS``.
+
+        Response always carries ``source`` (``"cache"`` or ``"fresh"``) and,
+        on cache hits, ``age_seconds`` so callers can reason about freshness.
+        """
         app_ctx = _ctx(ctx)
-        if instrument in app_ctx.price_cache:
-            return _json(
-                {
-                    "instrument": instrument,
-                    "last_price": app_ctx.price_cache[instrument],
-                    "source": "cache",
-                }
+        return _json(
+            await _get_current_price_impl(
+                app_ctx,
+                instrument=instrument,
+                skip_cache=skip_cache,
+                max_age_seconds=max_age_seconds,
             )
-        ticker = await app_ctx.ws_client.get_ticker(instrument)
-        if ticker.get("last_price"):
-            app_ctx.price_cache[instrument] = float(ticker["last_price"])
-        return _json(ticker)
+        )
 
     @server.tool()
     async def get_ticker(instrument: str, ctx: Any = None) -> str:
@@ -1904,31 +2089,61 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         trigger_source: str,
         confirm_live_trade: bool,
         entry_price: Optional[float] = None,
+        entry_trigger_price: Optional[float] = None,
         entry_post_only: bool = False,
         sl_limit_price: Optional[float] = None,
         trigger_fill_condition: str = "incremental",
+        entry_trigger_source: Optional[str] = None,
+        sl_trigger_source: Optional[str] = None,
+        tp_trigger_source: Optional[str] = None,
         client_order_id: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Place a native Deribit OTOCO bracket.
 
         Creates entry + stop-loss + take-profit in one Deribit call using
-        `linked_order_type=one_triggers_one_cancels_other`. In this Tier-B
-        implementation, take-profit is intentionally limited to `take_market`.
+        ``linked_order_type=one_triggers_one_cancels_other``. Take-profit is
+        intentionally limited to ``take_market``.
+
+        Entry-type matrix:
+
+        | entry_type   | entry_price | entry_trigger_price |
+        |--------------|-------------|---------------------|
+        | market       | None        | None                |
+        | limit        | required    | None                |
+        | stop_market  | None        | required            |
+        | stop_limit   | required    | required            |
+
+        Stop-* entries enable exchange-side waiting: the bracket sits on
+        Deribit until the trigger fires, then the entry executes and the
+        OTOCO children become live SL/TP. This removes wake-latency and
+        survives MCP outages for setups like "buy on $80100 break".
+        Already-past triggers are rejected: a buy stop-entry must price
+        below current; a sell stop-entry must price above. The current
+        price is read with cache bypassed so a stale WS feed cannot mask
+        the divergence.
+
+        Per-leg trigger source:
+          ``trigger_source`` sets the default ``mark_price`` / ``last_price``
+          / ``index_price`` for all three legs. Optional
+          ``entry_trigger_source`` / ``sl_trigger_source`` /
+          ``tp_trigger_source`` override per leg — common pattern is
+          ``last_price`` for the entry (clean market touch) plus
+          ``mark_price`` for SL/TP (wick-resistant).
 
         Response shape:
-          - `entry_order_id`: cancelable id of the entry order
-          - `child_order_ids`: `{sl, tp}` — cancelable trigger-order ids,
-            hydrated from `private/get_trigger_order_history` (matched by
-            `decision_id` label). Use these for `cancel_order`/
-            `get_order_state`.
-          - `child_order_ids_resolved`: `true` when both SL and TP were
-            resolved. If `false`, hydration timed out (Deribit history is
-            asynchronous) — fall back to `get_trigger_order_history` or
-            `get_open_orders_by_label` to pick up the children.
-          - `result`: compact order + trade summary only. Raw Deribit
-            payloads, including non-operative `OTO-...` slot refs, stay in
-            `order_audit` for debugging without bloating the session.
+          - ``entry_order_id``: cancelable id of the entry order.
+          - ``child_order_ids``: ``{sl, tp}`` — cancelable trigger-order
+            ids, hydrated from ``private/get_trigger_order_history``
+            (matched by ``decision_id`` label). Use these for
+            ``cancel_order`` / ``get_order_state``.
+          - ``child_order_ids_resolved``: ``true`` when both SL and TP
+            were resolved. ``false`` means hydration timed out (Deribit
+            history is asynchronous) — fall back to
+            ``get_trigger_order_history`` or ``get_open_orders_by_label``.
+          - ``result``: compact order + trade summary only. Raw Deribit
+            payloads, including non-operative ``OTO-...`` slot refs, stay
+            in ``order_audit`` for debugging without bloating the session.
         """
         app_ctx = _ctx(ctx)
         return _json(
@@ -1946,9 +2161,13 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 trigger_source=trigger_source,
                 confirm_live_trade=confirm_live_trade,
                 entry_price=entry_price,
+                entry_trigger_price=entry_trigger_price,
                 entry_post_only=entry_post_only,
                 sl_limit_price=sl_limit_price,
                 trigger_fill_condition=trigger_fill_condition,
+                entry_trigger_source=entry_trigger_source,
+                sl_trigger_source=sl_trigger_source,
+                tp_trigger_source=tp_trigger_source,
                 client_order_id=client_order_id,
             )
         )

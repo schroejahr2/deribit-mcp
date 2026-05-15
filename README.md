@@ -229,7 +229,7 @@ Some MCP gateways prefix tool names — check your gateway's conventions.
 
 | Tool | Purpose |
 |------|---------|
-| `get_current_price(instrument)` | Last/mark price snapshot |
+| `get_current_price(instrument, skip_cache=False, max_age_seconds=None)` | Last/mark price snapshot. `skip_cache=True` forces a fresh REST fetch (use before time-sensitive decisions where stale cached data could mislead). Response carries `source` + `age_seconds` for freshness reasoning. |
 | `get_ticker(instrument)` | Full ticker (mark, last, index, funding, IV) |
 | `get_greeks(instrument)` | Δ Γ Θ Vega for an option |
 | `get_instruments(currency, kind, expired)` | List instruments |
@@ -308,7 +308,7 @@ Same backing table as the [News Webhook](#news-webhook).
 |------|---------|
 | `buy(instrument, amount, order_type, ...)` | Long entry. Supports `market`, `limit`, `market_limit`, `stop_market`, `stop_limit`, `take_market`, `trailing_stop` |
 | `sell(...)` | Short entry / position exit, same surface as `buy` |
-| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL |
+| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
 | `edit_order(order_id, ...)` | Modify by Deribit ID |
 | `edit_order_by_label(currency, instrument, label, ...)` | Modify by `decision_id` (preflighted) |
 | `cancel_order(order_id, decision_id?)` | Single cancel |

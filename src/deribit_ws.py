@@ -296,21 +296,31 @@ class DeribitWebSocketClient:
                 )
 
     async def _auto_reconnect(self) -> None:
-        """Reconnect with exponential backoff after an unexpected drop."""
+        """Reconnect with exponential backoff — retries indefinitely until shutdown.
+
+        Operator visibility for prolonged outages is provided via a periodic
+        ``degraded`` outbox heartbeat emitted every
+        ``DERIBIT_WS_RECONNECT_HEARTBEAT_ATTEMPTS`` failed attempts (0 disables).
+        """
         delay = 1.0
         last_error: Optional[str] = None
-        for attempt in range(1, 8):  # ~1+2+4+...+64 ≈ 2 minutes total
-            if self._closing:
-                return
+        attempt = 0
+        max_delay = float(settings.deribit_ws_reconnect_max_delay_seconds)
+        heartbeat_every = int(settings.deribit_ws_reconnect_heartbeat_attempts)
+
+        while not self._closing:
+            attempt += 1
             try:
                 logger.info(f"Auto-reconnect attempt {attempt} after {delay:.0f}s...")
                 await asyncio.sleep(delay)
+                if self._closing:
+                    return
                 await self._reconnect()
                 if self.is_connected:
-                    logger.info("Auto-reconnect successful")
+                    logger.info(f"Auto-reconnect successful after {attempt} attempt(s)")
                     await self._emit_state(
                         "reconnected",
-                        message=f"Deribit WebSocket reconnected after {attempt} attempt(s).",
+                        message=(f"Deribit WebSocket reconnected after {attempt} attempt(s)."),
                         severity="info",
                         attempt=attempt,
                     )
@@ -318,15 +328,20 @@ class DeribitWebSocketClient:
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Auto-reconnect attempt {attempt} failed: {e}")
-            delay = min(delay * 2, 60.0)
-        logger.error("Auto-reconnect gave up after 8 attempts")
-        await self._emit_state(
-            "dead",
-            message="Deribit WebSocket auto-reconnect gave up after 8 attempts; manual restart required.",
-            severity="warning",
-            attempt=8,
-            reason=last_error,
-        )
+
+            if heartbeat_every > 0 and attempt % heartbeat_every == 0:
+                await self._emit_state(
+                    "degraded",
+                    message=(
+                        f"Deribit WebSocket reconnect still failing after "
+                        f"{attempt} attempt(s); continuing to retry."
+                    ),
+                    severity="warning",
+                    attempt=attempt,
+                    reason=last_error,
+                )
+
+            delay = min(delay * 2, max_delay)
 
     async def _send_subscribe(self, channel: str) -> None:
         """Send a `public/subscribe` for one channel."""

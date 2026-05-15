@@ -1506,6 +1506,286 @@ async def test_place_bracket_rejects_take_limit_and_marks_decision(monkeypatch):
     assert decision_repo.outcomes[0][1] == "rejected"
 
 
+class FakeWSForPrice:
+    def __init__(self, last_price: float):
+        self.last_price = last_price
+        self.get_ticker_calls: list[str] = []
+
+    async def get_ticker(self, instrument: str) -> dict:
+        self.get_ticker_calls.append(instrument)
+        return {"last_price": self.last_price, "mark_price": self.last_price}
+
+
+def _bracket_ctx_with_price(
+    *, current_price: float, rest: FakeBracketRest, decision_repo: FakeDecisionRepo
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        decision_repo=decision_repo,
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        ws_client=FakeWSForPrice(current_price),
+        price_cache={},
+        instrument_cache={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_stop_market_entry_passes_trigger_to_rest(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 100_000_000)
+
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(
+        current_price=79_000.0,
+        rest=rest,
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+    )
+
+    await _place_bracket_impl(
+        ctx,
+        decision_id="decision-1",
+        instrument="BTC-PERPETUAL",
+        side="buy",
+        amount=10,
+        entry_type="stop_market",
+        entry_trigger_price=80_100,
+        sl_type="stop_market",
+        sl_trigger_price=79_200,
+        tp_type="take_market",
+        tp_trigger_price=82_000,
+        trigger_source="mark_price",
+        entry_trigger_source="last_price",
+        confirm_live_trade=False,
+        client_order_id="bracket-cid-stop",
+    )
+
+    call = rest.place_otoco_calls[0]
+    assert call["entry_type"] == "stop_market"
+    assert call["entry_trigger"] == "last_price"
+    assert call["entry_trigger_price"] == 80_100
+    # Children inherit the global trigger_source when no per-leg override is set.
+    children = call["otoco_config"]
+    assert children[0]["trigger"] == "mark_price"
+    assert children[1]["trigger"] == "mark_price"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_stop_market_requires_entry_trigger_price(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(current_price=79_000.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(ValueError, match="entry_trigger_price is required"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="stop_market",
+            sl_type="stop_market",
+            sl_trigger_price=75_000,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-missing-trigger",
+        )
+
+    assert rest.place_otoco_calls == []
+    assert decision_repo.outcomes[0][1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_stop_limit_requires_entry_price(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(current_price=79_000.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(ValueError, match="entry_price is required when entry_type='stop_limit'"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="stop_limit",
+            entry_trigger_price=80_100,
+            sl_type="stop_market",
+            sl_trigger_price=75_000,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-missing-limit",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_rejects_already_triggered_buy(monkeypatch):
+    """A buy stop-entry must price above current; otherwise it fires immediately."""
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 100_000_000)
+
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    rest = FakeBracketRest()
+    # Current 80_200 is already above the 80_100 trigger — the trigger would fire instantly.
+    ctx = _bracket_ctx_with_price(current_price=80_200.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(Exception, match="already at or below"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="stop_market",
+            entry_trigger_price=80_100,
+            sl_type="stop_market",
+            sl_trigger_price=79_200,
+            tp_type="take_market",
+            tp_trigger_price=82_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-instant-fire",
+        )
+
+    assert rest.place_otoco_calls == []
+    assert decision_repo.outcomes[0][1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_rejects_already_triggered_sell(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 100_000_000)
+
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(current_price=78_900.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(Exception, match="already at or above"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="sell",
+            amount=10,
+            entry_type="stop_market",
+            entry_trigger_price=79_200,
+            sl_type="stop_market",
+            sl_trigger_price=80_500,
+            tp_type="take_market",
+            tp_trigger_price=77_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-sell-instant",
+        )
+
+    assert rest.place_otoco_calls == []
+    assert decision_repo.outcomes[0][1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_per_leg_trigger_source_override(monkeypatch):
+    """Asymmetric setup: last_price for entry, mark_price for SL/TP."""
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 100_000_000)
+
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(
+        current_price=79_000.0,
+        rest=rest,
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+    )
+
+    await _place_bracket_impl(
+        ctx,
+        decision_id="decision-1",
+        instrument="BTC-PERPETUAL",
+        side="buy",
+        amount=10,
+        entry_type="stop_market",
+        entry_trigger_price=80_100,
+        sl_type="stop_market",
+        sl_trigger_price=79_200,
+        tp_type="take_market",
+        tp_trigger_price=82_000,
+        trigger_source="index_price",  # default, overridden per leg below
+        entry_trigger_source="last_price",
+        sl_trigger_source="mark_price",
+        tp_trigger_source="mark_price",
+        confirm_live_trade=False,
+        client_order_id="bracket-cid-per-leg",
+    )
+
+    call = rest.place_otoco_calls[0]
+    assert call["entry_trigger"] == "last_price"
+    assert call["otoco_config"][0]["trigger"] == "mark_price"
+    assert call["otoco_config"][1]["trigger"] == "mark_price"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_notional_uses_entry_trigger_price(monkeypatch):
+    """Notional cap on a stop_market entry must use the trigger price, not the
+    placeholder None that the old `market`-style branch passed in. Exercises the
+    linear notional path (USDC-quoted instrument) where amount*price matters.
+    """
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100_000)
+    # Cap = $1_000; 10 contracts × 80_100 trigger = $801_000 → reject.
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000)
+
+    rest = FakeBracketRest(
+        instrument_meta={
+            "instrument_name": "ETH_USDC-PERPETUAL",
+            "kind": "future",
+            "quote_currency": "USDC",
+            "settlement_currency": "USDC",
+            "instrument_type": "linear",
+        },
+    )
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    ctx = _bracket_ctx_with_price(current_price=2_200.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(Exception, match="exceeds DERIBIT_MAX_NOTIONAL_USD"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="ETH_USDC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="stop_market",
+            entry_trigger_price=80_100,
+            sl_type="stop_market",
+            sl_trigger_price=79_200,
+            tp_type="take_market",
+            tp_trigger_price=82_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-notional",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
 class FakeComboRest:
     def __init__(self):
         self.create_combo_calls = []

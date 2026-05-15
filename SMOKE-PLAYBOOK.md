@@ -1154,6 +1154,108 @@ Pick an absurd SL trigger that pushes per-leg notional past
 > testnet (e.g. cap raised), pick a different absurd value or skip 18.C
 > with a note.
 
+### 18.D Bracket stop_* entry + per-leg trigger sources (UNVERIFIED ON TESTNET)
+
+> **Open assumption:** validates that Deribit OTOCO accepts a trigger
+> order (`stop_market` / `stop_limit`) as the primary leg with the trigger
+> params hoisted onto the parent order. If the testnet rejects the primary
+> trigger params, document the actual Deribit error here and switch the
+> impl to a sequential OTO fallback (primary trigger → OTO with reduce-only
+> SL/TP attached after first fill).
+
+```
+mark = derebit-get_current_price("BTC-PERPETUAL", skip_cache=True).last_price
+
+# 18.D.1 — stop_market entry happy path (buy on break above mark*1.005)
+trig = mark * 1.005
+sl_t = trig * 0.99
+tp_t = trig * 1.02
+decision_id_d1 = derebit-record_decision(
+  instrument="BTC-PERPETUAL",
+  reasoning="Phase 18D stop_market entry break-trigger long",
+  action_taken="place_bracket"
+)
+br_d1 = derebit-place_bracket(
+  decision_id=decision_id_d1, instrument="BTC-PERPETUAL", side="buy", amount=10,
+  entry_type="stop_market", entry_trigger_price=trig,
+  sl_type="stop_market", sl_trigger_price=sl_t,
+  tp_type="take_market",  tp_trigger_price=tp_t,
+  trigger_source="mark_price",
+  entry_trigger_source="last_price",
+  confirm_live_trade=true
+)
+       → assert br_d1.entry_order_id is non-empty
+       → assert br_d1.result.order.order_state in {"untriggered", "open"}
+state_entry = derebit-get_order_state(order_id=br_d1.entry_order_id)
+       → assert state_entry.order_type == "stop_market"
+       → assert state_entry.trigger == "last_price"    # per-leg override
+       → assert abs(state_entry.trigger_price - trig) < 0.5
+       → cleanup: derebit-cancel_order(br_d1.entry_order_id)
+
+# 18.D.2 — already-past trigger reject
+decision_id_d2 = derebit-record_decision(
+  instrument="BTC-PERPETUAL",
+  reasoning="Phase 18D already-past trigger reject",
+  action_taken="place_bracket"
+)
+       try:
+         derebit-place_bracket(
+           decision_id=decision_id_d2, instrument="BTC-PERPETUAL",
+           side="buy", amount=10,
+           entry_type="stop_market", entry_trigger_price=mark*0.5,
+           sl_type="stop_market", sl_trigger_price=mark*0.4,
+           tp_type="take_market",  tp_trigger_price=mark*0.6,
+           trigger_source="mark_price", confirm_live_trade=true
+         )
+         → FAIL: expected reject "already at or below current price"
+       except as e:
+         → assert "already at or below" in str(e)
+       d = derebit-list_decisions(instrument="BTC-PERPETUAL", limit=5)
+       → assert next(x for x in d if x.decision_id == decision_id_d2).outcome == "rejected"
+
+# 18.D.3 — stop_limit entry with asymmetric per-leg trigger sources
+trig = mark * 1.005
+limit = trig * 1.001
+decision_id_d3 = derebit-record_decision(
+  instrument="BTC-PERPETUAL",
+  reasoning="Phase 18D stop_limit asymmetric trigger sources",
+  action_taken="place_bracket"
+)
+br_d3 = derebit-place_bracket(
+  decision_id=decision_id_d3, instrument="BTC-PERPETUAL", side="buy", amount=10,
+  entry_type="stop_limit", entry_trigger_price=trig, entry_price=limit,
+  sl_type="stop_market", sl_trigger_price=trig*0.99,
+  tp_type="take_market",  tp_trigger_price=trig*1.02,
+  trigger_source="mark_price",
+  entry_trigger_source="last_price",
+  sl_trigger_source="mark_price",
+  tp_trigger_source="mark_price",
+  confirm_live_trade=true
+)
+state_entry = derebit-get_order_state(order_id=br_d3.entry_order_id)
+       → assert state_entry.order_type == "stop_limit"
+       → assert state_entry.trigger == "last_price"
+       → assert abs(state_entry.price - limit) < 0.5
+sl_id, tp_id = br_d3.child_order_ids.sl, br_d3.child_order_ids.tp
+state_sl = derebit-get_order_state(order_id=sl_id)
+state_tp = derebit-get_order_state(order_id=tp_id)
+       → assert state_sl.trigger == "mark_price"
+       → assert state_tp.trigger == "mark_price"
+       → cleanup:
+           derebit-cancel_order(br_d3.entry_order_id)
+           for cid in (sl_id, tp_id):
+             try: derebit-cancel_order(cid)
+             except: pass
+           derebit-update_decision_outcome(decision_id_d3, "cancelled",
+             "smoke cleanup")
+```
+
+> **If 18.D.1 fails with a Deribit primary-trigger rejection:** capture the
+> error verbatim and switch `place_otoco` to omit `trigger`/`trigger_price`
+> on the parent order; instead, place a standalone trigger order for the
+> entry leg and attach the OTO children once the entry fills. Update the
+> tests in `tests/test_server_helpers.py` to match the new REST call shape.
+
 ---
 
 ## Phase 19 — Tier-B Orderbook Stream (B-2.1)

@@ -23,6 +23,7 @@ def _ms_to_iso(value: Any) -> Optional[str]:
         return None
     return to_iso(datetime.fromtimestamp(ms / 1000, tz=timezone.utc))
 
+
 ALLOWED_PAYLOAD_KEYS = {
     "event_id",
     "event_type",
@@ -381,9 +382,8 @@ class EventOutboxRepo:
         payload["source"] = "deribit_ws"
         payload["channel"] = channel
         payload["message"] = _order_message(payload)
-        payload["triggered_at"] = (
-            _ms_to_iso(payload.get("last_update_timestamp"))
-            or _ms_to_iso(payload.get("creation_timestamp"))
+        payload["triggered_at"] = _ms_to_iso(payload.get("last_update_timestamp")) or _ms_to_iso(
+            payload.get("creation_timestamp")
         )
         dedupe_key = "deribit-order:" + _dedupe_fragment(
             channel,

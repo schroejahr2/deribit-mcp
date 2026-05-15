@@ -516,11 +516,19 @@ class DeribitRestClient:
         entry_post_only: bool,
         trigger_fill_condition: str,
         otoco_config: list[dict[str, Any]],
+        entry_trigger: Optional[str] = None,
+        entry_trigger_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Place a native Deribit OTOCO order using JSON-RPC POST."""
+        """Place a native Deribit OTOCO order using JSON-RPC POST.
+
+        When ``entry_type`` is ``stop_market`` or ``stop_limit`` the entry leg
+        is itself a trigger order; pass ``entry_trigger`` (``mark_price``,
+        ``last_price`` or ``index_price``) and ``entry_trigger_price`` to wire
+        the primary trigger params Deribit expects on the parent order.
+        """
         if side not in {"buy", "sell"}:
             raise ValueError("side must be 'buy' or 'sell'")
-        params = {
+        params: Dict[str, Any] = {
             "instrument_name": instrument,
             "amount": amount,
             "type": entry_type,
@@ -531,6 +539,10 @@ class DeribitRestClient:
             "trigger_fill_condition": trigger_fill_condition,
             "otoco_config": otoco_config,
         }
+        if entry_trigger is not None:
+            params["trigger"] = entry_trigger
+        if entry_trigger_price is not None:
+            params["trigger_price"] = entry_trigger_price
         return await self._rpc(f"private/{side}", params)
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:

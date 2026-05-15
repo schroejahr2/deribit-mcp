@@ -7,7 +7,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, MutableMapping
 
 from .alerts import AlertCondition, AlertManager
 from .config import settings
@@ -16,6 +16,7 @@ from .deribit_ws import DeribitWebSocketClient
 from .event_outbox import EventOutboxRepo
 from .market_streams import MarketStreamManager
 from .notifications import NotificationManager
+from .price_cache import PriceCache
 from .persistence import (
     AlertRepo,
     Database,
@@ -38,7 +39,7 @@ class AppContext:
     rest_client: DeribitRestClient
     alert_manager: AlertManager
     notification_manager: NotificationManager
-    price_cache: Dict[str, float]
+    price_cache: MutableMapping[str, float]
     db: Database
     alert_repo: AlertRepo
     decision_repo: DecisionRepo
@@ -64,9 +65,7 @@ async def _maintenance_reaper_loop(
             await asyncio.sleep(300)
             await event_outbox_repo.reap_expired()
             await idempotency_repo.prune_expired()
-            reaped = await event_outbox_repo.reap_stale_consumers(
-                CONSUMER_STALE_TTL_SECONDS
-            )
+            reaped = await event_outbox_repo.reap_stale_consumers(CONSUMER_STALE_TTL_SECONDS)
             if reaped:
                 logger.info("Reaped %d stale consumer(s)", reaped)
     except asyncio.CancelledError:
@@ -117,7 +116,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
 
     ws_client = DeribitWebSocketClient()
     rest_client = DeribitRestClient()
-    price_cache: Dict[str, float] = {}
+    price_cache: MutableMapping[str, float] = PriceCache()
     instrument_cache: Dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def notification_callback(
