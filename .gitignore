@@ -66,6 +66,8 @@ data/
 # Local agent/runtime metadata
 AGENTS.md
 .agents/
+CLAUDE.md
+CALIBER_LEARNINGS.md
 
 # Local planning notes
 todo.md
