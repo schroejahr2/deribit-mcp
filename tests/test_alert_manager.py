@@ -264,3 +264,37 @@ async def test_inactive_alert_is_skipped():
 
     await mgr.process_price_update("BTC-PERPETUAL", 1000.0)
     assert fired == []
+
+
+def test_pricealert_default_channel_is_outbox():
+    """Default channel routes alerts into the in-session outbox stream;
+    telegram is reserved for explicit user-escalation calls."""
+    alert = PriceAlert(instrument="BTC-PERPETUAL", threshold=100.0)
+    assert alert.notification_channel == "outbox"
+
+
+@pytest.mark.asyncio
+async def test_add_alert_default_channel_is_outbox():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    alert = await mgr.add_alert(
+        instrument="BTC-PERPETUAL",
+        condition="above",
+        threshold=100.0,
+    )
+    assert alert.notification_channel == "outbox"
+
+
+@pytest.mark.asyncio
+async def test_add_time_alert_default_channel_is_outbox():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    alert = await mgr.add_time_alert(
+        message="ping",
+        fire_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+    )
+    assert alert.notification_channel == "outbox"

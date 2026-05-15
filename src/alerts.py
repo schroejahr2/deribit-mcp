@@ -41,7 +41,7 @@ class PriceAlert:
     instrument: str = ""
     condition: AlertCondition = AlertCondition.ABOVE
     threshold: Optional[float] = 0.0
-    notification_channel: str = "telegram"
+    notification_channel: str = "outbox"
     status: AlertStatus = AlertStatus.ACTIVE
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     triggered_at: Optional[datetime] = None
@@ -92,7 +92,7 @@ class AlertManager:
         instrument: str,
         condition: str,
         threshold: float,
-        notification_channel: str = "telegram",
+        notification_channel: str = "outbox",
         message: Optional[str] = None,
         repeat: bool = False,
         cooldown_seconds: int = 300,
@@ -131,7 +131,7 @@ class AlertManager:
         message: str,
         fire_at: datetime,
         instrument: Optional[str] = None,
-        notification_channel: str = "telegram",
+        notification_channel: str = "outbox",
         repeat: bool = False,
         cooldown_seconds: int = 300,
     ) -> PriceAlert:

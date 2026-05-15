@@ -469,7 +469,7 @@ Telegram for the human user, outbox for the agent wakeup pipeline:
 
 | Var | Purpose |
 |-----|---------|
-| `TELEGRAM_BOT_TOKEN` | Bot token for startup heartbeat + alerts with `notification_channel="telegram"` |
+| `TELEGRAM_BOT_TOKEN` | Bot token for startup heartbeat + alerts with `notification_channel="telegram"` (opt-in escalation; default channel is `outbox`) |
 | `TELEGRAM_CHAT_ID` | Where to deliver |
 ### Market streams
 
