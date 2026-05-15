@@ -1154,14 +1154,17 @@ Pick an absurd SL trigger that pushes per-leg notional past
 > testnet (e.g. cap raised), pick a different absurd value or skip 18.C
 > with a note.
 
-### 18.D Bracket stop_* entry + per-leg trigger sources (UNVERIFIED ON TESTNET)
+### 18.D Bracket stop_* entry + per-leg trigger sources
 
-> **Open assumption:** validates that Deribit OTOCO accepts a trigger
-> order (`stop_market` / `stop_limit`) as the primary leg with the trigger
-> params hoisted onto the parent order. If the testnet rejects the primary
-> trigger params, document the actual Deribit error here and switch the
-> impl to a sequential OTO fallback (primary trigger → OTO with reduce-only
-> SL/TP attached after first fill).
+> **Status:** verified on testnet 2026-05-15 — Deribit OTOCO accepts both
+> `stop_market` and `stop_limit` as the primary leg with `trigger` and
+> `trigger_price` hoisted onto the parent order; response carries
+> `is_primary_otoco=true`, `order_state="untriggered"`, and the per-leg
+> trigger source override is honoured (entry `trigger="last_price"` while
+> children stay on `mark_price`). Re-run via
+> `scripts/smoke_bracket_18d.py` against testnet to re-validate after
+> Deribit API changes. The historical fallback design (sequential OTO with
+> children attached after first fill) is no longer needed.
 
 ```
 mark = derebit-get_current_price("BTC-PERPETUAL", skip_cache=True).last_price

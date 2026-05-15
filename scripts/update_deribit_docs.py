@@ -12,7 +12,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-
 BASE_URL = "https://docs.deribit.com"
 DOCS_ROOT = Path(__file__).resolve().parents[1] / "docs" / "deribit-api"
 PAGES_ROOT = DOCS_ROOT / "pages"
@@ -57,16 +56,13 @@ def main() -> int:
     write_bytes(DOCS_ROOT / "llms.txt", llms_bytes)
 
     links = extract_links(llms_text)
-    markdown_links = [
-        url for url in links if urlparse(url).path.endswith(".md")
-    ]
+    markdown_links = [url for url in links if urlparse(url).path.endswith(".md")]
     spec_links = [
         url
         for url in links
         if urlparse(url).path.endswith(".json")
         and (
-            "/specifications/" in urlparse(url).path
-            or urlparse(url).path.endswith("/openapi.json")
+            "/specifications/" in urlparse(url).path or urlparse(url).path.endswith("/openapi.json")
         )
     ]
 
