@@ -1459,7 +1459,19 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         outcome_note: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
-        """Update a recorded decision with a final or current outcome."""
+        """Update a recorded decision with a final or current outcome.
+
+        Valid values fall into two groups:
+
+        - **Execution state** (what happened to the order):
+          ``filled``, ``cancelled``, ``rejected``, ``expired``, ``partial``,
+          ``unknown``.
+        - **PnL state** (what happened to the position once an exit is
+          final): ``win``, ``loss``, ``breakeven``. Use these for trade
+          journal aggregation so consumers do not have to parse
+          ``outcome_note`` free text. Set once per decision after the
+          position is closed.
+        """
         app_ctx = _ctx(ctx)
         await app_ctx.decision_repo.update_outcome(decision_id, outcome, outcome_note)
         return _json({"updated": True, "decision_id": decision_id})

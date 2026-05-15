@@ -478,12 +478,19 @@ VALID_ACTIONS = {
 }
 
 VALID_OUTCOMES = {
+    # Execution-state outcomes (what happened to the order itself).
     "filled",
     "cancelled",
     "rejected",
     "expired",
     "partial",
     "unknown",
+    # PnL outcomes (what happened to the position after the order resolved).
+    # Use these once an exit is final so trade journals can aggregate without
+    # parsing outcome_note free text.
+    "win",
+    "loss",
+    "breakeven",
 }
 
 

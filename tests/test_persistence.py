@@ -40,6 +40,29 @@ async def test_decision_repo_roundtrip_and_outcome_validation():
 
 
 @pytest.mark.asyncio
+async def test_decision_repo_accepts_pnl_outcomes():
+    """win/loss/breakeven are first-class PnL outcomes alongside execution states."""
+    db = Database(":memory:")
+    await db.connect()
+    repo = DecisionRepo(db)
+
+    for idx, outcome in enumerate(("win", "loss", "breakeven"), start=1):
+        decision_id = f"decision-pnl-{idx}"
+        await repo.create(
+            decision_id=decision_id,
+            instrument="BTC-PERPETUAL",
+            reasoning="pnl outcome smoke",
+            action_taken="buy",
+        )
+        await repo.update_outcome(decision_id, outcome, outcome_note=f"closed {outcome}")
+        rows = await repo.list(instrument="BTC-PERPETUAL")
+        match = next(row for row in rows if row["id"] == decision_id)
+        assert match["outcome"] == outcome
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_idempotency_repo_returns_cached_response():
     db = Database(":memory:")
     await db.connect()
