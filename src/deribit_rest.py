@@ -38,8 +38,8 @@ class DeribitRestClient:
 
     def __init__(self):
         self.base_url = settings.deribit_rest_url
-        self.api_key = settings.deribit_api_key
-        self.api_secret = settings.deribit_api_secret
+        self.api_key = settings.effective_api_key
+        self.api_secret = settings.effective_api_secret
         self.session: Optional[aiohttp.ClientSession] = None
         self.access_token: Optional[str] = None
         self.token_expiry: Optional[float] = None

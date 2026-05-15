@@ -203,8 +203,8 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
 
         if (
             settings.deribit_trading_event_outbox_enabled
-            and settings.deribit_api_key
-            and settings.deribit_api_secret
+            and settings.effective_api_key
+            and settings.effective_api_secret
         ):
             for channel in _trading_event_channels():
                 try:

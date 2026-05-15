@@ -14,9 +14,13 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Deribit API
+    # Deribit API — base pair targets the active network (mainnet by default).
+    # Optional _TESTNET pair lets operators keep both credential sets persistent
+    # so flipping `DERIBIT_TEST_MODE` is the only change needed to swap nets.
     deribit_api_key: str = ""
     deribit_api_secret: str = ""
+    deribit_api_key_testnet: str = ""
+    deribit_api_secret_testnet: str = ""
     deribit_test_mode: bool = True
 
     # Transport / HTTP integration
@@ -125,6 +129,26 @@ class Settings(BaseSettings):
                     "DERIBIT_TRADING_EVENT_CHANNELS may only contain Deribit user.* channels: "
                     + ", ".join(invalid)
                 )
+
+    @property
+    def effective_api_key(self) -> str:
+        """Pick the active credential key based on test_mode.
+
+        Falls back to the base ``deribit_api_key`` when the ``_TESTNET`` field
+        is empty so operators can opt into the dual-cred layout without
+        breaking single-key deployments.
+        """
+        if self.deribit_test_mode and self.deribit_api_key_testnet:
+            return self.deribit_api_key_testnet
+        return self.deribit_api_key
+
+    @property
+    def effective_api_secret(self) -> str:
+        """Pick the active credential secret based on test_mode. See
+        :pyattr:`effective_api_key` for fallback semantics."""
+        if self.deribit_test_mode and self.deribit_api_secret_testnet:
+            return self.deribit_api_secret_testnet
+        return self.deribit_api_secret
 
     @property
     def deribit_ws_url(self) -> str:

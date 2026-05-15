@@ -101,7 +101,7 @@ class DeribitWebSocketClient:
 
             self._handler_task = asyncio.create_task(self._message_handler())
 
-            if settings.deribit_api_key and settings.deribit_api_secret:
+            if settings.effective_api_key and settings.effective_api_secret:
                 await self._authenticate()
 
         except Exception as e:
@@ -142,8 +142,8 @@ class DeribitWebSocketClient:
             "method": "public/auth",
             "params": {
                 "grant_type": "client_credentials",
-                "client_id": settings.deribit_api_key,
-                "client_secret": settings.deribit_api_secret,
+                "client_id": settings.effective_api_key,
+                "client_secret": settings.effective_api_secret,
             },
         }
 
