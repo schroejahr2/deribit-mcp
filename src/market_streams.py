@@ -462,11 +462,21 @@ class MarketStreamManager:
                 if int(event.get("timestamp") or event.get("received_at") or 0) > since_ts
             ]
         events = events[-limit:]
+        # Coverage window lets callers disambiguate `count=0`: genuine "no
+        # liquidations in the last N seconds" (window is wide and gap-free)
+        # vs "we don't know" (window is short or coverage_gap=true).
+        now_ms = int(time.time() * 1000)
+        coverage_window_seconds: Optional[float] = (
+            max(0.0, (now_ms - state.subscribed_since) / 1000.0)
+            if state.subscribed_since is not None
+            else None
+        )
         return {
             "currency": currency,
             "kind": kind,
             "subscribed_since": state.subscribed_since,
             "coverage_gap": state.coverage_gap,
+            "coverage_window_seconds": coverage_window_seconds,
             "events": events,
             "count": len(events),
         }

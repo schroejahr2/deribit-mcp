@@ -153,6 +153,25 @@ async def test_liquidation_stream_filters_and_reports_coverage(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_liquidation_response_includes_coverage_window(monkeypatch):
+    """coverage_window_seconds disambiguates count=0 (genuine quiet vs no data)."""
+    monkeypatch.setattr("src.market_streams.settings.deribit_liquidation_buffer_size", 10)
+    ws = FakeWS()
+    manager = MarketStreamManager(ws)
+
+    # First call subscribes the channel and stamps subscribed_since.
+    first = await manager.get_recent_liquidations("BTC", "future", limit=10)
+    assert "coverage_window_seconds" in first
+    assert first["coverage_window_seconds"] is not None
+    assert first["coverage_window_seconds"] >= 0.0
+
+    # After a small sleep, the window must have advanced.
+    await asyncio.sleep(0.05)
+    later = await manager.get_recent_liquidations("BTC", "future", limit=10)
+    assert later["coverage_window_seconds"] > first["coverage_window_seconds"]
+
+
+@pytest.mark.asyncio
 async def test_liquidation_rejects_unsupported_scope():
     manager = MarketStreamManager(FakeWS())
 
