@@ -350,6 +350,41 @@ sell(BTC-PERPETUAL, amount=10, order_type="stop_market",
      confirm_live_trade=true)
 ```
 
+Example — exchange-side breakout bracket with asymmetric trigger feeds.
+Entry waits for `last_price` to cross 80100 (clean market touch), then
+SL/TP protect on `mark_price` (wick-resistant). The bracket sits on
+Deribit until the entry fires, so wake-latency and MCP downtime do not
+miss the setup:
+
+```
+record_decision(
+  instrument="BTC-PERPETUAL",
+  reasoning="80100 break-up + 79200 reclaim long",
+  action_taken="place_bracket",
+) → did
+
+place_bracket(
+  decision_id=did,
+  instrument="BTC-PERPETUAL",
+  side="buy",
+  amount=10,
+  entry_type="stop_market",
+  entry_trigger_price=80100,           # break trigger
+  sl_type="stop_market",
+  sl_trigger_price=79200,              # reclaim invalid
+  tp_type="take_market",
+  tp_trigger_price=82500,
+  trigger_source="mark_price",         # default for SL + TP legs
+  entry_trigger_source="last_price",   # entry uses real-trade prints
+  confirm_live_trade=true,
+)
+```
+
+A `buy` whose `entry_trigger_price` is already at or below current price
+is rejected before the Deribit call (mirror logic for `sell`). The
+current-price read bypasses the cache so a stale WS feed cannot mask the
+divergence.
+
 ---
 
 ## Quick start
