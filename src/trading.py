@@ -348,9 +348,20 @@ async def enforce_close_position_limit(app_ctx: Any, instrument: str) -> None:
     if not position:
         raise TradingValidationError(f"Could not load position for {instrument}")
 
-    raw_size = position.get("size")
-    if raw_size is None:
+    family = instrument_family(meta)
+    # Deribit `size` units differ by family: futures report `size` in quote
+    # currency (USD), with `size_currency` carrying the base-currency amount.
+    # Linear order amounts are denominated in base currency, so the guard must
+    # compare against `size_currency`; inverse amounts are USD (`size`); option
+    # `size` is already base currency.
+    if family == "linear":
         raw_size = position.get("size_currency")
+        if raw_size is None:
+            raw_size = position.get("size")
+    else:
+        raw_size = position.get("size")
+        if raw_size is None:
+            raw_size = position.get("size_currency")
     if raw_size is None:
         raise TradingValidationError(f"Could not determine open position size for {instrument}")
 
@@ -358,7 +369,6 @@ async def enforce_close_position_limit(app_ctx: Any, instrument: str) -> None:
     if amount == 0:
         return
 
-    family = instrument_family(meta)
     enforce_static_amount_limit(amount, family)
     notional = await calculate_notional_usd(app_ctx, instrument, amount, meta)
     enforce_notional_limit(notional)

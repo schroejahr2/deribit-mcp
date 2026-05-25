@@ -518,6 +518,7 @@ class DeribitRestClient:
         otoco_config: list[dict[str, Any]],
         entry_trigger: Optional[str] = None,
         entry_trigger_price: Optional[float] = None,
+        entry_reject_post_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Place a native Deribit OTOCO order using JSON-RPC POST.
 
@@ -525,6 +526,10 @@ class DeribitRestClient:
         is itself a trigger order; pass ``entry_trigger`` (``mark_price``,
         ``last_price`` or ``index_price``) and ``entry_trigger_price`` to wire
         the primary trigger params Deribit expects on the parent order.
+
+        ``entry_reject_post_only`` maps to Deribit's ``reject_post_only`` on the
+        entry leg: when set true, a crossing post-only entry is rejected instead
+        of silently repriced to the next maker price.
         """
         if side not in {"buy", "sell"}:
             raise ValueError("side must be 'buy' or 'sell'")
@@ -539,6 +544,8 @@ class DeribitRestClient:
             "trigger_fill_condition": trigger_fill_condition,
             "otoco_config": otoco_config,
         }
+        if entry_reject_post_only is not None:
+            params["reject_post_only"] = entry_reject_post_only
         if entry_trigger is not None:
             params["trigger"] = entry_trigger
         if entry_trigger_price is not None:

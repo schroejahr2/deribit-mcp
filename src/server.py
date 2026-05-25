@@ -674,6 +674,14 @@ async def _place_order_impl(
     # 6: effective_price erst nach validation berechnen
     effective_price = compute_effective_price(order_type, trigger_price, price)
 
+    # Hardening: a crossing post_only limit is silently repriced by Deribit
+    # to the next maker price unless reject_post_only is set. A silent reprice
+    # that then fills is the dangerous case (mis-placed limit far from intent),
+    # so default post_only orders to loud rejection. An explicit
+    # reject_post_only=False still opts back into Deribit's reprice behaviour.
+    if post_only and reject_post_only is None:
+        reject_post_only = True
+
     # 7: amount-/notional-guard mit decision-reject
     try:
         await _validate_order_amount(app_ctx, instrument, amount, effective_price=effective_price)
@@ -867,7 +875,8 @@ def _validate_bracket_params(
     entry_price: Optional[float],
     entry_trigger_price: Optional[float],
     sl_type: str,
-    sl_trigger_price: float,
+    sl_trigger_price: Optional[float],
+    sl_trigger_offset: Optional[float],
     sl_limit_price: Optional[float],
     tp_type: str,
     tp_trigger_price: float,
@@ -903,14 +912,38 @@ def _validate_bracket_params(
         if entry_trigger_price is None:
             raise ValueError("entry_trigger_price is required when entry_type='stop_limit'")
 
-    if sl_type not in {"stop_market", "stop_limit"}:
-        raise ValueError("sl_type must be 'stop_market' or 'stop_limit'")
+    if sl_type not in {"stop_market", "stop_limit", "trailing_stop"}:
+        raise ValueError("sl_type must be 'stop_market', 'stop_limit', or 'trailing_stop'")
     if tp_type != "take_market":
         raise ValueError("tp_type=take_market is the only supported take-profit type")
     if trigger_fill_condition not in {"incremental", "complete_fill", "first_hit"}:
         raise ValueError(
             "trigger_fill_condition must be one of incremental, complete_fill, first_hit"
         )
+
+    # SL-type-dependent param matrix: fixed-trigger stops take sl_trigger_price
+    # (and reject sl_trigger_offset); trailing_stop takes sl_trigger_offset
+    # (and rejects sl_trigger_price + sl_limit_price).
+    if sl_type == "trailing_stop":
+        if sl_trigger_price is not None:
+            raise ValueError(
+                "sl_trigger_price is not valid for sl_type='trailing_stop'; "
+                "use sl_trigger_offset (absolute price deviation from peak)"
+            )
+        if sl_trigger_offset is None:
+            raise ValueError("sl_trigger_offset is required when sl_type='trailing_stop'")
+        if sl_limit_price is not None:
+            raise ValueError(
+                "sl_limit_price is not valid for sl_type='trailing_stop' "
+                "(trailing-stop fires as market)"
+            )
+    else:
+        if sl_trigger_price is None:
+            raise ValueError(f"sl_trigger_price is required when sl_type='{sl_type}'")
+        if sl_trigger_offset is not None:
+            raise ValueError(
+                f"sl_trigger_offset is only valid for sl_type='trailing_stop', not '{sl_type}'"
+            )
 
     sources = _resolve_bracket_trigger_sources(
         trigger_source=trigger_source,
@@ -931,7 +964,7 @@ def _validate_bracket_params(
         sl_type,
         trigger=sources["sl"],
         trigger_price=sl_trigger_price,
-        trigger_offset=None,
+        trigger_offset=sl_trigger_offset,
         price=sl_limit_price,
     )
     validate_trigger_params(
@@ -952,14 +985,16 @@ async def _place_bracket_impl(
     amount: float,
     entry_type: str,
     sl_type: str,
-    sl_trigger_price: float,
     tp_type: str,
     tp_trigger_price: float,
     trigger_source: str,
     confirm_live_trade: bool,
+    sl_trigger_price: Optional[float] = None,
+    sl_trigger_offset: Optional[float] = None,
     entry_price: Optional[float] = None,
     entry_trigger_price: Optional[float] = None,
     entry_post_only: bool = False,
+    entry_reject_post_only: Optional[bool] = None,
     sl_limit_price: Optional[float] = None,
     trigger_fill_condition: str = "incremental",
     entry_trigger_source: Optional[str] = None,
@@ -988,6 +1023,7 @@ async def _place_bracket_impl(
             entry_trigger_price=entry_trigger_price,
             sl_type=sl_type,
             sl_trigger_price=sl_trigger_price,
+            sl_trigger_offset=sl_trigger_offset,
             sl_limit_price=sl_limit_price,
             tp_type=tp_type,
             tp_trigger_price=tp_trigger_price,
@@ -1017,6 +1053,8 @@ async def _place_bracket_impl(
             amount,
             effective_price=entry_effective_price,
         )
+        # Trailing-stop SL has no fixed trigger price at submit time, so the
+        # notional guard falls back to current mark (effective_price=None).
         await _validate_order_amount(
             app_ctx,
             instrument,
@@ -1033,6 +1071,13 @@ async def _place_bracket_impl(
         await _try_mark_decision_rejected(app_ctx, decision_id, str(exc))
         raise
 
+    # Hardening: a crossing post_only entry is silently repriced by Deribit to
+    # the next maker price unless reject_post_only is set. Default post_only
+    # bracket entries to loud rejection; an explicit entry_reject_post_only=
+    # False still opts back into Deribit's reprice behaviour.
+    if entry_post_only and entry_reject_post_only is None:
+        entry_reject_post_only = True
+
     resolved_sources = _resolve_bracket_trigger_sources(
         trigger_source=trigger_source,
         entry_trigger_source=entry_trigger_source,
@@ -1045,7 +1090,10 @@ async def _place_bracket_impl(
         "direction": child_direction,
         "type": sl_type,
         "trigger": resolved_sources["sl"],
+        # Trailing-stop SL uses trigger_offset, not trigger_price; the
+        # validator has already proven exactly one of the two is set.
         "trigger_price": sl_trigger_price,
+        "trigger_offset": sl_trigger_offset,
         "price": sl_limit_price,
         "reduce_only": True,
         "label": decision_id,
@@ -1070,8 +1118,10 @@ async def _place_bracket_impl(
         "entry_price": entry_price,
         "entry_trigger_price": entry_trigger_price,
         "entry_post_only": entry_post_only,
+        "entry_reject_post_only": entry_reject_post_only,
         "sl_type": sl_type,
         "sl_trigger_price": sl_trigger_price,
+        "sl_trigger_offset": sl_trigger_offset,
         "sl_limit_price": sl_limit_price,
         "tp_type": tp_type,
         "tp_trigger_price": tp_trigger_price,
@@ -1122,6 +1172,7 @@ async def _place_bracket_impl(
             entry_price=entry_price,
             label=decision_id,
             entry_post_only=entry_post_only,
+            entry_reject_post_only=entry_reject_post_only,
             trigger_fill_condition=trigger_fill_condition,
             otoco_config=otoco_config,
             entry_trigger=rest_entry_trigger,
@@ -2023,6 +2074,11 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Linear notional guard uses worst-case execution price for trigger
         orders (max(trigger_price, price)) to prevent under-checking when the
         trigger fires above current mark.
+
+        When `post_only=True`, a crossing limit is silently repriced by
+        Deribit to the next maker price unless rejected — so
+        `reject_post_only` defaults to True whenever `post_only` is set.
+        Pass `reject_post_only=False` to opt back into the reprice behaviour.
         """
         app_ctx = _ctx(ctx)
         return _json(
@@ -2095,14 +2151,16 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         amount: float,
         entry_type: str,
         sl_type: str,
-        sl_trigger_price: float,
         tp_type: str,
         tp_trigger_price: float,
         trigger_source: str,
         confirm_live_trade: bool,
+        sl_trigger_price: Optional[float] = None,
+        sl_trigger_offset: Optional[float] = None,
         entry_price: Optional[float] = None,
         entry_trigger_price: Optional[float] = None,
         entry_post_only: bool = False,
+        entry_reject_post_only: Optional[bool] = None,
         sl_limit_price: Optional[float] = None,
         trigger_fill_condition: str = "incremental",
         entry_trigger_source: Optional[str] = None,
@@ -2134,6 +2192,28 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         below current; a sell stop-entry must price above. The current
         price is read with cache bypassed so a stale WS feed cannot mask
         the divergence.
+
+        SL-type matrix:
+
+        | sl_type        | sl_trigger_price | sl_trigger_offset | sl_limit_price |
+        |----------------|------------------|-------------------|----------------|
+        | stop_market    | required         | forbidden         | forbidden      |
+        | stop_limit     | required         | forbidden         | required       |
+        | trailing_stop  | forbidden        | required          | forbidden      |
+
+        ``sl_trigger_offset`` is an *absolute* deviation in quote currency
+        (USD for inverse, USDC for linear), not a percent — same unit as
+        ``trigger_price``. Trailing fires as market when the mark/last/index
+        feed moves ``offset`` from its peak since submit.
+
+        Post-only entry:
+          ``entry_post_only=True`` makes the entry a maker-only order. A
+          crossing post-only limit is *silently repriced* by Deribit to the
+          next maker price unless rejected — so ``entry_reject_post_only``
+          defaults to True whenever ``entry_post_only`` is set, turning a
+          crossing entry into a loud rejection instead. Pass
+          ``entry_reject_post_only=False`` to opt back into Deribit's reprice
+          behaviour.
 
         Per-leg trigger source:
           ``trigger_source`` sets the default ``mark_price`` / ``last_price``
@@ -2168,6 +2248,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 entry_type=entry_type,
                 sl_type=sl_type,
                 sl_trigger_price=sl_trigger_price,
+                sl_trigger_offset=sl_trigger_offset,
                 tp_type=tp_type,
                 tp_trigger_price=tp_trigger_price,
                 trigger_source=trigger_source,
@@ -2175,6 +2256,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 entry_price=entry_price,
                 entry_trigger_price=entry_trigger_price,
                 entry_post_only=entry_post_only,
+                entry_reject_post_only=entry_reject_post_only,
                 sl_limit_price=sl_limit_price,
                 trigger_fill_condition=trigger_fill_condition,
                 entry_trigger_source=entry_trigger_source,

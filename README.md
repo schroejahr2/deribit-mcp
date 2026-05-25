@@ -308,7 +308,7 @@ Same backing table as the [News Webhook](#news-webhook).
 |------|---------|
 | `buy(instrument, amount, order_type, ...)` | Long entry. Supports `market`, `limit`, `market_limit`, `stop_market`, `stop_limit`, `take_market`, `trailing_stop` |
 | `sell(...)` | Short entry / position exit, same surface as `buy` |
-| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
+| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). `sl_type` accepts `stop_market`, `stop_limit` (fixed `sl_trigger_price`) or `trailing_stop` (use `sl_trigger_offset` — absolute deviation from peak in quote currency). Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
 | `edit_order(order_id, ...)` | Modify by Deribit ID |
 | `edit_order_by_label(currency, instrument, label, ...)` | Modify by `decision_id` (preflighted) |
 | `cancel_order(order_id, decision_id?)` | Single cancel |
@@ -335,6 +335,11 @@ and replay without flooding agent sessions.
   cannot under-check the cap.
 - Mutating orders without a valid `decision_id` are rejected before
   the Deribit call.
+- `post_only` orders default `reject_post_only=true`: a crossing limit
+  is rejected instead of being silently repriced by Deribit to the next
+  maker price. Applies to `buy`/`sell` (`reject_post_only`) and
+  `place_bracket` entries (`entry_reject_post_only`); pass the field
+  explicitly as `false` to opt back into the reprice behaviour.
 
 Example — long with a stop-loss at mark × 0.97:
 

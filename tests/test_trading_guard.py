@@ -233,3 +233,129 @@ async def test_combo_leg_static_limits_are_enforced(monkeypatch):
 
     with pytest.raises(trading.TradingValidationError, match="amount 3.0 exceeds"):
         await trading.enforce_order_amount_limits(app_ctx, "BTC-COMBO-1", 1)
+
+
+class PositionRest:
+    """Fake REST client exposing a single instrument plus its open position."""
+
+    def __init__(self, instrument, position):
+        self.instrument = instrument
+        self.position = position
+        self.ticker_calls = 0
+
+    async def get_instrument(self, instrument):
+        return self.instrument
+
+    async def get_position(self, instrument):
+        return self.position
+
+    async def get_ticker(self, instrument):
+        self.ticker_calls += 1
+        return {"mark_price": 76_000}
+
+
+LINEAR_PERP = {
+    "instrument_name": "BTC_USDC-PERPETUAL",
+    "kind": "future",
+    "quote_currency": "USDC",
+    "settlement_currency": "USDC",
+}
+INVERSE_PERP = {
+    "instrument_name": "BTC-PERPETUAL",
+    "kind": "future",
+    "quote_currency": "USD",
+    "settlement_currency": "BTC",
+}
+
+
+@pytest.mark.asyncio
+async def test_close_position_linear_uses_size_currency(monkeypatch):
+    # Linear order amounts are base currency; the guard must read
+    # `size_currency` (0.04 BTC), not `size` (3031 USD notional).
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(LINEAR_PERP, {"size": 3031.0, "size_currency": 0.04}),
+        instrument_cache={},
+    )
+
+    await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")
+
+
+@pytest.mark.asyncio
+async def test_close_position_linear_size_does_not_trip_static_limit(monkeypatch):
+    # Regression: reading `size` (USD notional) instead of `size_currency`
+    # made a 0.04 BTC position breach DERIBIT_MAX_AMOUNT_LINEAR.
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(LINEAR_PERP, {"size": 3031.0, "size_currency": 0.04}),
+        instrument_cache={},
+    )
+
+    # With the bug this raised "amount 3031.0 exceeds DERIBIT_MAX_AMOUNT_LINEAR".
+    await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")
+
+
+@pytest.mark.asyncio
+async def test_close_position_inverse_uses_size_usd(monkeypatch):
+    # Inverse order amounts are USD; the guard must read `size` (3031 USD).
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(INVERSE_PERP, {"size": 3031.0, "size_currency": 0.04}),
+        instrument_cache={},
+    )
+
+    await trading.enforce_close_position_limit(app_ctx, "BTC-PERPETUAL")
+
+
+@pytest.mark.asyncio
+async def test_close_position_inverse_size_enforced_against_limit(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(INVERSE_PERP, {"size": 3031.0, "size_currency": 0.04}),
+        instrument_cache={},
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="amount 3031.0 exceeds"):
+        await trading.enforce_close_position_limit(app_ctx, "BTC-PERPETUAL")
+
+
+@pytest.mark.asyncio
+async def test_close_position_linear_falls_back_to_size_when_no_size_currency(monkeypatch):
+    # Defensive: if Deribit ever omits `size_currency`, fall back to `size`.
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(LINEAR_PERP, {"size": 0.04}),
+        instrument_cache={},
+    )
+
+    await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")
+
+
+@pytest.mark.asyncio
+async def test_close_position_zero_size_short_circuits(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    rest = PositionRest(LINEAR_PERP, {"size": 0.0, "size_currency": 0.0})
+    app_ctx = SimpleNamespace(rest_client=rest, instrument_cache={})
+
+    await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")
+    # Flat position never needs a notional lookup.
+    assert rest.ticker_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_close_position_missing_size_fields_raises(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_linear", 100)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+    app_ctx = SimpleNamespace(
+        rest_client=PositionRest(LINEAR_PERP, {"average_price": 76_000}),
+        instrument_cache={},
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="determine open position size"):
+        await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")

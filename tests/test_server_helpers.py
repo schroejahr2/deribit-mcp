@@ -1858,3 +1858,408 @@ async def test_create_combo_rejects_signed_amount(monkeypatch):
         )
 
     assert decision_repo.outcomes[0][1] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# post_only hardening — crossing limits must reject, not silently reprice
+# ---------------------------------------------------------------------------
+
+
+def _enable_inverse_trading(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+
+
+@pytest.mark.asyncio
+async def test_place_order_post_only_defaults_reject_post_only_true(monkeypatch):
+    """post_only=True with reject_post_only unset → resolved to True."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakePlaceOrderRest()
+    audit = AuditRepo()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=audit,
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    await _place_order_impl(
+        app_ctx,
+        side="buy",
+        instrument="BTC-PERPETUAL",
+        amount=10,
+        order_type="limit",
+        price=76_060,
+        decision_id="decision-1",
+        post_only=True,
+        reject_post_only=None,
+        reduce_only=None,
+        time_in_force=None,
+        trigger=None,
+        trigger_price=None,
+        trigger_offset=None,
+        client_order_id="cid-1",
+        confirm_live_trade=False,
+    )
+
+    _, _, _, _, kwargs = rest.buy_calls[0]
+    assert kwargs["post_only"] is True
+    assert kwargs["reject_post_only"] is True
+    # Audit row records the resolved value, not the raw None.
+    assert audit.records[0]["request"]["reject_post_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_place_order_explicit_reject_post_only_false_is_honoured(monkeypatch):
+    """An explicit reject_post_only=False opts back into Deribit's reprice."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakePlaceOrderRest()
+    app_ctx = _make_app_ctx(rest)
+
+    await _place_order_impl(
+        app_ctx,
+        side="buy",
+        instrument="BTC-PERPETUAL",
+        amount=10,
+        order_type="limit",
+        price=76_060,
+        decision_id="decision-1",
+        post_only=True,
+        reject_post_only=False,
+        reduce_only=None,
+        time_in_force=None,
+        trigger=None,
+        trigger_price=None,
+        trigger_offset=None,
+        client_order_id="cid-1",
+        confirm_live_trade=False,
+    )
+
+    _, _, _, _, kwargs = rest.buy_calls[0]
+    assert kwargs["reject_post_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_place_order_no_post_only_leaves_reject_unset(monkeypatch):
+    """Without post_only the hardening does not touch reject_post_only."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakePlaceOrderRest()
+    app_ctx = _make_app_ctx(rest)
+
+    await _place_order_impl(
+        app_ctx,
+        side="buy",
+        instrument="BTC-PERPETUAL",
+        amount=10,
+        order_type="limit",
+        price=76_060,
+        decision_id="decision-1",
+        post_only=None,
+        reject_post_only=None,
+        reduce_only=None,
+        time_in_force=None,
+        trigger=None,
+        trigger_price=None,
+        trigger_offset=None,
+        client_order_id="cid-1",
+        confirm_live_trade=False,
+    )
+
+    _, _, _, _, kwargs = rest.buy_calls[0]
+    assert kwargs["reject_post_only"] is None
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_post_only_entry_defaults_reject_true(monkeypatch):
+    """entry_post_only=True → entry_reject_post_only resolved True to place_otoco."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    audit = AuditRepo()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=audit,
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    await _place_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        instrument="BTC-PERPETUAL",
+        side="buy",
+        amount=10,
+        entry_type="limit",
+        entry_price=76_060,
+        entry_post_only=True,
+        sl_type="stop_market",
+        sl_trigger_price=75_000,
+        tp_type="take_market",
+        tp_trigger_price=85_000,
+        trigger_source="mark_price",
+        confirm_live_trade=False,
+        client_order_id="bracket-cid",
+    )
+
+    call = rest.place_otoco_calls[0]
+    assert call["entry_post_only"] is True
+    assert call["entry_reject_post_only"] is True
+    assert audit.records[0]["request"]["entry_reject_post_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_explicit_entry_reject_false_is_honoured(monkeypatch):
+    """entry_reject_post_only=False opts the bracket entry back into reprice."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    await _place_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        instrument="BTC-PERPETUAL",
+        side="buy",
+        amount=10,
+        entry_type="limit",
+        entry_price=76_060,
+        entry_post_only=True,
+        entry_reject_post_only=False,
+        sl_type="stop_market",
+        sl_trigger_price=75_000,
+        tp_type="take_market",
+        tp_trigger_price=85_000,
+        trigger_source="mark_price",
+        confirm_live_trade=False,
+        client_order_id="bracket-cid",
+    )
+
+    assert rest.place_otoco_calls[0]["entry_reject_post_only"] is False
+
+
+# ---------------------------------------------------------------------------
+# Trailing-stop SL inside place_bracket
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_trailing_sl_passes_trigger_offset_to_rest(monkeypatch):
+    """sl_type='trailing_stop' + sl_trigger_offset → stop_child carries
+    trigger_offset, leaves trigger_price empty, audit row records both."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    audit = AuditRepo()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=audit,
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    await _place_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        instrument="BTC-PERPETUAL",
+        side="buy",
+        amount=10,
+        entry_type="market",
+        sl_type="trailing_stop",
+        sl_trigger_offset=200,
+        tp_type="take_market",
+        tp_trigger_price=85_000,
+        trigger_source="mark_price",
+        confirm_live_trade=False,
+        client_order_id="bracket-trail",
+    )
+
+    call = rest.place_otoco_calls[0]
+    sl_child = call["otoco_config"][0]
+    assert sl_child["type"] == "trailing_stop"
+    assert sl_child["trigger_offset"] == 200
+    assert sl_child["trigger_price"] is None
+    assert sl_child["reduce_only"] is True
+    assert sl_child["trigger"] == "mark_price"
+    # TP leg untouched.
+    tp_child = call["otoco_config"][1]
+    assert tp_child["type"] == "take_market"
+    assert tp_child["trigger_price"] == 85_000
+    # Audit row carries both knobs so /events readers can replay the bracket.
+    request = audit.records[0]["request"]
+    assert request["sl_type"] == "trailing_stop"
+    assert request["sl_trigger_offset"] == 200
+    assert request["sl_trigger_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_trailing_sl_requires_offset(monkeypatch):
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    app_ctx = SimpleNamespace(
+        decision_repo=decision_repo,
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(ValueError, match="sl_trigger_offset is required"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="trailing_stop",
+            sl_trigger_price=None,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-trail-bad",
+        )
+
+    assert rest.place_otoco_calls == []
+    assert decision_repo.outcomes[0][1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_trailing_sl_rejects_trigger_price(monkeypatch):
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(ValueError, match="sl_trigger_price is not valid"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="trailing_stop",
+            sl_trigger_price=75_000,
+            sl_trigger_offset=200,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-trail-conflict",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_trailing_sl_rejects_limit_price(monkeypatch):
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(ValueError, match="sl_limit_price is not valid"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="trailing_stop",
+            sl_trigger_offset=200,
+            sl_limit_price=74_500,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-trail-limit",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_stop_market_rejects_sl_trigger_offset(monkeypatch):
+    """Symmetric guard: fixed-trigger stops must not carry sl_trigger_offset."""
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(ValueError, match="sl_trigger_offset is only valid"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="stop_market",
+            sl_trigger_price=75_000,
+            sl_trigger_offset=200,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-mix",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_stop_market_requires_sl_trigger_price(monkeypatch):
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(ValueError, match="sl_trigger_price is required"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="stop_market",
+            sl_trigger_price=None,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-nosl",
+        )
+
+    assert rest.place_otoco_calls == []
