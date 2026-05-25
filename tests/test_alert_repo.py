@@ -220,3 +220,78 @@ async def test_list_all_filters_by_instrument_and_status():
     only_triggered = await repo.list_all(status="triggered")
     assert {a.id for a in only_triggered} == {btc_trig.id}
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_update_last_price_stamps_last_price_at():
+    db = Database(":memory:")
+    await db.connect()
+    repo = AlertRepo(db)
+
+    alert = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.BELOW,
+        threshold=77450.0,
+        notification_channel="outbox",
+    )
+    await repo.save(alert)
+
+    sample_time = datetime(2026, 5, 25, 10, 0, 0, tzinfo=timezone.utc)
+    await repo.update_last_price(alert.id, 77589.0, sample_time)
+
+    loaded = await repo.load_active()
+    assert len(loaded) == 1
+    rehydrated = loaded[0]
+    assert rehydrated._last_price == 77589.0
+    assert rehydrated._last_price_at == sample_time
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_update_last_price_defaults_to_now_when_no_stamp_given():
+    db = Database(":memory:")
+    await db.connect()
+    repo = AlertRepo(db)
+
+    alert = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.BELOW,
+        threshold=77450.0,
+        notification_channel="outbox",
+    )
+    await repo.save(alert)
+    before = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    await repo.update_last_price(alert.id, 77000.0)
+
+    loaded = await repo.load_active()
+    after = datetime.now(timezone.utc) + timedelta(seconds=1)
+    assert loaded[0]._last_price_at is not None
+    assert before <= loaded[0]._last_price_at <= after
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_save_then_load_preserves_last_price_at():
+    db = Database(":memory:")
+    await db.connect()
+    repo = AlertRepo(db)
+
+    sample_time = datetime(2026, 5, 25, 9, 30, 0, tzinfo=timezone.utc)
+    alert = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.BELOW,
+        threshold=77450.0,
+        notification_channel="outbox",
+    )
+    alert._last_price = 78000.0
+    alert._last_price_at = sample_time
+    await repo.save(alert)
+
+    rehydrated = (await repo.load_active())[0]
+    assert rehydrated._last_price_at == sample_time
+    # to_dict must surface the timestamp for operators / list_alerts callers.
+    payload = rehydrated.to_dict()
+    assert payload["last_price"] == 78000.0
+    assert payload["last_price_at"] == sample_time.isoformat()
+    await db.close()

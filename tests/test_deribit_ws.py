@@ -214,3 +214,142 @@ async def test_auto_reconnect_backoff_caps_at_max_delay(monkeypatch):
     assert sleeps[0] == 1.0
     assert sleeps[-1] == 8.0
     assert max(sleeps) == 8.0
+
+
+class FlakyResubscribeWS(DeribitWebSocketClient):
+    """Test double for the resubscribe-failure path.
+
+    `fail_first` maps channel name → how many times `_send_subscribe` should
+    raise before it starts succeeding for that channel.
+    """
+
+    def __init__(self, fail_first: dict[str, int] | None = None):
+        super().__init__()
+        self.fail_first = dict(fail_first or {})
+        self.subscribe_attempts: list[str] = []
+        self.state_events: list[tuple[str, dict]] = []
+        self._connected_for_test = True
+        self.set_state_callback(self._record_state)
+
+    async def _record_state(self, state: str, payload: dict) -> None:
+        self.state_events.append((state, payload))
+
+    async def connect(self) -> None:
+        # No real socket; reconnect treats us as freshly connected.
+        self._running = True
+        self._closing = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected_for_test
+
+    async def _send_subscribe(self, channel: str) -> None:
+        self.subscribe_attempts.append(channel)
+        remaining = self.fail_first.get(channel, 0)
+        if remaining > 0:
+            self.fail_first[channel] = remaining - 1
+            raise RuntimeError(f"simulated subscribe failure for {channel}")
+        self._subscribed_channels.add(channel)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_routes_failed_channels_to_pending_and_emits_degraded(monkeypatch):
+    """Failed resubscribe → channel kept in pending + degraded state event."""
+
+    # Patch the retry task launcher so the loop does not race the assertions;
+    # the loop itself is covered by the next test.
+    monkeypatch.setattr(
+        DeribitWebSocketClient,
+        "_ensure_resubscribe_retry_task",
+        lambda self: None,
+    )
+    client = FlakyResubscribeWS(fail_first={"ticker.BTC-PERPETUAL.raw": 99})
+    # Pretend we used to be subscribed to two channels before the reconnect.
+    client._subscribed_channels = {
+        "ticker.BTC-PERPETUAL.raw",
+        "ticker.ETH-PERPETUAL.raw",
+    }
+    # Force the lock-guarded path to actually run resubscribe.
+    client._connected_for_test = False
+
+    async def after_connect_mark_connected():
+        client._connected_for_test = True
+
+    original_connect = client.connect
+
+    async def connect_then_mark():
+        await original_connect()
+        await after_connect_mark_connected()
+
+    client.connect = connect_then_mark  # type: ignore[assignment]
+
+    await client._reconnect()
+
+    # BTC failed → stays pending; ETH succeeded → not pending.
+    assert client._pending_resubscribe == {"ticker.BTC-PERPETUAL.raw"}
+    assert "ticker.ETH-PERPETUAL.raw" in client._subscribed_channels
+    assert "ticker.BTC-PERPETUAL.raw" not in client._subscribed_channels
+
+    # One degraded event with the channel + failure detail.
+    degraded = [(s, p) for s, p in client.state_events if s == "degraded"]
+    assert len(degraded) == 1
+    payload = degraded[0][1]
+    assert payload["reason"] == "resubscribe_failed"
+    assert payload["channels"] == ["ticker.BTC-PERPETUAL.raw"]
+    assert payload["failures"][0]["channel"] == "ticker.BTC-PERPETUAL.raw"
+    assert payload["failures"][0]["error"].startswith("RuntimeError:")
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_retry_loop_recovers_pending_channels(monkeypatch):
+    """Retry loop drains pending and emits a reconnected/resubscribe_recovered event."""
+
+    monkeypatch.setattr("src.deribit_ws.settings.deribit_ws_reconnect_max_delay_seconds", 8.0)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("src.deribit_ws.asyncio.sleep", fake_sleep)
+
+    # Fails twice then succeeds — covers the per-channel backoff path.
+    client = FlakyResubscribeWS(fail_first={"ticker.BTC-PERPETUAL.raw": 2})
+    client._pending_resubscribe = {"ticker.BTC-PERPETUAL.raw"}
+
+    await client._resubscribe_retry_loop()
+
+    assert client._pending_resubscribe == set()
+    assert "ticker.BTC-PERPETUAL.raw" in client._subscribed_channels
+
+    recovered = [(s, p) for s, p in client.state_events if s == "reconnected"]
+    assert len(recovered) == 1
+    payload = recovered[0][1]
+    assert payload["reason"] == "resubscribe_recovered"
+    assert payload["channels"] == ["ticker.BTC-PERPETUAL.raw"]
+    assert payload["attempt"] == 3  # 2 failures + 1 success
+
+    # Backoff doubled after each failed round, then stayed put on success.
+    assert sleeps[0] == 1.0
+    assert sleeps[1] == 2.0
+    assert sleeps[2] == 4.0
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_retry_loop_exits_when_closing(monkeypatch):
+    """Shutdown short-circuits the loop even with pending channels."""
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.deribit_ws.asyncio.sleep", fake_sleep)
+
+    client = FlakyResubscribeWS(fail_first={"ticker.X.raw": 99})
+    client._pending_resubscribe = {"ticker.X.raw"}
+    client._closing = True
+
+    await client._resubscribe_retry_loop()
+
+    # Loop bailed before doing any work.
+    assert client.subscribe_attempts == []
+    assert client._pending_resubscribe == {"ticker.X.raw"}

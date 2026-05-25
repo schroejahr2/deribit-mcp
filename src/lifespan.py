@@ -74,6 +74,93 @@ async def _maintenance_reaper_loop(
         logger.error("Maintenance reaper crashed: %s", exc, exc_info=True)
 
 
+async def _stale_alert_watchdog_loop(
+    alert_manager: AlertManager,
+    rest_client: Any,
+    ws_client: Any,
+    event_outbox_repo: EventOutboxRepo,
+) -> None:
+    """Catch silent ticker-feed gaps that the WS reconnect path missed.
+
+    If a price-alert instrument has not had a sample for longer than
+    ``DERIBIT_ALERT_STALE_THRESHOLD_SECONDS`` we:
+      1. write an ``alert_stale`` event into the outbox per stale instrument,
+      2. force a server-side resubscribe to revive the ticker channel,
+      3. pull a fresh REST ticker and feed it through ``process_price_update``
+         so alerts that would have triggered now do.
+
+    Either setting at 0 disables the watchdog.
+    """
+    interval = settings.deribit_alert_stale_check_seconds
+    threshold = settings.deribit_alert_stale_threshold_seconds
+    if interval <= 0 or threshold <= 0:
+        logger.info(
+            "Stale-alert watchdog disabled (interval=%s, threshold=%s)", interval, threshold
+        )
+        return
+    logger.info(
+        "Stale-alert watchdog running every %.1fs; threshold %.1fs",
+        interval,
+        threshold,
+    )
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                stale = alert_manager.detect_stale_alerts(threshold)
+                if not stale:
+                    continue
+                for instrument, age in stale:
+                    age_int = int(age) if age != float("inf") else -1
+                    logger.warning(
+                        "Stale alert sample: %s age=%.1fs (threshold=%.1fs)",
+                        instrument,
+                        age,
+                        threshold,
+                    )
+                    try:
+                        await event_outbox_repo.insert_connection_event(
+                            "alert_stale",
+                            message=(
+                                f"Alert ticker sample for {instrument} stale "
+                                f"(age={age:.1f}s, threshold={threshold:.1f}s); "
+                                "forcing WS resubscribe + REST refresh."
+                            ),
+                            severity="warning",
+                            attempt=age_int,
+                            reason="alert_stale",
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to write alert_stale event for %s: %s",
+                            instrument,
+                            exc,
+                        )
+                    try:
+                        await ws_client.force_resubscribe(f"ticker.{instrument}.raw")
+                    except Exception as exc:
+                        logger.error(
+                            "force_resubscribe for %s failed: %s",
+                            instrument,
+                            exc,
+                        )
+                try:
+                    refreshed = await alert_manager.refresh_from_rest(rest_client)
+                    if refreshed:
+                        logger.info(
+                            "Stale-alert watchdog refreshed %d instrument(s) via REST",
+                            refreshed,
+                        )
+                except Exception as exc:
+                    logger.error("Stale-alert REST refresh failed: %s", exc, exc_info=True)
+            except Exception as exc:
+                logger.error("Stale-alert watchdog tick crashed: %s", exc, exc_info=True)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Stale-alert watchdog crashed: %s", exc, exc_info=True)
+
+
 def _trading_event_channels() -> list[str]:
     return [
         channel.strip()
@@ -146,6 +233,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
     scheduler = TimeAlertScheduler(alert_repo, alert_manager)
     market_stream_manager = MarketStreamManager(ws_client)
     reaper_task: asyncio.Task | None = None
+    stale_alert_task: asyncio.Task | None = None
 
     async def on_price_update(instrument: str, tick_data: Dict[str, Any]):
         try:
@@ -176,6 +264,20 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 exc,
                 exc_info=True,
             )
+        # After any reconnect (socket-level or per-channel resubscribe recovery),
+        # force a REST refresh of every active price-alert so the cached
+        # _last_price snaps back fresh before the next WS frame arrives.
+        if state == "reconnected":
+            try:
+                refreshed = await alert_manager.refresh_from_rest(rest_client)
+                if refreshed:
+                    logger.info(
+                        "Refreshed %d alert instrument(s) via REST after WS %s",
+                        refreshed,
+                        payload.get("reason") or "reconnect",
+                    )
+            except Exception as exc:
+                logger.error("Alert refresh after WS reconnect failed: %s", exc, exc_info=True)
 
     async def on_deribit_user_change(channel: str, data: Dict[str, Any]) -> None:
         try:
@@ -256,6 +358,9 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
         reaper_task = asyncio.create_task(
             _maintenance_reaper_loop(event_outbox_repo, idempotency_repo)
         )
+        stale_alert_task = asyncio.create_task(
+            _stale_alert_watchdog_loop(alert_manager, rest_client, ws_client, event_outbox_repo)
+        )
 
         ctx = AppContext(
             ws_client=ws_client,
@@ -286,6 +391,12 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             reaper_task.cancel()
             try:
                 await reaper_task
+            except asyncio.CancelledError:
+                pass
+        if stale_alert_task is not None:
+            stale_alert_task.cancel()
+            try:
+                await stale_alert_task
             except asyncio.CancelledError:
                 pass
         await scheduler.stop()

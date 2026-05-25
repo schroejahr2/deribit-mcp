@@ -89,6 +89,7 @@ class Database:
               triggered_at TEXT,
               last_trigger_time TEXT,
               last_price REAL,
+              last_price_at TEXT,
               schema_version INTEGER NOT NULL DEFAULT 1
             );
 
@@ -255,7 +256,15 @@ class Database:
         await self._migrate_order_audit_client_order_id(conn)
         await self._migrate_drop_briefings(conn)
         await self._migrate_news_add_dedupe_key(conn)
+        await self._migrate_alerts_add_last_price_at(conn)
         await conn.commit()
+
+    async def _migrate_alerts_add_last_price_at(self, conn: aiosqlite.Connection) -> None:
+        """Stamp the last price-sample arrival so operators can detect stale alerts."""
+        cursor = await conn.execute("PRAGMA table_info(alerts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "last_price_at" not in columns:
+            await conn.execute("ALTER TABLE alerts ADD COLUMN last_price_at TEXT")
 
     async def _migrate_news_add_dedupe_key(self, conn: aiosqlite.Connection) -> None:
         """Add dedupe_key column + unique partial index to pre-existing news table."""
@@ -306,8 +315,8 @@ class AlertRepo:
             INSERT INTO alerts (
               id, instrument, condition, threshold, fire_at, notification_channel,
               status, message, repeat, cooldown_seconds, created_at, triggered_at,
-              last_trigger_time, last_price, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+              last_trigger_time, last_price, last_price_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(id) DO UPDATE SET
               instrument=excluded.instrument,
               condition=excluded.condition,
@@ -320,7 +329,8 @@ class AlertRepo:
               cooldown_seconds=excluded.cooldown_seconds,
               triggered_at=excluded.triggered_at,
               last_trigger_time=excluded.last_trigger_time,
-              last_price=excluded.last_price
+              last_price=excluded.last_price,
+              last_price_at=excluded.last_price_at
             """,
             (
                 alert.id,
@@ -337,6 +347,7 @@ class AlertRepo:
                 to_iso(alert.triggered_at),
                 to_iso(alert.last_trigger_time),
                 alert._last_price,
+                to_iso(alert._last_price_at),
             ),
         )
         await conn.commit()
@@ -368,6 +379,7 @@ class AlertRepo:
                 fire_at=parse_iso(row["fire_at"]),
             )
             alert._last_price = row["last_price"]
+            alert._last_price_at = parse_iso(row["last_price_at"])
             alerts.append(alert)
         return alerts
 
@@ -413,12 +425,22 @@ class AlertRepo:
                 fire_at=parse_iso(row["fire_at"]),
             )
             alert._last_price = row["last_price"]
+            alert._last_price_at = parse_iso(row["last_price_at"])
             alerts.append(alert)
         return alerts
 
-    async def update_last_price(self, alert_id: str, last_price: float) -> None:
+    async def update_last_price(
+        self,
+        alert_id: str,
+        last_price: float,
+        last_price_at: Optional[datetime] = None,
+    ) -> None:
         conn = self.db.require_conn()
-        await conn.execute("UPDATE alerts SET last_price = ? WHERE id = ?", (last_price, alert_id))
+        stamp = to_iso(last_price_at or utc_now())
+        await conn.execute(
+            "UPDATE alerts SET last_price = ?, last_price_at = ? WHERE id = ?",
+            (last_price, stamp, alert_id),
+        )
         await conn.commit()
 
     async def mark_cancelled(self, alert_id: str) -> None:

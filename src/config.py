@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     deribit_ws_reconnect_max_delay_seconds: float = 60.0
     deribit_ws_reconnect_heartbeat_attempts: int = 10
 
+    # Alert sample-staleness watchdog: catches the case where the WS ticker
+    # feed goes silent after a reconnect (e.g. a resubscribe never landed).
+    # Setting either to 0 disables the watchdog entirely.
+    deribit_alert_stale_check_seconds: float = 30.0
+    deribit_alert_stale_threshold_seconds: float = 60.0
+
     # Max age for an in-memory cached price before get_current_price falls back to a
     # fresh REST fetch. Keep small enough that WS-glitch staleness is caught.
     deribit_price_cache_max_age_seconds: float = 3.0
@@ -110,6 +116,10 @@ class Settings(BaseSettings):
             raise ValueError("DERIBIT_WS_RECONNECT_MAX_DELAY_SECONDS must be > 0")
         if self.deribit_ws_reconnect_heartbeat_attempts < 0:
             raise ValueError("DERIBIT_WS_RECONNECT_HEARTBEAT_ATTEMPTS must be >= 0")
+        if self.deribit_alert_stale_check_seconds < 0:
+            raise ValueError("DERIBIT_ALERT_STALE_CHECK_SECONDS must be >= 0")
+        if self.deribit_alert_stale_threshold_seconds < 0:
+            raise ValueError("DERIBIT_ALERT_STALE_THRESHOLD_SECONDS must be >= 0")
         if self.deribit_price_cache_max_age_seconds < 0:
             raise ValueError("DERIBIT_PRICE_CACHE_MAX_AGE_SECONDS must be >= 0")
         if self.deribit_trading_event_outbox_enabled:

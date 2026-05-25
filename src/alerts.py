@@ -53,6 +53,7 @@ class PriceAlert:
 
     # Internal state for tracking
     _last_price: Optional[float] = None
+    _last_price_at: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert alert to dictionary."""
@@ -70,6 +71,7 @@ class PriceAlert:
             "repeat": self.repeat,
             "cooldown_seconds": self.cooldown_seconds,
             "last_price": self._last_price,
+            "last_price_at": self._last_price_at.isoformat() if self._last_price_at else None,
         }
 
 
@@ -223,10 +225,13 @@ class AlertManager:
                 pct_change = ((current_price - alert._last_price) / alert._last_price) * 100
                 triggered = abs(pct_change) >= alert.threshold
 
-        # Update last price for next check
+        # Update last price for next check + stamp the moment we saw it so a
+        # later watchdog can detect when the ticker stream has gone silent.
+        now = datetime.now(timezone.utc)
         alert._last_price = current_price
+        alert._last_price_at = now
         if self.repo:
-            await self.repo.update_last_price(alert.id, current_price)
+            await self.repo.update_last_price(alert.id, current_price, now)
 
         return triggered
 
@@ -348,6 +353,80 @@ class AlertManager:
             )
 
         return message
+
+    def detect_stale_alerts(
+        self,
+        threshold_seconds: float,
+        now: Optional[datetime] = None,
+    ) -> List[tuple[str, float]]:
+        """Return ``[(instrument, age_seconds)]`` for active price alerts whose
+        last sample is older than ``threshold_seconds``.
+
+        Deduped per instrument (worst offender wins) and sorted by age
+        descending so the watchdog can act on the worst first. An alert that
+        has never been sampled (``_last_price_at is None``) counts as
+        infinitely stale.
+        """
+        reference = now or datetime.now(timezone.utc)
+        ages: Dict[str, float] = {}
+        for alert in list(self.alerts.values()):
+            if alert.status != AlertStatus.ACTIVE:
+                continue
+            if alert.condition == AlertCondition.TIME:
+                continue
+            if not alert.instrument:
+                continue
+            last = alert._last_price_at
+            if last is None:
+                age = float("inf")
+            else:
+                age = (reference - last).total_seconds()
+            if age < threshold_seconds:
+                continue
+            existing = ages.get(alert.instrument)
+            if existing is None or age > existing:
+                ages[alert.instrument] = age
+        return sorted(ages.items(), key=lambda kv: kv[1], reverse=True)
+
+    async def refresh_from_rest(self, rest_client: Any) -> int:
+        """Pull a fresh ticker via REST for every active price-alert instrument.
+
+        Used after a WebSocket reconnect/resubscribe-recovery so the cached
+        ``_last_price`` does not stay stale for the duration of the gap until
+        the next ticker frame arrives over WS. Returns the number of
+        instruments that were refreshed (one per *distinct* instrument).
+        """
+        instruments: set[str] = set()
+        for alert in list(self.alerts.values()):
+            if alert.condition == AlertCondition.TIME:
+                continue
+            if alert.status != AlertStatus.ACTIVE:
+                continue
+            if alert.instrument:
+                instruments.add(alert.instrument)
+
+        refreshed = 0
+        for instrument in sorted(instruments):
+            try:
+                ticker = await rest_client.get_ticker(instrument)
+                price = (
+                    ticker.get("mark_price")
+                    or ticker.get("last_price")
+                    or ticker.get("index_price")
+                )
+                if price is None:
+                    logger.warning("REST refresh for %s returned no usable price", instrument)
+                    continue
+                await self.process_price_update(instrument, float(price))
+                refreshed += 1
+            except Exception as exc:
+                logger.error(
+                    "REST refresh for alert instrument %s failed: %s",
+                    instrument,
+                    exc,
+                    exc_info=True,
+                )
+        return refreshed
 
     async def clear_all_alerts(self) -> int:
         """Clear all alerts."""

@@ -298,3 +298,232 @@ async def test_add_time_alert_default_channel_is_outbox():
         fire_at=datetime.now(timezone.utc) + timedelta(seconds=60),
     )
     assert alert.notification_channel == "outbox"
+
+
+class _StubRestClient:
+    """Fake REST client used for refresh_from_rest tests."""
+
+    def __init__(self, tickers: dict):
+        self._tickers = dict(tickers)
+        self.calls: list[str] = []
+
+    async def get_ticker(self, instrument: str) -> dict:
+        self.calls.append(instrument)
+        value = self._tickers.get(instrument, {})
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_rest_fires_alert_when_ws_was_stale():
+    """Repro for the day-12 alert-stale bug: BE-ratchet alert below 77450 with
+    last seen sample 77589 must fire as soon as REST returns the real price."""
+    fired: list[tuple] = []
+
+    async def cb(channel, message, alert, **kwargs):
+        fired.append((alert.id, kwargs.get("triggered_price")))
+        return True
+
+    mgr = AlertManager(cb)
+    alert = _alert(condition=AlertCondition.BELOW, threshold=77450.0)
+    alert._last_price = 77589.0
+    mgr.alerts[alert.id] = alert
+
+    rest = _StubRestClient({"BTC-PERPETUAL": {"mark_price": 77200.0}})
+    refreshed = await mgr.refresh_from_rest(rest)
+
+    assert refreshed == 1
+    assert rest.calls == ["BTC-PERPETUAL"]
+    assert len(fired) == 1
+    assert fired[0][1] == 77200.0
+    assert alert._last_price == 77200.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_rest_dedupes_instruments_across_alerts():
+    """Multiple alerts on the same instrument cause only one REST call."""
+
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    a1 = _alert(condition=AlertCondition.BELOW, threshold=77450.0)
+    a2 = _alert(condition=AlertCondition.ABOVE, threshold=80000.0)
+    mgr.alerts[a1.id] = a1
+    mgr.alerts[a2.id] = a2
+
+    rest = _StubRestClient({"BTC-PERPETUAL": {"last_price": 77500.0}})
+    refreshed = await mgr.refresh_from_rest(rest)
+
+    assert refreshed == 1
+    assert rest.calls == ["BTC-PERPETUAL"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_rest_skips_time_and_non_active_alerts():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    triggered = _alert(condition=AlertCondition.BELOW, threshold=77450.0)
+    triggered.status = AlertStatus.TRIGGERED
+    time_alert = _alert(
+        condition=AlertCondition.TIME,
+        instrument="",
+        threshold=None,
+    )
+    active = _alert(instrument="ETH-PERPETUAL")
+    mgr.alerts[triggered.id] = triggered
+    mgr.alerts[time_alert.id] = time_alert
+    mgr.alerts[active.id] = active
+
+    rest = _StubRestClient({"ETH-PERPETUAL": {"mark_price": 1.0}})
+    refreshed = await mgr.refresh_from_rest(rest)
+
+    assert refreshed == 1
+    assert rest.calls == ["ETH-PERPETUAL"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_rest_survives_per_instrument_errors():
+    """A single REST failure must not abort the rest of the refresh batch."""
+
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    a1 = _alert(instrument="BTC-PERPETUAL", condition=AlertCondition.BELOW, threshold=77450.0)
+    a2 = _alert(instrument="ETH-PERPETUAL", condition=AlertCondition.BELOW, threshold=2000.0)
+    mgr.alerts[a1.id] = a1
+    mgr.alerts[a2.id] = a2
+
+    rest = _StubRestClient(
+        {
+            "BTC-PERPETUAL": RuntimeError("boom"),
+            "ETH-PERPETUAL": {"mark_price": 1500.0},
+        }
+    )
+
+    refreshed = await mgr.refresh_from_rest(rest)
+
+    # Only ETH succeeded; BTC error logged but did not stop the batch.
+    assert refreshed == 1
+    assert sorted(rest.calls) == ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+    assert a2._last_price == 1500.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_from_rest_skips_when_ticker_has_no_price():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    alert = _alert()
+    mgr.alerts[alert.id] = alert
+
+    rest = _StubRestClient({"BTC-PERPETUAL": {}})
+    refreshed = await mgr.refresh_from_rest(rest)
+
+    assert refreshed == 0
+    assert alert._last_price is None
+
+
+# ---------------------------------------------------------------------------
+# detect_stale_alerts — watchdog-input helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_detect_stale_alerts_returns_aged_instruments_sorted_by_age():
+    """Watchdog input: every instrument older than threshold, worst first."""
+
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    fresh = _alert(instrument="BTC-PERPETUAL")
+    fresh._last_price_at = now - timedelta(seconds=10)
+    slightly_stale = _alert(instrument="ETH-PERPETUAL")
+    slightly_stale._last_price_at = now - timedelta(seconds=90)
+    very_stale = _alert(instrument="SOL_USDC-PERPETUAL")
+    very_stale._last_price_at = now - timedelta(seconds=600)
+    for a in (fresh, slightly_stale, very_stale):
+        mgr.alerts[a.id] = a
+
+    stale = mgr.detect_stale_alerts(threshold_seconds=60.0, now=now)
+
+    # BTC fresh → out. Others ordered worst → least bad.
+    assert [instrument for instrument, _ in stale] == [
+        "SOL_USDC-PERPETUAL",
+        "ETH-PERPETUAL",
+    ]
+    assert stale[0][1] == 600.0
+    assert stale[1][1] == 90.0
+
+
+@pytest.mark.asyncio
+async def test_detect_stale_alerts_treats_never_sampled_as_infinitely_stale():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    never_sampled = _alert(instrument="BTC-PERPETUAL")
+    assert never_sampled._last_price_at is None
+    mgr.alerts[never_sampled.id] = never_sampled
+
+    stale = mgr.detect_stale_alerts(threshold_seconds=60.0, now=now)
+
+    assert len(stale) == 1
+    assert stale[0][0] == "BTC-PERPETUAL"
+    assert stale[0][1] == float("inf")
+
+
+@pytest.mark.asyncio
+async def test_detect_stale_alerts_dedupes_per_instrument_to_worst_age():
+    """Two BTC alerts → one entry with the larger age (worst offender wins)."""
+
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    a1 = _alert(instrument="BTC-PERPETUAL")
+    a1._last_price_at = now - timedelta(seconds=120)
+    a2 = _alert(instrument="BTC-PERPETUAL", threshold=80_000.0)
+    a2._last_price_at = now - timedelta(seconds=300)
+    mgr.alerts[a1.id] = a1
+    mgr.alerts[a2.id] = a2
+
+    stale = mgr.detect_stale_alerts(threshold_seconds=60.0, now=now)
+
+    assert stale == [("BTC-PERPETUAL", 300.0)]
+
+
+@pytest.mark.asyncio
+async def test_detect_stale_alerts_ignores_time_and_non_active_alerts():
+    async def cb(*a, **kw):
+        return True
+
+    mgr = AlertManager(cb)
+    now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    triggered_alert = _alert(instrument="BTC-PERPETUAL")
+    triggered_alert.status = AlertStatus.TRIGGERED
+    triggered_alert._last_price_at = now - timedelta(seconds=600)
+
+    time_alert = _alert(condition=AlertCondition.TIME, instrument="", threshold=None)
+    time_alert._last_price_at = None  # ignored regardless of age
+
+    active_fresh = _alert(instrument="ETH-PERPETUAL")
+    active_fresh._last_price_at = now - timedelta(seconds=5)
+
+    for a in (triggered_alert, time_alert, active_fresh):
+        mgr.alerts[a.id] = a
+
+    assert mgr.detect_stale_alerts(threshold_seconds=60.0, now=now) == []

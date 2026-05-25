@@ -35,6 +35,9 @@ class DeribitWebSocketClient:
         self.subscriptions: Dict[str, List[Callable]] = {}
         # channels that have an active server-side subscription
         self._subscribed_channels: Set[str] = set()
+        # channels that we wanted to (re)subscribe but the server did not ack
+        # — drained by `_resubscribe_retry_loop` until empty.
+        self._pending_resubscribe: Set[str] = set()
         self._ticker_callback_wrappers: Dict[tuple[str, Callable], Callable] = {}
         self._running = False
         self._closing = False
@@ -44,6 +47,7 @@ class DeribitWebSocketClient:
         self._handler_task: Optional[asyncio.Task] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._resubscribe_retry_task: Optional[asyncio.Task] = None
         self._reconnect_lock = asyncio.Lock()
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
@@ -118,20 +122,114 @@ class DeribitWebSocketClient:
         """Reconnect, re-auth and re-subscribe active channels.
 
         Serialised via lock so a burst of failures triggers a single reconnect.
+        Channels whose resubscribe call fails are pushed into
+        ``_pending_resubscribe`` and a background retry loop keeps trying until
+        each one is back; the failure is also surfaced via the state callback
+        as a ``degraded`` event so operators are not silently blind.
         """
         async with self._reconnect_lock:
             if self.is_connected:
                 return
             await self.connect()
-            # Resubscribe everything we previously had
-            channels_to_resub = list(self._subscribed_channels)
+            # Resubscribe everything we previously had — including any that
+            # were already pending from an earlier round.
+            channels_to_resub = sorted(self._subscribed_channels | self._pending_resubscribe)
             self._subscribed_channels.clear()
             self.reconnect_generation += 1
+            failures: List[tuple[str, str]] = []
             for channel in channels_to_resub:
                 try:
                     await self._send_subscribe(channel)
+                    self._pending_resubscribe.discard(channel)
                 except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
                     logger.error(f"Failed to resubscribe {channel}: {e}")
+                    self._pending_resubscribe.add(channel)
+                    failures.append((channel, error))
+            if failures:
+                await self._emit_state(
+                    "degraded",
+                    message=(
+                        f"Deribit WebSocket reconnected but "
+                        f"{len(failures)} channel(s) failed to resubscribe; "
+                        "retrying in the background."
+                    ),
+                    severity="warning",
+                    reason="resubscribe_failed",
+                    channels=[c for c, _ in failures],
+                    failures=[{"channel": c, "error": err} for c, err in failures],
+                )
+                self._ensure_resubscribe_retry_task()
+
+    def _ensure_resubscribe_retry_task(self) -> None:
+        """Start the background resubscribe-retry loop if not already running."""
+        if self._closing:
+            return
+        if self._resubscribe_retry_task is None or self._resubscribe_retry_task.done():
+            self._resubscribe_retry_task = asyncio.create_task(
+                self._resubscribe_retry_loop(),
+                name="deribit-ws-resubscribe-retry",
+            )
+
+    async def _resubscribe_retry_loop(self) -> None:
+        """Drain `_pending_resubscribe` by retrying with exponential backoff.
+
+        Runs until every channel that should be subscribed is back, or the
+        client shuts down. Recovers each channel separately so a single
+        permanently-rejected channel cannot block the others. On every batch
+        that recovers at least one channel a ``reconnected`` state event is
+        emitted with ``reason="resubscribe_recovered"`` so the outbox shows the
+        gap has closed.
+        """
+        delay = 1.0
+        max_delay = float(settings.deribit_ws_reconnect_max_delay_seconds)
+        attempt = 0
+        try:
+            while not self._closing and self._pending_resubscribe:
+                attempt += 1
+                await asyncio.sleep(delay)
+                if self._closing or not self._pending_resubscribe:
+                    return
+                if not self.is_connected:
+                    # The auto-reconnect task owns the socket; wait for it
+                    # to come back before trying server-side subscribes.
+                    delay = min(delay * 2, max_delay)
+                    continue
+                recovered: List[str] = []
+                round_failures: List[tuple[str, str]] = []
+                for channel in sorted(self._pending_resubscribe):
+                    try:
+                        await self._send_subscribe(channel)
+                        self._pending_resubscribe.discard(channel)
+                        recovered.append(channel)
+                    except Exception as e:
+                        error = f"{type(e).__name__}: {e}"
+                        logger.error(f"Retry resubscribe for {channel} failed: {e}")
+                        round_failures.append((channel, error))
+                if recovered:
+                    await self._emit_state(
+                        "reconnected",
+                        message=(
+                            f"Deribit WebSocket resubscribe recovered "
+                            f"{len(recovered)} channel(s) after {attempt} attempt(s)."
+                        ),
+                        severity="info",
+                        reason="resubscribe_recovered",
+                        channels=recovered,
+                        attempt=attempt,
+                    )
+                if round_failures and not recovered:
+                    delay = min(delay * 2, max_delay)
+                elif round_failures:
+                    # Reset delay; some channels recovered so the next
+                    # attempt for the remainder shouldn't wait long.
+                    delay = 1.0
+                else:
+                    delay = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.error(f"Resubscribe retry loop crashed: {exc}", exc_info=True)
 
     async def _authenticate(self) -> None:
         """Authenticate with Deribit API and start refresh loop."""
@@ -565,6 +663,8 @@ class DeribitWebSocketClient:
             self._handler_task.cancel()
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
+        if self._resubscribe_retry_task and not self._resubscribe_retry_task.done():
+            self._resubscribe_retry_task.cancel()
         if self.ws:
             try:
                 await self.ws.close()
