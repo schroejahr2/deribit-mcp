@@ -22,6 +22,7 @@ const els = {
   heldSymbols: document.getElementById("heldSymbols"),
   heldAlerts: document.getElementById("heldAlerts"),
   positionsTable: document.getElementById("positionsTable"),
+  ordersTable: document.getElementById("ordersTable"),
   healthList: document.getElementById("healthList"),
   brainList: document.getElementById("brainList"),
   schedulerList: document.getElementById("schedulerList"),
@@ -474,6 +475,62 @@ function renderPositions(data) {
   );
 }
 
+function orderTriggerSummary(order) {
+  const type = order.order_type || "";
+  if (type.startsWith("trailing")) {
+    const offset = order.trigger_offset;
+    return offset != null ? `Δ ${formatNumber(offset)}` : "trailing";
+  }
+  if (type.startsWith("stop_") || type.startsWith("take_")) {
+    const trigger = order.trigger_price;
+    const feed = order.trigger || "";
+    if (trigger == null) return feed || "-";
+    return feed ? `${formatNumber(trigger)} (${feed})` : formatNumber(trigger);
+  }
+  if (type === "limit" || type === "stop_limit" || type === "take_limit") {
+    return formatNumber(order.price);
+  }
+  return "market";
+}
+
+function orderFlagSummary(order) {
+  const flags = [];
+  if (order.post_only) flags.push("PO");
+  if (order.reduce_only) flags.push("RO");
+  if (order.triggered) flags.push("triggered");
+  if (order.time_in_force && order.time_in_force !== "good_til_cancelled") {
+    flags.push(order.time_in_force);
+  }
+  return flags.length ? flags.join(" · ") : "-";
+}
+
+function renderOrders(data) {
+  const orders = [...(data.account?.open_orders || [])].sort((a, b) => {
+    const labelA = a.label || "";
+    const labelB = b.label || "";
+    if (labelA && labelB && labelA !== labelB) return labelA.localeCompare(labelB);
+    if (labelA && !labelB) return -1;
+    if (!labelA && labelB) return 1;
+    return (b.creation_timestamp || 0) - (a.creation_timestamp || 0);
+  });
+  renderTable(
+    els.ordersTable,
+    orders,
+    [
+      {
+        label: "Symbol",
+        value: (o) => mainSub(o.instrument_name, o.label || ""),
+      },
+      { label: "Side", value: (o) => o.direction || "-" },
+      { label: "Type", value: (o) => o.order_type || "-" },
+      { label: "Trigger / Price", value: orderTriggerSummary },
+      { label: "Amount", value: (o) => formatNumber(o.amount) },
+      { label: "Flags", value: orderFlagSummary },
+    ],
+    "No open orders"
+  );
+}
+
 function renderScheduler(data) {
   const scheduler = data.scheduler || {};
   renderKeyList(els.schedulerList, [
@@ -613,6 +670,7 @@ function render(data) {
   renderBrain(data);
   renderSymbols(data);
   renderPositions(data);
+  renderOrders(data);
   renderScheduler(data);
   renderAlerts(data);
   renderDecisions(data);
