@@ -147,11 +147,19 @@ class DeribitWebSocketClient:
                     self._pending_resubscribe.add(channel)
                     failures.append((channel, error))
             if failures:
+                # Channel names + first error fold into the human-readable
+                # message so the outbox row (which only persists `message`,
+                # `severity`, `attempt`, `reason`) still names the blind
+                # feed; the in-memory state event still carries the full
+                # structured channels/failures fields for live consumers.
+                channel_list = ", ".join(c for c, _ in failures)
+                first_error = failures[0][1]
                 await self._emit_state(
                     "degraded",
                     message=(
                         f"Deribit WebSocket reconnected but "
-                        f"{len(failures)} channel(s) failed to resubscribe; "
+                        f"{len(failures)} channel(s) failed to resubscribe "
+                        f"[{channel_list}] (first error: {first_error}); "
                         "retrying in the background."
                     ),
                     severity="warning",
@@ -197,7 +205,16 @@ class DeribitWebSocketClient:
                     continue
                 recovered: List[str] = []
                 round_failures: List[tuple[str, str]] = []
+                abandoned: List[str] = []
                 for channel in sorted(self._pending_resubscribe):
+                    # Skip orphans: all consumers unsubscribed while we were
+                    # pending. Resubscribing here would leave a live
+                    # server-side feed with no callback to consume it and
+                    # waste channel-cap budget.
+                    if not self.subscriptions.get(channel):
+                        self._pending_resubscribe.discard(channel)
+                        abandoned.append(channel)
+                        continue
                     try:
                         await self._send_subscribe(channel)
                         self._pending_resubscribe.discard(channel)
@@ -206,12 +223,21 @@ class DeribitWebSocketClient:
                         error = f"{type(e).__name__}: {e}"
                         logger.error(f"Retry resubscribe for {channel} failed: {e}")
                         round_failures.append((channel, error))
+                if abandoned:
+                    logger.info(
+                        "Dropped %d resubscribe-pending channel(s) with no remaining "
+                        "callbacks: %s",
+                        len(abandoned),
+                        ", ".join(abandoned),
+                    )
                 if recovered:
+                    recovered_list = ", ".join(recovered)
                     await self._emit_state(
                         "reconnected",
                         message=(
                             f"Deribit WebSocket resubscribe recovered "
-                            f"{len(recovered)} channel(s) after {attempt} attempt(s)."
+                            f"{len(recovered)} channel(s) [{recovered_list}] "
+                            f"after {attempt} attempt(s)."
                         ),
                         severity="info",
                         reason="resubscribe_recovered",
@@ -561,6 +587,9 @@ class DeribitWebSocketClient:
             return
 
         self.subscriptions.pop(channel, None)
+        # If the channel was waiting for a resubscribe retry, drop it now —
+        # there is no longer a consumer that wants the feed back.
+        self._pending_resubscribe.discard(channel)
         if not self.is_connected:
             self._subscribed_channels.discard(channel)
             return

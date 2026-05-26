@@ -198,9 +198,18 @@ class AlertManager:
         if alert.status != AlertStatus.ACTIVE:
             return False
 
+        # Stamp the sample timestamp + price *before* any early-return. A
+        # repeating alert in cooldown still sees a live feed; without this
+        # stamp the stale-watchdog would age the alert past its threshold
+        # and emit spurious alert_stale events for the whole cooldown window.
+        now = datetime.now(timezone.utc)
+        alert._last_price_at = now
+        if self.repo:
+            await self.repo.update_last_price(alert.id, current_price, now)
+
         # Check cooldown for repeating alerts
         if alert.repeat and alert.last_trigger_time:
-            time_since_last = (datetime.now(timezone.utc) - alert.last_trigger_time).total_seconds()
+            time_since_last = (now - alert.last_trigger_time).total_seconds()
             if time_since_last < alert.cooldown_seconds:
                 return False
 
@@ -225,13 +234,10 @@ class AlertManager:
                 pct_change = ((current_price - alert._last_price) / alert._last_price) * 100
                 triggered = abs(pct_change) >= alert.threshold
 
-        # Update last price for next check + stamp the moment we saw it so a
-        # later watchdog can detect when the ticker stream has gone silent.
-        now = datetime.now(timezone.utc)
+        # In-memory _last_price kept current here so CROSSES_* see the
+        # previous sample on their next call. Repo last_price has already
+        # been written above for restart-recovery.
         alert._last_price = current_price
-        alert._last_price_at = now
-        if self.repo:
-            await self.repo.update_last_price(alert.id, current_price, now)
 
         return triggered
 

@@ -316,6 +316,8 @@ async def test_resubscribe_retry_loop_recovers_pending_channels(monkeypatch):
     # Fails twice then succeeds — covers the per-channel backoff path.
     client = FlakyResubscribeWS(fail_first={"ticker.BTC-PERPETUAL.raw": 2})
     client._pending_resubscribe = {"ticker.BTC-PERPETUAL.raw"}
+    # Live callback present → not an orphan; retry must subscribe.
+    client.subscriptions["ticker.BTC-PERPETUAL.raw"] = [lambda c, d: None]
 
     await client._resubscribe_retry_loop()
 
@@ -353,3 +355,101 @@ async def test_resubscribe_retry_loop_exits_when_closing(monkeypatch):
     # Loop bailed before doing any work.
     assert client.subscribe_attempts == []
     assert client._pending_resubscribe == {"ticker.X.raw"}
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_retry_loop_drops_orphan_channels(monkeypatch):
+    """Channels whose callbacks were all unsubscribed while pending must be
+    dropped without re-sending public/subscribe — otherwise we leave a
+    live server-side feed with no consumer and waste channel capacity."""
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.deribit_ws.asyncio.sleep", fake_sleep)
+
+    client = FlakyResubscribeWS()  # would succeed if called
+    client._pending_resubscribe = {"ticker.GONE.raw"}
+    # No entry in self.subscriptions → orphan.
+
+    await client._resubscribe_retry_loop()
+
+    assert client.subscribe_attempts == []
+    assert client._pending_resubscribe == set()
+    assert "ticker.GONE.raw" not in client._subscribed_channels
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_drops_channel_from_pending_resubscribe(monkeypatch):
+    """Unsubscribing the last callback while a resubscribe is still
+    queued must remove the channel from `_pending_resubscribe` so the
+    retry loop never re-creates the orphan."""
+    client = FlakyResubscribeWS()
+    client._pending_resubscribe = {"ticker.GONE.raw"}
+
+    async def cb(channel, data):
+        return None
+
+    client.subscriptions["ticker.GONE.raw"] = [cb]
+
+    await client.unsubscribe("ticker.GONE.raw", cb)
+
+    assert client._pending_resubscribe == set()
+    assert "ticker.GONE.raw" not in client.subscriptions
+
+
+@pytest.mark.asyncio
+async def test_reconnect_degraded_message_names_failed_channels(monkeypatch):
+    """The degraded outbox event only persists `message` (plus severity/
+    attempt/reason). The channel list must be folded into the message
+    so operators can see which feed is blind without the structured
+    payload fields."""
+    monkeypatch.setattr(
+        DeribitWebSocketClient,
+        "_ensure_resubscribe_retry_task",
+        lambda self: None,
+    )
+    client = FlakyResubscribeWS(
+        fail_first={"ticker.BTC-PERPETUAL.raw": 99, "ticker.ETH-PERPETUAL.raw": 99}
+    )
+    client._subscribed_channels = {
+        "ticker.BTC-PERPETUAL.raw",
+        "ticker.ETH-PERPETUAL.raw",
+    }
+    client._connected_for_test = False
+
+    async def connect_then_mark():
+        client._running = True
+        client._closing = False
+        client._connected_for_test = True
+
+    client.connect = connect_then_mark  # type: ignore[assignment]
+
+    await client._reconnect()
+
+    degraded = [(s, p) for s, p in client.state_events if s == "degraded"]
+    assert len(degraded) == 1
+    message = degraded[0][1]["message"]
+    assert "ticker.BTC-PERPETUAL.raw" in message
+    assert "ticker.ETH-PERPETUAL.raw" in message
+    assert "first error:" in message
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_recovered_message_names_channels(monkeypatch):
+    monkeypatch.setattr("src.deribit_ws.settings.deribit_ws_reconnect_max_delay_seconds", 8.0)
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.deribit_ws.asyncio.sleep", fake_sleep)
+
+    client = FlakyResubscribeWS()  # no failures: instant success
+    client._pending_resubscribe = {"ticker.BTC-PERPETUAL.raw"}
+    client.subscriptions["ticker.BTC-PERPETUAL.raw"] = [lambda c, d: None]
+
+    await client._resubscribe_retry_loop()
+
+    recovered = [(s, p) for s, p in client.state_events if s == "reconnected"]
+    assert len(recovered) == 1
+    assert "ticker.BTC-PERPETUAL.raw" in recovered[0][1]["message"]

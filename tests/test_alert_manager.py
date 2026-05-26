@@ -7,6 +7,7 @@ the cooldown gate for repeat alerts.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -167,6 +168,44 @@ async def test_repeat_alert_obeys_cooldown():
     alert.last_trigger_time = datetime.now(timezone.utc) - timedelta(seconds=400)
     await mgr.process_price_update("BTC-PERPETUAL", 115.0)
     assert len(fired) == 2
+
+
+@pytest.mark.asyncio
+async def test_repeat_alert_stamps_last_price_at_during_cooldown():
+    """Regression: a healthy tick during cooldown must still stamp
+    _last_price_at, otherwise the stale-watchdog ages the alert past
+    its threshold and emits spurious alert_stale events for the whole
+    cooldown window (and force_resubscribes on every tick)."""
+    fired: list = []
+
+    async def cb(channel, message, alert, **kwargs):
+        fired.append(alert.id)
+        return True
+
+    mgr = AlertManager(cb)
+    alert = _alert(
+        condition=AlertCondition.ABOVE,
+        threshold=100.0,
+        repeat=True,
+        cooldown_seconds=300,
+    )
+    mgr.alerts[alert.id] = alert
+
+    # First trigger establishes last_trigger_time + cooldown.
+    await mgr.process_price_update("BTC-PERPETUAL", 110.0)
+    assert len(fired) == 1
+    initial_stamp = alert._last_price_at
+    assert initial_stamp is not None
+
+    # Tick during cooldown: must update _last_price_at even though the
+    # trigger is suppressed. Without the fix, the stamp stayed frozen.
+    await asyncio.sleep(0)  # let the event loop tick the wall clock
+    await mgr.process_price_update("BTC-PERPETUAL", 120.0)
+    assert len(fired) == 1, "cooldown still blocks re-trigger"
+    assert alert._last_price_at is not None
+    assert (
+        alert._last_price_at >= initial_stamp
+    ), "sample timestamp must advance on every observed tick, not only on triggers"
 
 
 @pytest.mark.asyncio
