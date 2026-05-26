@@ -8,6 +8,12 @@ from src import trading
 from src.news import compact_news_row, format_news_message, push_news
 from src.server import (
     _cancel_orders_by_label_impl,
+    _compact_account_summaries,
+    _compact_account_summary,
+    _compact_chart_bars,
+    _compact_decision,
+    _compact_note,
+    _compact_user_trade,
     _create_combo_impl,
     _edit_order_by_label_impl,
     _execute_audited,
@@ -15,6 +21,7 @@ from src.server import (
     _place_bracket_impl,
     _place_order_impl,
     _prepare_mutating_tool,
+    _truncate_text,
 )
 
 
@@ -193,6 +200,361 @@ def test_compact_news_row_omits_full_payload_by_default():
     assert "content" not in compact
     assert full["content"] == {"raw": "not compact"}
     assert full["context"] == {"previous_id": "old"}
+
+
+def _zero_summary(currency: str, **overrides) -> dict:
+    base = {
+        "currency": currency,
+        "balance": 0.0,
+        "equity": 0.0,
+        "available_funds": 0.0,
+        "margin_balance": 0.0,
+        "margin_model": "segregated_sm",
+        "cross_collateral_enabled": False,
+        "portfolio_margining_enabled": False,
+        "additional_reserve": 0.0,
+        "spot_reserve": 0.0,
+        "locked_balance": 0.0,
+        "fee_balance": 0.0,
+        "initial_margin": 0.0,
+        "maintenance_margin": 0.0,
+        "futures_pl": 0.0,
+        "futures_session_rpl": 0.0,
+        "futures_session_upl": 0.0,
+        "options_delta": 0.0,
+        "options_pl": 0.0,
+        "options_value": 0.0,
+        "total_pl": 0.0,
+        "session_rpl": 0.0,
+        "session_upl": 0.0,
+        "projected_initial_margin": 0.0,
+        "projected_maintenance_margin": 0.0,
+        "projected_delta_total": 0.0,
+        "delta_total": 0.0,
+        "delta_total_map": {},
+        "options_gamma_map": {},
+        "options_theta_map": {},
+        "options_vega_map": {},
+        "estimated_liquidation_ratio_map": {},
+        "limits": {"matching_engine": {"trading": {"total": {"burst": 20, "rate": 5}}}},
+        "deposit_address": "0xfeedbeef",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_compact_account_summary_strips_zero_fields_and_limits():
+    summary = _zero_summary(
+        "USDC",
+        balance=905.1,
+        equity=900.48,
+        available_funds=900.48,
+        margin_balance=900.48,
+        futures_session_rpl=-4.62,
+        session_rpl=-4.62,
+        delta_total_map={"btc_usdc": 0.0},
+    )
+
+    compact = _compact_account_summary(summary)
+
+    assert "limits" not in compact
+    assert "deposit_address" not in compact
+    assert "delta_total_map" in compact
+    assert "options_gamma_map" not in compact
+    assert "options_theta_map" not in compact
+    assert compact["currency"] == "USDC"
+    assert compact["balance"] == 905.1
+    assert compact["futures_session_rpl"] == -4.62
+    assert "additional_reserve" not in compact
+    assert "spot_reserve" not in compact
+    assert "options_delta" not in compact
+    assert "futures_session_upl" not in compact
+
+
+def test_compact_account_summary_keeps_nonzero_zero_drop_fields():
+    summary = _zero_summary("BTC", initial_margin=0.5, options_vega=12.3)
+    compact = _compact_account_summary(summary)
+
+    assert compact["initial_margin"] == 0.5
+    assert compact["options_vega"] == 12.3
+
+
+def test_compact_account_summaries_drops_zero_balance_currencies():
+    summaries = [
+        _zero_summary("ADA"),
+        _zero_summary("BTC", deposit_address="bc1qfoo"),
+        _zero_summary("USDC", balance=905.1, equity=900.48),
+        _zero_summary("ETH", balance=0.0, equity=0.0),
+    ]
+
+    compact = _compact_account_summaries(summaries)
+
+    assert [row["currency"] for row in compact] == ["USDC"]
+    assert "deposit_address" not in compact[0]
+
+
+def test_compact_account_summaries_keeps_empties_when_include_empty():
+    summaries = [_zero_summary("ADA"), _zero_summary("USDC", balance=905.1, equity=900.48)]
+
+    compact = _compact_account_summaries(summaries, include_empty=True)
+
+    assert [row["currency"] for row in compact] == ["ADA", "USDC"]
+    # limits still stripped even when including empties
+    for row in compact:
+        assert "limits" not in row
+        assert "deposit_address" not in row
+
+
+def test_compact_account_summary_passthrough_for_non_dict():
+    assert _compact_account_summary(None) is None
+    assert _compact_account_summary("oops") == "oops"
+    assert _compact_account_summaries(None) is None
+
+
+def test_truncate_text_short_and_long():
+    assert _truncate_text("short", 200) == "short"
+    long = "x" * 250
+    truncated = _truncate_text(long, 200)
+    assert truncated.endswith("…")
+    assert len(truncated) == 201
+    assert _truncate_text(None, 200) is None
+    assert _truncate_text("anything", 0) == "anything"
+
+
+def _decision_row(**overrides) -> dict:
+    base = {
+        "id": "decision-1",
+        "created_at": "2026-05-26T10:00:00+00:00",
+        "alert_id": None,
+        "instrument": "BTC_USDC-PERPETUAL",
+        "reasoning": "x" * 500,
+        "action_taken": "buy",
+        "related_order_id": None,
+        "metadata": None,
+        "schema_version": 1,
+        "outcome": None,
+        "outcome_note": None,
+        "outcome_recorded_at": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_compact_decision_truncates_reasoning_and_drops_null_metadata():
+    row = _decision_row(reasoning="a" * 300, outcome_note="b" * 300)
+    compact = _compact_decision(row, reasoning_chars=100)
+
+    assert compact["reasoning"].endswith("…")
+    assert len(compact["reasoning"]) == 101
+    assert compact["outcome_note"].endswith("…")
+    assert len(compact["outcome_note"]) == 101
+    assert "metadata" not in compact
+    assert "schema_version" not in compact
+    assert compact["id"] == "decision-1"
+    assert compact["action_taken"] == "buy"
+
+
+def test_compact_decision_keeps_short_strings_and_nonnull_metadata():
+    row = _decision_row(
+        reasoning="short reason",
+        outcome_note="closed in profit",
+        metadata={"source": "test"},
+    )
+    compact = _compact_decision(row, reasoning_chars=200)
+
+    assert compact["reasoning"] == "short reason"
+    assert compact["outcome_note"] == "closed in profit"
+    assert compact["metadata"] == {"source": "test"}
+
+
+def test_compact_decision_passthrough_for_non_dict():
+    assert _compact_decision(None) is None
+    assert _compact_decision("oops") == "oops"
+
+
+def test_compact_chart_bars_transposes_to_columnar_and_drops_cost():
+    bars = [
+        {
+            "ts": 1,
+            "open": 100.0,
+            "high": 110.0,
+            "low": 95.0,
+            "close": 105.0,
+            "volume": 1.5,
+            "cost": 157.5,
+        },
+        {
+            "ts": 2,
+            "open": 105.0,
+            "high": 115.0,
+            "low": 100.0,
+            "close": 112.0,
+            "volume": 2.0,
+            "cost": 224.0,
+        },
+    ]
+
+    cols = _compact_chart_bars(bars)
+
+    assert set(cols.keys()) == {"ts", "open", "high", "low", "close", "volume"}
+    assert cols["ts"] == [1, 2]
+    assert cols["close"] == [105.0, 112.0]
+    assert cols["volume"] == [1.5, 2.0]
+    assert "cost" not in cols
+
+
+def test_compact_chart_bars_keeps_cost_when_requested():
+    bars = [{"ts": 1, "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1, "cost": 100}]
+    cols = _compact_chart_bars(bars, drop_cost=False)
+
+    assert cols["cost"] == [100]
+
+
+def test_compact_chart_bars_empty_and_passthrough():
+    assert _compact_chart_bars([]) == {
+        "ts": [],
+        "open": [],
+        "high": [],
+        "low": [],
+        "close": [],
+        "volume": [],
+    }
+    assert _compact_chart_bars(None) is None
+    assert _compact_chart_bars("oops") == "oops"
+
+
+def test_compact_chart_bars_skips_non_dict_entries():
+    bars = [
+        {"ts": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1, "cost": 1},
+        None,
+        "skip",
+    ]
+    cols = _compact_chart_bars(bars)
+
+    assert cols["ts"] == [1]
+    assert cols["close"] == [1]
+
+
+def _user_trade(**overrides) -> dict:
+    base = {
+        "trade_id": "ETH-12345",
+        "order_id": "ETH-67890",
+        "instrument_name": "BTC_USDC-PERPETUAL",
+        "direction": "buy",
+        "price": 76900.5,
+        "amount": 0.01,
+        "timestamp": 1779800000000,
+        "fee": 0.00023,
+        "fee_currency": "USDC",
+        "liquidity": "T",
+        "order_type": "market",
+        "tick_direction": 1,
+        "state": "filled",
+        "mark_price": 76911.67,
+        "index_price": 76888.27,
+        "matching_id": None,
+        "contracts": 0.01,
+        "api": True,
+        "advanced": "usd",
+        "mmp": False,
+        "self_trade": False,
+        "post_only": False,
+        "reduce_only": False,
+        "risk_reducing": False,
+        "label": "",
+        "profit_loss": 0.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_compact_user_trade_keeps_essentials_and_drops_noise():
+    compact = _compact_user_trade(_user_trade())
+
+    assert set(compact.keys()) == {
+        "trade_id",
+        "order_id",
+        "instrument_name",
+        "direction",
+        "price",
+        "amount",
+        "timestamp",
+        "fee",
+        "fee_currency",
+        "liquidity",
+        "order_type",
+    }
+
+
+def test_compact_user_trade_keeps_truthy_optional_fields():
+    trade = _user_trade(label="scalp-1", profit_loss=12.3, reduce_only=True)
+    compact = _compact_user_trade(trade)
+
+    assert compact["label"] == "scalp-1"
+    assert compact["profit_loss"] == 12.3
+    assert compact["reduce_only"] is True
+    assert "self_trade" not in compact
+    assert "post_only" not in compact
+
+
+def test_compact_user_trade_passthrough_for_non_dict():
+    assert _compact_user_trade(None) is None
+    assert _compact_user_trade("oops") == "oops"
+
+
+def _note_row(**overrides) -> dict:
+    base = {
+        "id": "note-1",
+        "created_at": "2026-05-26T10:00:00+00:00",
+        "updated_at": None,
+        "category": None,
+        "instrument": None,
+        "alert_id": None,
+        "decision_id": None,
+        "body": "x" * 400,
+        "tags": [],
+        "schema_version": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_compact_note_truncates_body_and_drops_null_fields():
+    compact = _compact_note(_note_row(), body_chars=100)
+
+    assert compact["body"].endswith("…")
+    assert len(compact["body"]) == 101
+    assert "schema_version" not in compact
+    assert "updated_at" not in compact
+    assert "category" not in compact
+    assert "instrument" not in compact
+    assert "alert_id" not in compact
+    assert "decision_id" not in compact
+    assert compact["id"] == "note-1"
+    assert compact["tags"] == []
+
+
+def test_compact_note_keeps_set_optional_fields():
+    row = _note_row(
+        body="short note",
+        category="observation",
+        instrument="BTC_USDC-PERPETUAL",
+        decision_id="d-1",
+        tags=["scalp", "btc"],
+    )
+    compact = _compact_note(row)
+
+    assert compact["body"] == "short note"
+    assert compact["category"] == "observation"
+    assert compact["instrument"] == "BTC_USDC-PERPETUAL"
+    assert compact["decision_id"] == "d-1"
+    assert compact["tags"] == ["scalp", "btc"]
+    assert "alert_id" not in compact
+
+
+def test_compact_note_passthrough_for_non_dict():
+    assert _compact_note(None) is None
+    assert _compact_note("oops") == "oops"
 
 
 def test_format_news_message_includes_meta_summary_tags_and_url():

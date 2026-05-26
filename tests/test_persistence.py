@@ -40,6 +40,31 @@ async def test_decision_repo_roundtrip_and_outcome_validation():
 
 
 @pytest.mark.asyncio
+async def test_decision_repo_get_returns_single_row_or_none():
+    db = Database(":memory:")
+    await db.connect()
+    repo = DecisionRepo(db)
+
+    await repo.create(
+        decision_id="decision-get-1",
+        instrument="BTC-PERPETUAL",
+        reasoning="long reasoning body",
+        action_taken="buy",
+        metadata={"source": "test"},
+    )
+
+    row = await repo.get("decision-get-1")
+    assert row is not None
+    assert row["id"] == "decision-get-1"
+    assert row["reasoning"] == "long reasoning body"
+    assert row["metadata"] == {"source": "test"}
+    assert "metadata_json" not in row
+
+    assert await repo.get("nope") is None
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_decision_repo_accepts_pnl_outcomes():
     """win/loss/breakeven are first-class PnL outcomes alongside execution states."""
     db = Database(":memory:")

@@ -629,14 +629,29 @@ class DecisionRepo:
         rows = await cursor.fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            item = dict(row)
-            if item.get("metadata_json"):
-                item["metadata"] = json.loads(item.pop("metadata_json"))
-            else:
-                item.pop("metadata_json", None)
-                item["metadata"] = None
-            result.append(item)
+            result.append(self._row_to_dict(row))
         return result
+
+    async def get(self, decision_id: str) -> Optional[dict[str, Any]]:
+        conn = self.db.require_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM decisions WHERE id = ?",
+            (decision_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_dict(row)
+
+    @staticmethod
+    def _row_to_dict(row: Any) -> dict[str, Any]:
+        item = dict(row)
+        if item.get("metadata_json"):
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+        else:
+            item.pop("metadata_json", None)
+            item["metadata"] = None
+        return item
 
 
 class OrderAuditRepo:

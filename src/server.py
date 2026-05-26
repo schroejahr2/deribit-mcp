@@ -271,6 +271,212 @@ def _compact_deribit_order_result(response: Any) -> dict[str, Any]:
     }
 
 
+_ACCOUNT_SUMMARY_DROP_KEYS = frozenset({"limits", "deposit_address"})
+_ACCOUNT_SUMMARY_DROP_IF_ZERO = frozenset(
+    {
+        "additional_reserve",
+        "spot_reserve",
+        "locked_balance",
+        "fee_balance",
+        "options_delta",
+        "options_gamma",
+        "options_pl",
+        "options_session_rpl",
+        "options_session_upl",
+        "options_theta",
+        "options_value",
+        "options_vega",
+        "futures_pl",
+        "futures_session_rpl",
+        "futures_session_upl",
+        "session_rpl",
+        "session_upl",
+        "delta_total",
+        "estimated_liquidation_ratio",
+        "initial_margin",
+        "maintenance_margin",
+        "open_orders_margin",
+        "projected_delta_total",
+        "projected_initial_margin",
+        "projected_maintenance_margin",
+        "total_pl",
+    }
+)
+
+
+def _compact_account_summary(summary: Any) -> Any:
+    """Trim noise from a Deribit account summary row.
+
+    Drops `limits` and `deposit_address` (each has its own dedicated tool),
+    empty `*_map` dicts, and zero-valued accounting fields. Keeps `currency`,
+    `margin_model`, balance/equity/available_funds even when zero so the
+    caller can still tell currency presence from absence.
+    """
+    if not isinstance(summary, dict):
+        return summary
+    out: dict[str, Any] = {}
+    for key, value in summary.items():
+        if key in _ACCOUNT_SUMMARY_DROP_KEYS:
+            continue
+        if key.endswith("_map") and isinstance(value, dict) and not value:
+            continue
+        if key in _ACCOUNT_SUMMARY_DROP_IF_ZERO and isinstance(value, (int, float)) and value == 0:
+            continue
+        out[key] = value
+    return out
+
+
+def _compact_account_summaries(summaries: Any, include_empty: bool = False) -> list[dict[str, Any]]:
+    if not isinstance(summaries, list):
+        return summaries
+    out: list[dict[str, Any]] = []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        if not include_empty:
+            equity = summary.get("equity") or 0
+            balance = summary.get("balance") or 0
+            if equity == 0 and balance == 0:
+                continue
+        out.append(_compact_account_summary(summary))
+    return out
+
+
+_USER_TRADE_KEEP = frozenset(
+    {
+        "trade_id",
+        "order_id",
+        "instrument_name",
+        "direction",
+        "price",
+        "amount",
+        "timestamp",
+        "fee",
+        "fee_currency",
+        "liquidity",
+        "order_type",
+    }
+)
+_USER_TRADE_KEEP_IF_TRUTHY = frozenset(
+    {
+        "label",
+        "reduce_only",
+        "post_only",
+        "self_trade",
+        "risk_reducing",
+        "profit_loss",
+        "block_trade_id",
+        "combo_trade_id",
+        "combo_id",
+    }
+)
+
+
+def _compact_user_trade(trade: Any) -> Any:
+    """Trim Deribit user-trade row for list views.
+
+    Keeps execution essentials (ids, instrument, direction, price, amount,
+    fee, timestamp, liquidity, order_type). Drops noisy fields such as
+    `tick_direction`, `state`, `mark_price`, `index_price`, `matching_id`,
+    `contracts`, `api`, `advanced`, `mmp`. Optional fields like `label`,
+    `profit_loss`, `reduce_only` survive only when truthy / non-zero so
+    zero-PnL maker fills stay compact.
+    """
+    if not isinstance(trade, dict):
+        return trade
+    out: dict[str, Any] = {}
+    for key in _USER_TRADE_KEEP:
+        if key in trade:
+            out[key] = trade[key]
+    for key in _USER_TRADE_KEEP_IF_TRUTHY:
+        value = trade.get(key)
+        if value:
+            out[key] = value
+    return out
+
+
+_CHART_BAR_KEYS = ("ts", "open", "high", "low", "close", "volume", "cost")
+
+
+def _compact_chart_bars(bars: Any, drop_cost: bool = True) -> Any:
+    """Transpose list-of-bar-dicts into parallel columnar arrays.
+
+    Keys appear once instead of per-bar. Set ``drop_cost=False`` to keep the
+    ``cost`` column (= price * size); it is redundant for most consumers
+    and inflates the response.
+    """
+    if not isinstance(bars, list):
+        return bars
+    keys = tuple(k for k in _CHART_BAR_KEYS if not (drop_cost and k == "cost"))
+    out: dict[str, list[Any]] = {k: [] for k in keys}
+    for bar in bars:
+        if not isinstance(bar, dict):
+            continue
+        for k in keys:
+            out[k].append(bar.get(k))
+    return out
+
+
+_NOTE_DROP_KEYS = frozenset({"schema_version"})
+_NOTE_DROP_IF_NULL = frozenset({"updated_at", "category", "instrument", "alert_id", "decision_id"})
+
+
+def _compact_note(row: Any, body_chars: int = 150) -> Any:
+    """Trim a note row for list views.
+
+    Truncates ``body`` to ``body_chars`` (default 150). Drops
+    ``schema_version`` and null-valued ``updated_at`` / ``category`` /
+    ``instrument`` / ``alert_id`` / ``decision_id``. Empty ``tags`` lists
+    survive (consumers expect the field to exist). Full body stays
+    available through ``get_note``.
+    """
+    if not isinstance(row, dict):
+        return row
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in _NOTE_DROP_KEYS:
+            continue
+        if key in _NOTE_DROP_IF_NULL and value is None:
+            continue
+        if key == "body":
+            value = _truncate_text(value, body_chars)
+        out[key] = value
+    return out
+
+
+_DECISION_DROP_KEYS = frozenset({"schema_version"})
+_DECISION_TRUNCATE_FIELDS = ("reasoning", "outcome_note")
+
+
+def _truncate_text(value: Any, max_chars: int) -> Any:
+    if not isinstance(value, str) or max_chars <= 0:
+        return value
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "…"
+
+
+def _compact_decision(row: Any, reasoning_chars: int = 200) -> Any:
+    """Trim decision row for list views.
+
+    Drops `schema_version` and null `metadata`, truncates `reasoning` and
+    `outcome_note` to ``reasoning_chars`` (default 200). Full content stays
+    available through ``get_decision``.
+    """
+    if not isinstance(row, dict):
+        return row
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in _DECISION_DROP_KEYS:
+            continue
+        if key == "metadata" and value is None:
+            continue
+        if key in _DECISION_TRUNCATE_FIELDS:
+            value = _truncate_text(value, reasoning_chars)
+        out[key] = value
+    return out
+
+
 def _currency_from_instrument(instrument: str) -> str:
     """Derive Deribit settlement currency from instrument name.
 
@@ -1532,13 +1738,34 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         instrument: Optional[str] = None,
         alert_id: Optional[str] = None,
         since: Optional[str] = None,
-        limit: int = 50,
+        limit: int = 10,
+        reasoning_chars: int = 200,
+        verbose: bool = False,
         ctx: Any = None,
     ) -> str:
-        """List recorded decisions with optional filters."""
+        """List recorded decisions with optional filters.
+
+        Default response truncates ``reasoning`` and ``outcome_note`` to
+        ``reasoning_chars`` chars and drops null ``metadata`` /
+        ``schema_version`` to keep context small. Use ``get_decision`` for
+        full content of a specific row, or pass ``verbose=True`` for raw
+        rows. ``limit`` defaults to 10; raise it when you actually need
+        more history.
+        """
         app_ctx = _ctx(ctx)
         decisions = await app_ctx.decision_repo.list(instrument, alert_id, since, limit)
+        if not verbose:
+            decisions = [_compact_decision(row, reasoning_chars) for row in decisions]
         return _json({"decisions": decisions, "count": len(decisions)})
+
+    @server.tool()
+    async def get_decision(decision_id: str, ctx: Any = None) -> str:
+        """Get a single decision row by id with full ``reasoning`` and ``outcome_note``."""
+        app_ctx = _ctx(ctx)
+        row = await app_ctx.decision_repo.get(decision_id)
+        if row is None:
+            raise ValueError(f"Unknown decision_id: {decision_id}")
+        return _json({"decision": row})
 
     @server.tool()
     async def add_note(
@@ -1578,10 +1805,19 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         tag: Optional[str] = None,
         since: Optional[str] = None,
-        limit: int = 50,
+        limit: int = 10,
+        body_chars: int = 150,
+        verbose: bool = False,
         ctx: Any = None,
     ) -> str:
-        """List persisted notes with optional filters."""
+        """List persisted notes with optional filters.
+
+        Default response truncates ``body`` to ``body_chars`` chars and
+        drops ``schema_version`` plus null-valued ``updated_at`` /
+        ``category`` / ``instrument`` / ``alert_id`` / ``decision_id``.
+        Use ``get_note`` for the full body of one row, or pass
+        ``verbose=True`` for raw rows. ``limit`` defaults to 10.
+        """
         app_ctx = _ctx(ctx)
         notes = await app_ctx.note_repo.list(
             instrument=instrument,
@@ -1592,7 +1828,18 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             since=since,
             limit=limit,
         )
+        if not verbose:
+            notes = [_compact_note(row, body_chars) for row in notes]
         return _json({"notes": notes, "count": len(notes)})
+
+    @server.tool()
+    async def get_note(note_id: str, ctx: Any = None) -> str:
+        """Get a single note by id with full untruncated ``body``."""
+        app_ctx = _ctx(ctx)
+        row = await app_ctx.note_repo.get(note_id)
+        if row is None:
+            raise ValueError(f"Unknown note_id: {note_id}")
+        return _json({"note": row})
 
     @server.tool()
     async def update_note(
@@ -1945,16 +2192,39 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         )
 
     @server.tool()
-    async def get_account_summary(currency: str = "BTC", ctx: Any = None) -> str:
-        """Get account summary and balance information."""
+    async def get_account_summary(
+        currency: str = "BTC", verbose: bool = False, ctx: Any = None
+    ) -> str:
+        """Get account summary and balance information.
+
+        Default response strips `limits`, `deposit_address`, empty
+        `*_map` dicts, and zero-valued accounting fields to keep context
+        small. Pass `verbose=True` for the raw Deribit payload (use
+        `get_rate_limit_status` for the limits block).
+        """
         app_ctx = _ctx(ctx)
-        return _json(await app_ctx.rest_client.get_account_summary(currency))
+        summary = await app_ctx.rest_client.get_account_summary(currency)
+        if verbose:
+            return _json(summary)
+        return _json(_compact_account_summary(summary))
 
     @server.tool()
-    async def get_account_summaries(extended: bool = True, ctx: Any = None) -> str:
-        """Get per-currency account summaries in one call."""
+    async def get_account_summaries(
+        include_empty: bool = False, verbose: bool = False, ctx: Any = None
+    ) -> str:
+        """Get per-currency account summaries in one call.
+
+        Default response drops currencies with `equity==0 && balance==0`,
+        strips `limits`, `deposit_address`, empty `*_map` dicts, and
+        zero-valued accounting fields. Pass `include_empty=True` to keep
+        zero-balance currencies, or `verbose=True` for the raw payload
+        (use `get_rate_limit_status` for the limits block).
+        """
         app_ctx = _ctx(ctx)
-        return _json(await app_ctx.rest_client.get_account_summaries(extended))
+        summaries = await app_ctx.rest_client.get_account_summaries(extended=True)
+        if verbose:
+            return _json(summaries)
+        return _json(_compact_account_summaries(summaries, include_empty=include_empty))
 
     @server.tool()
     async def get_rate_limit_status(
@@ -2580,12 +2850,22 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         end_seq: Optional[int] = None,
         start_timestamp: Optional[int] = None,
         end_timestamp: Optional[int] = None,
-        count: Optional[int] = 20,
+        count: Optional[int] = 10,
         sorting: Optional[str] = None,
         historical: Optional[bool] = None,
+        verbose: bool = False,
         ctx: Any = None,
     ) -> str:
-        """Get executed user trades."""
+        """Get executed user trades.
+
+        Default response keeps execution essentials only (ids, instrument,
+        direction, price, amount, fee, timestamp, liquidity, order_type)
+        and drops noisy fields like ``tick_direction``, ``state``,
+        ``mark_price``, ``index_price``, ``matching_id``, ``contracts``,
+        ``api``. Optional fields (``label``, ``profit_loss``,
+        ``reduce_only`` …) appear only when truthy. ``count`` defaults to
+        10. Pass ``verbose=True`` for the raw Deribit payload.
+        """
         app_ctx = _ctx(ctx)
         filters = {
             "kind": kind,
@@ -2599,7 +2879,12 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             "sorting": sorting,
             "historical": historical,
         }
-        return _json(await app_ctx.rest_client.get_user_trades(currency, instrument, **filters))
+        trades = await app_ctx.rest_client.get_user_trades(currency, instrument, **filters)
+        if verbose:
+            return _json(trades)
+        if isinstance(trades, list):
+            trades = [_compact_user_trade(t) for t in trades]
+        return _json(trades)
 
     @server.tool()
     async def get_order_history(
@@ -2733,27 +3018,37 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         end_timestamp: int,
         resolution: str = "60",
         tail: int = 500,
+        drop_cost: bool = True,
+        verbose: bool = False,
         ctx: Any = None,
     ) -> str:
-        """Get OHLCV bars (candlesticks) as a list of bar objects.
+        """Get OHLCV bars (candlesticks).
 
-        `resolution`: minutes (1, 3, 5, 10, 15, 30, 60, 120, 180, 360, 720)
-        or "1D". Defaults to "60" (hourly). `start_timestamp`/`end_timestamp`
-        are milliseconds-since-epoch (Deribit convention); seconds inputs are
-        rejected with a hint. `tail` trims the output to the last N bars
-        as a token-burst safety net (default 500); `tail=0` disables but
-        only when estimated bars stay <= 1000.
+        Default response is columnar (``{ts:[...], open:[...], high:[...],
+        low:[...], close:[...], volume:[...]}``) — keys appear once
+        instead of per-bar, ~70% smaller than a list of bar objects.
+        ``drop_cost=True`` (default) omits the ``cost`` column (= price *
+        size, redundant for most consumers). Pass ``verbose=True`` for
+        the legacy list-of-dicts shape.
+
+        ``resolution``: minutes (1, 3, 5, 10, 15, 30, 60, 120, 180, 360,
+        720) or "1D". Defaults to "60" (hourly). ``start_timestamp`` /
+        ``end_timestamp`` are milliseconds-since-epoch; seconds inputs
+        are rejected with a hint. ``tail`` trims to the last N bars
+        (default 500); ``tail=0`` disables but only when estimated bars
+        stay <= 1000.
         """
         app_ctx = _ctx(ctx)
-        return _json(
-            await app_ctx.rest_client.get_chart_data(
-                instrument=instrument,
-                start_timestamp=start_timestamp,
-                end_timestamp=end_timestamp,
-                resolution=resolution,
-                tail=tail,
-            )
+        bars = await app_ctx.rest_client.get_chart_data(
+            instrument=instrument,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            resolution=resolution,
+            tail=tail,
         )
+        if verbose:
+            return _json(bars)
+        return _json(_compact_chart_bars(bars, drop_cost=drop_cost))
 
     @server.tool()
     async def get_book_summary(
