@@ -76,3 +76,4 @@ TIER-*.md
 # Local docker compose overrides (dev bind-mounts etc.)
 docker-compose.override.yml
 docker-compose.override.yaml
+log.txt
