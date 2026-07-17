@@ -1556,6 +1556,50 @@ each confirmation in sequence and pause for their reply.
 
 ---
 
+## Phase 23 — Coherent state, semantic events, and managed protection
+
+Run this phase on testnet. Reuse a test decision and test position from the
+earlier phases when available; otherwise mark the mutating checks `SKIPPED`
+instead of opening a position solely for this phase.
+
+```
+23.1  get_trading_state(
+        instrument="BTC-PERPETUAL",
+        decision_id=<test decision>,
+        currency="BTC"
+      )
+      Verify:
+      - capture_id/captured_at/data_age_ms and per-source status are present
+      - positions, open_orders, orders_by_decision, account, market_data,
+        pnl, and risk are structured sections
+      - entry_status/sl_status/tp_status match the decision group
+      - pnl exposes entry/exit/unclassified fees and funding attribution
+      - risk exposes aggregate and decision attribution
+
+23.2  Create a decision-bound time alert and inspect its outbox event.
+      Verify event_type=timer_fired, monotonic event_sequence, the same
+      bounded snapshot shape, and snapshot-derived top-level statuses.
+      Remove the alert after delivery.
+
+23.3  If the test decision has an open protected position:
+      - verify_protection(decision_id)
+      - move_stop(decision_id, <strictly better trigger>, ...)
+      - retry the same client_order_id and verify no duplicate edit
+      - replace_bracket(decision_id, <better SL>, <valid TP>, ...)
+      - verify new SL/TP coverage before old ids disappear
+      - close_position_and_cancel_protection(decision_id, ...)
+      - if the first response is closing, retry the same client_order_id;
+        verify no duplicate close and eventual flat protection cleanup
+
+23.4  Negative checks:
+      - a worse stop is rejected
+      - a long sell stop_limit with limit above trigger is rejected
+      - a short buy stop_limit with limit below trigger is rejected
+      - replace_bracket never reports protection_gap=true
+```
+
+---
+
 ## Final report
 
 Print a structured summary:
@@ -1616,6 +1660,7 @@ Phase 21 (Tier-B Nice-to-have):
 Phase 22 (Operator handoff):
   22.A telegram path (op confirm):   PASS / FAIL / SKIPPED — op absent
   22.B persistence + restart:        PASS / FAIL / SKIPPED — op absent
+Phase 23 (State/events/protection):  PASS / FAIL / SKIPPED
 
 Total mutating tool calls:           ~N
 Total decisions recorded:            ~N

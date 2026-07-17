@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="Deribit × Claude MCP Server — Autonomous Trading. Contextual Intelligence. Real-Time Action." />
+  <img src="docs/banner.png" alt="Deribit MCP Server — Autonomous Trading. Contextual Intelligence. Real-Time Action." />
 </p>
 
 # Deribit MCP Server
@@ -8,27 +8,26 @@
 > independent and not affiliated with, endorsed by, or sponsored by
 > Deribit or Coinbase.
 
-**Hand Claude Opus the keys to a Deribit account.**
+**Connect Codex or another MCP agent to a guarded Deribit account.**
 
 > 🤖 **Fully automatic crypto spot, futures, and options trading from a single prompt.**
 >
 > 📡 **Alerts and news ticker injected straight into the session — no slow polling loops.**
 >
-> 🧠 **Tell Opus your strategy. Walk away. It runs the book.**
+> 🧠 **Tell the agent your strategy. Walk away. It runs the book.**
 >
 > 📰 **Pipe your own news, signals, or regime models into the session via webhook.**
 >
 > 🖥️ **Watch health, positions, alerts, decisions, trades, news, and outbox state in a browser dashboard.**
 
-A Model Context Protocol server that turns Claude Opus into a fully
-autonomous derivatives trader on [Deribit](https://www.deribit.com) —
+A Model Context Protocol server that turns Codex or another MCP client into a
+fully autonomous derivatives trader on [Deribit](https://www.deribit.com) —
 live tickers, OHLCV candles, order books, options Greeks, funding
-rates, account state — paired with a **Claude Code Sidecar** that pushes
-alerts straight back into the running session as native channel
-notifications. The agent doesn't poll. It sleeps until the market wakes
-it up.
+rates, account state — paired with a durable outbox bridge that pushes alerts
+back into a dedicated agent task. The agent doesn't poll. It sleeps until the
+market wakes it up.
 
-Opus places its own orders. Sets its own stop-losses, take-profits, and
+The agent places its own orders. Sets its own stop-losses, take-profits, and
 trailing stops. Schedules its own time-based alerts to wake itself up
 later. Records every decision into an audit trail before the order hits
 the wire. Survives container restarts with full state intact.
@@ -44,11 +43,9 @@ the wire. Survives container restarts with full state intact.
 
 ## ⚠️ Experimental — Read This First
 
-The **Cloud Channel / Sidecar wakeup pipeline** depends on Claude
-Code's [Channels Research Preview](https://www.anthropic.com/) — an
-unreleased / **alpha** feature surface inside Claude Code. The transport
-contract (`notifications/claude/channel`) and the sidecar plugin model
-may change without notice. Today this works; next month it might not.
+Agent wakeups depend on experimental client APIs. The Codex integration uses
+the Codex App Server JSON-RPC protocol; the legacy Claude path uses Claude
+Code's Channels Research Preview. These client-facing contracts may change.
 
 **Trading is real money.** When `DERIBIT_TEST_MODE=false`, every
 mutating tool call hits the live Deribit exchange. Use the kill switch
@@ -78,12 +75,13 @@ It is not a Robinhood replacement. ⚠️
    *and* after the call. The `decision_id` rides through Deribit as the
    order `label`, so post-hoc analysis joins trivially.
 
-3. **Cloud channel wakeup pipeline (Alpha — see warning).** Alerts
+3. **Durable agent wakeup pipeline (Alpha — see warning).** Alerts
    tagged `notification_channel="outbox"` flow into a SQLite outbox,
-   stream over your private network to a sidecar plugin running on
-   the Claude-Code machine, and surface inside the session as a
-   native `<channel>` block. The agent doesn't poll; it sleeps until
-   the market wakes it up.
+   stream to a client bridge, and surface inside a dedicated Codex task through
+   `turn/start` or `turn/steer`. The legacy Claude channel sidecar remains
+   available separately. The agent doesn't poll; it sleeps until the market
+   wakes it up. Each alert event includes a bounded trigger-time snapshot with current
+   market/account state, top-of-book depth, and compact 5m/15m/60m structure.
 
 4. **Self-scheduling alerts.** The agent calls `set_price_alert` for
    threshold/cross/percentage-change conditions, `set_time_alert` to
@@ -120,7 +118,7 @@ It is not a Robinhood replacement. ⚠️
    console, or outbox channel on demand.
 
 9. **Browser dashboard.** `/dashboard/` serves an operator view for
-   health, registered sidecar consumers, held symbols, open positions,
+   health, registered wakeup consumers, held symbols, open positions,
    alerts, timers, recent decisions, MCP order audits, Deribit user
    trades, outbox events, and latest news. It also includes a news
    push form that persists the item through `/news` and pushes it to
@@ -132,14 +130,14 @@ It is not a Robinhood replacement. ⚠️
 
 ```
 +--------------------------------+       +--------------------------------+
-| Claude Code session            |       | Deribit MCP (port 8000)        |
+| Codex task                     |       | Deribit MCP (port 8000)        |
 | MCP client                     |       |                                |
 |                                |       | REST + WS to Deribit           |
 | tool calls --------------------------->| /mcp (X-Deribit-MCP-Secret)   |
-| stdio or streamable HTTP       |       |                                |
+| streamable HTTP                |       |                                |
 |                                |       | SQLite                         |
-| channel sidecar <----------------------| /events/stream + /events/ack  |
-| notifications/claude/channel   |       | outbox + alerts + audit + news |
+| Codex JSON-RPC <--- bridge <-----------| /events/stream + /events/ack  |
+| turn/start or turn/steer       |       | outbox + alerts + audit + news |
 +--------------------------------+       +--------------------------------+
                                                    ^              ^
                                                    |              |
@@ -150,19 +148,20 @@ Operator browser -------------------------------------------------+
 GET /dashboard/ (admin Bearer token for JSON + news push)
 ```
 
-**Tool path:** Claude Code is the MCP client. It loads this server
-either directly over stdio (`MCP_TRANSPORT=stdio`) or over
-streamable-http — optionally through an MCP gateway in front. The HTTP
+**Tool path:** Codex (or another MCP client) loads this server directly over
+stdio (`MCP_TRANSPORT=stdio`) or Streamable HTTP — optionally through an MCP
+gateway in front. The HTTP
 transport is protected by an `X-Deribit-MCP-Secret` shared secret.
 The server is gateway-agnostic; wire it up however your setup prefers.
 
-**Wakeup path (sidecar plugin):** Alerts tagged
+**Codex wakeup path:** Alerts tagged
 `notification_channel="outbox"` write structured events to a durable
-SQLite outbox. A small Bun/TS plugin loaded into the same Claude Code
-session streams those events from `/events/stream`, emits them as
-native `notifications/claude/channel` blocks inside the session, and
-ACKs back. Sidecar lives in [`channel-plugin/`](channel-plugin/) —
-see [HANDOFF.md](channel-plugin/HANDOFF.md).
+SQLite outbox. `deribit-codex-bridge` streams those events, submits them to one
+explicitly configured task through the managed Codex App Server, and ACKs only
+after validated JSON-RPC acceptance. See
+[docs/codex-integration.md](docs/codex-integration.md). The Claude-specific
+channel sidecar is a legacy alternative documented in
+[`channel-plugin/HANDOFF.md`](channel-plugin/HANDOFF.md); Codex does not need it.
 
 **News-injection path:** Any external pipeline `POST`s a news item
 to `/news` with `push=true`. The MCP persists it, then pushes a short
@@ -173,7 +172,7 @@ duplicate posts return the existing row and do not push again.
 **Browser dashboard:** `/dashboard/` serves the local Deribit MCP
 dashboard. Its JSON data and news-push form use
 `DERIBIT_EVENT_ADMIN_TOKEN` as a Bearer token. The UI is intentionally
-read-heavy: it shows service health, registered sidecar consumers,
+read-heavy: it shows service health, registered wakeup consumers,
 held symbols, positions, alerts, timers, recent decisions, recent
 Deribit trades, MCP order audits, latest news, and outbox events.
 The news form stores a row through `/news` and pushes it to the agent
@@ -250,6 +249,7 @@ Some MCP gateways prefix tool names — check your gateway's conventions.
 
 | Tool | Purpose |
 |------|---------|
+| `get_trading_state(instrument?, decision_id?, currency?, include_day_pnl=True)` | One bounded, internally consistent capture of positions, decision-grouped orders and protection status, account/margin, top of book, 1m/5m structure, tape imbalance, OI deltas, net PnL, and stop exposure. `currency` enables a currency-only account/PnL snapshot; every source reports status and age and partial data is explicit. |
 | `get_account_summary(currency)` | Balance, PnL, margin |
 | `get_account_summaries(extended)` | All currencies in one call |
 | `get_positions(currency, kind)` | Open positions |
@@ -270,8 +270,8 @@ Some MCP gateways prefix tool names — check your gateway's conventions.
 
 | Tool | Purpose |
 |------|---------|
-| `set_price_alert(instrument, condition, threshold, channel)` | `above` / `below` / `crosses_above` / `crosses_below` / `percentage_change` |
-| `set_time_alert(when, message, channel)` | Wake itself up at a future timestamp |
+| `set_price_alert(instrument, condition, threshold, channel, decision_id?)` | `above` / `below` / `crosses_above` / `crosses_below` / `percentage_change`; optionally bind the alert to one decision |
+| `set_time_alert(when, message, channel, instrument?, decision_id?)` | Wake itself up at a future timestamp with decision-scoped live state already attached |
 | `list_alerts(...)` | All persisted alerts |
 | `remove_alert(alert_id)` | Cancel one |
 
@@ -308,9 +308,16 @@ Same backing table as the [News Webhook](#news-webhook).
 |------|---------|
 | `buy(instrument, amount, order_type, ...)` | Long entry. Supports `market`, `limit`, `market_limit`, `stop_market`, `stop_limit`, `take_market`, `trailing_stop` |
 | `sell(...)` | Short entry / position exit, same surface as `buy` |
-| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). `sl_type` accepts `stop_market`, `stop_limit` (fixed `sl_trigger_price`) or `trailing_stop` (use `sl_trigger_offset` — absolute deviation from peak in quote currency). Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
-| `edit_order(order_id, ...)` | Modify by Deribit ID |
-| `edit_order_by_label(currency, instrument, label, ...)` | Modify by `decision_id` (preflighted) |
+| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). `sl_type` accepts `stop_market`, `stop_limit` (fixed `sl_trigger_price`) or `trailing_stop` (use `sl_trigger_offset` — absolute deviation from peak in quote currency). Protective stop-limit geometry is enforced: sell limit ≤ trigger for a long, buy limit ≥ trigger for a short. Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
+| `edit_order(order_id, ...)` | Modify by Deribit ID, including `trigger_price` / `trigger_offset` for SL/TP repricing |
+| `edit_order_by_label(currency, instrument, label, ...)` | Modify by `decision_id` (preflighted), including `trigger_price` repricing |
+| `verify_protection(decision_id)` | Read-only proof that the full open position is covered by an active reduce-only stop |
+| `move_stop(decision_id, new_trigger, ...)` | Move the single active fixed SL by order ID; rejects every stop deterioration |
+| `move_stop_to_breakeven(decision_id, offset=0, ...)` | Move a fixed SL to entry plus a direction-aware offset, never backwards |
+| `trail_stop(decision_id, distance, ...)` | Tighten an existing exchange-side trailing stop; fixed-to-trailing conversion uses `replace_bracket` |
+| `replace_bracket(decision_id, ...)` | Create and verify a new native reduce-only OCO pair before cancelling the old protection. No unprotected gap; incremental fill handling preserves sibling coverage, and delayed exchange visibility is reconciled idempotently without placing a second OCO. The multi-step replacement is not an exchange transaction. |
+| `cancel_pending_setup(decision_id, ...)` | Cancel captured pending-entry IDs and dormant OTO children with fill-race checks |
+| `close_position_and_cancel_protection(decision_id, ...)` | Cancel active decision entries, close once, confirm flat, then remove captured SL/TP orders. Retries reconcile an in-flight close without submitting a duplicate; protection stays live while the close is incomplete. |
 | `cancel_order(order_id, decision_id?)` | Single cancel |
 | `cancel_orders_by_label(currency, label)` | Currency-scoped label cancel |
 | `cancel_all_orders(scope, confirm_cancel_all)` | Global requires explicit confirmation |
@@ -470,6 +477,7 @@ the container fails fast on missing or inconsistent values.
 |-----|---------|---------|
 | `MCP_TRANSPORT` | `stdio` | `http` for gateway backend, `stdio` for local dev |
 | `MCP_HTTP_JSON_RESPONSE` | `false` | Set `true` only if your gateway rejects streamed responses |
+| `MCP_HTTP_STATELESS` | `false` | Set `true` for direct Codex Streamable-HTTP clients; disables GET/SSE session state |
 | `MCP_SHARED_SECRET` | `""` | Required when `MCP_TRANSPORT=http`. Pass via `X-Deribit-MCP-Secret` |
 | `DERIBIT_DB_PATH` | `/data/deribit.db` | SQLite location, mounted volume |
 
@@ -493,13 +501,14 @@ On Mainnet (`DERIBIT_TEST_MODE=false`), each mutating tool call also
 requires `confirm_live_trade=true` — defense against accidental
 Mainnet calls from a session configured for testnet.
 
-### Event outbox / sidecar
+### Event outbox / wakeup consumers
 
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `DERIBIT_EVENT_ADMIN_TOKEN` | `""` | Required for `POST /events/register`, `POST /news`, `POST /news/{id}/push`, and dashboard JSON/news-push actions |
 | `DERIBIT_EVENT_RETENTION_DAYS` | `7` | How long to keep ACKed events in the outbox |
-| `DERIBIT_EVENT_STREAM_CLAIM_SECONDS` | `90` | How long a sidecar's stream-claim survives without renewal |
+| `DERIBIT_EVENT_STREAM_CLAIM_SECONDS` | `90` | How long a wakeup consumer's stream claim survives without renewal |
+| `DERIBIT_NEWS_MAX_DELIVERY_AGE_HOURS` | `6` | Do not replay older `news_ready` events as live wakeups; `0` disables the filter |
 | `DERIBIT_TRADING_EVENT_OUTBOX_ENABLED` | `true` | Mirror authenticated Deribit `user.*` order/fill lifecycle events into the outbox |
 | `DERIBIT_TRADING_EVENT_CHANNELS` | `user.changes.future.any.100ms,user.changes.option.any.100ms,user.changes.spot.any.100ms,user.changes.future_combo.any.100ms,user.changes.option_combo.any.100ms` | Comma-separated Deribit `user.*` channels to stream into session wakeups |
 
@@ -533,20 +542,21 @@ Python app itself:
 
 ---
 
-## Wakeup architecture (sidecar pipeline)
+## Wakeup architecture (Codex bridge or legacy sidecar)
 
 When an alert with `notification_channel="outbox"` fires, the server
-writes a payload-allowlisted event to the `event_outbox` table. The
-sidecar plugin running on the Claude machine:
+writes a payload-allowlisted event to the `event_outbox` table. A wakeup
+consumer such as `deribit-codex-bridge`:
 
 1. Holds a long stream open at
    `GET /events/stream?consumer_id=<id>` (Bearer auth, per-consumer
    token).
 2. Receives the event as NDJSON.
-3. Emits `notifications/claude/channel` with `content` =
-   `payload.message` and `meta` = identifier-keyed metadata
-   (`alert_id`, `instrument`, `severity`, `event_id`, `event_type`).
-4. Calls `POST /events/{event_id}/ack` so the server stops re-delivering.
+3. Submits a sanitized event to its agent client. Codex receives the JSON as
+   application-owned `additionalContext` and uses `turn/start` while idle
+   or `turn/steer` during a normal active turn.
+4. Calls `POST /events/{event_id}/ack` only after the client accepts delivery,
+   so the server stops re-delivering.
 
 Operator commands:
 
@@ -555,14 +565,28 @@ Operator commands:
 curl -sS -X POST http://<deribit-host>:8000/events/register \
   -H "Authorization: Bearer $DERIBIT_EVENT_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"consumer_id":"<uuid4>","display_name":"trading-claude-laptop"}'
+  -d '{"consumer_id":"<uuid4>","display_name":"codex-trading-thread"}'
 ```
 
-The `meta` keys must match `[A-Za-z0-9_]`. Server-side severity is
-deterministic: `percentage_change` with `|threshold| >= 5` →
+Server-side severity is deterministic: `percentage_change` with
+`|threshold| >= 5` →
 `warning`, otherwise `info`. Event payload allowlist is in
 `src/event_outbox.py:ALLOWED_PAYLOAD_KEYS` — anything not listed is
 dropped before persisting.
+
+Alert and timer events carry the same strictly allowlisted snapshot returned by
+`get_trading_state`: capture time and source ages, account/margin, positions,
+orders grouped by `decision_id`, entry/SL/TP lifecycle, top-of-book depth and
+spread, completed 1m/5m candles and volume, tape imbalance, OI changes, net
+PnL, and stop/notional exposure. PnL separates entry, exit, and unclassified
+fees and marks decision-level funding attribution as `exact`, `ambiguous`, or
+`unavailable`. `risk.decision` follows the same attribution rule and never
+assigns a shared instrument-level position to one decision without evidence.
+Reads run concurrently with bounded timeouts;
+`snapshot_complete`, `data_age_ms`, per-source status, and truncation flags make
+partial data explicit and never suppress delivery. Collections and encoded
+size remain capped. Codex only reloads the sections that are stale, incomplete,
+or needed immediately before a mutation.
 
 News pushes with `notification_channel="outbox"` emit `news_ready`
 events. They are deduped server-side by `news:{url}` when the news row
@@ -570,12 +594,17 @@ has a URL, otherwise by `news:{news_id}`. They carry only allowlisted
 news metadata: `news_id`, `source`, `instrument`, `headline`,
 `summary`, `url`, `score`, `tags`, `message`.
 
-Authenticated Deribit trading events use the same sidecar path when
-`DERIBIT_TRADING_EVENT_OUTBOX_ENABLED=true`: the server subscribes to
-the configured `DERIBIT_TRADING_EVENT_CHANNELS`, converts order
-lifecycle updates and fills into sanitized `deribit_order_update` /
-`deribit_trade_update` events, and skips raw position snapshots to avoid
-mark-price spam in the session.
+Authenticated Deribit trading events use the same wakeup path when
+`DERIBIT_TRADING_EVENT_OUTBOX_ENABLED=true`. A persistent projector converts
+user-order/trade/position batches into semantic events such as
+`entry_opened`, `entry_partially_filled`, `position_opened`, `sl_activated`,
+`tp_activated`, `stop_triggered`, `position_closed`, `order_rejected`, and
+`protection_missing`. Each stored event has a monotonic `event_sequence` plus
+typed `previous_state` / `current_state` and may contain multiple transitions
+from the same exchange batch without creating duplicate wakeups. Time alerts
+use `timer_fired`. Payload-level `current_state` follows the coherent snapshot,
+while each transition preserves the sparse exchange-trigger delta. Every
+trading wakeup carries a fresh bounded trading-state snapshot.
 
 ---
 
@@ -622,9 +651,12 @@ Single SQLite database mounted on a host volume. Tables:
 - `notes` — free-form agent scratchpad.
 - `idempotency_keys` — per-call cache for `client_order_id`. 5 min TTL,
   reaped every 5 min. Survives container restart.
-- `event_outbox`, `event_consumers`, `event_deliveries` — sidecar
-  wakeup pipeline state. Reaper deletes only events whose deliveries are
-  all ACKed and whose `expires_at` has passed.
+- `event_outbox`, `event_consumers`, `event_deliveries` — wakeup pipeline
+  state, including a persistent monotonic event sequence. Reaper deletes only
+  events whose deliveries are all ACKed and whose `expires_at` has passed.
+- `trading_event_state` — persistent semantic order/position/protection
+  projector state used to produce reliable previous-to-current transitions
+  across process restarts.
 - `news` — externally ingested news items with headline, summary,
   source, instrument scope, URL, score, tags, free-form JSON content,
   processing status, optional model attribution, and notification push
@@ -732,6 +764,8 @@ src/
 ├── event_outbox.py      # Outbox repo, severity mapping, payload allowlist,
 │                        # consumer lifecycle, claim/ack/heartbeat/reaper
 ├── events_api.py        # FastAPI routes for /events/*
+├── codex_app_server.py  # Codex App Server JSON-RPC client + turn routing
+├── codex_event_bridge.py # Outbox stream, SQLite journal, Codex delivery + ACK
 ├── notifications.py     # TelegramChannel, OutboxNotificationChannel,
 │                        # NotificationManager
 ├── market_streams.py    # WS-cached order books, trade tape, liquidations
@@ -745,7 +779,8 @@ src/
 
 dashboard/               # Browser dashboard: `dashboard/api.py` + `dashboard/static/`
 tests/                   # pytest cases covering the layers above
-channel-plugin/          # Sidecar handoff & build instructions
+channel-plugin/          # Legacy Claude sidecar handoff & build instructions
+docs/codex-integration.md # Codex MCP + managed app-server setup
 DEMO_CLAUDE.md           # Example Claude Code operating prompt
 llms.txt                 # Install guide for LLM agents
 SMOKE-PLAYBOOK.md        # End-to-end test catalogue

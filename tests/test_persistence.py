@@ -1,7 +1,12 @@
+import json
+import sqlite3
+
 import pytest
 
+from src.alerts import AlertCondition, PriceAlert
 from src.event_outbox import EventOutboxRepo
 from src.persistence import (
+    AlertRepo,
     Database,
     DecisionRepo,
     IdempotencyRepo,
@@ -9,6 +14,82 @@ from src.persistence import (
     NoteRepo,
     OrderAuditRepo,
 )
+
+
+@pytest.mark.asyncio
+async def test_alert_repo_migrates_and_roundtrips_decision_id(tmp_path):
+    db_path = tmp_path / "legacy-alerts.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute("""
+        CREATE TABLE alerts (
+          id TEXT PRIMARY KEY,
+          instrument TEXT,
+          condition TEXT NOT NULL,
+          threshold REAL,
+          fire_at TEXT,
+          notification_channel TEXT NOT NULL,
+          status TEXT NOT NULL,
+          message TEXT,
+          repeat INTEGER NOT NULL DEFAULT 0,
+          cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+          created_at TEXT NOT NULL,
+          triggered_at TEXT,
+          last_trigger_time TEXT,
+          last_price REAL,
+          schema_version INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+    legacy.commit()
+    legacy.close()
+
+    db = Database(str(db_path))
+    await db.connect()
+    repo = AlertRepo(db)
+    alert = PriceAlert(
+        instrument="BTC_USDC-PERPETUAL",
+        condition=AlertCondition.ABOVE,
+        threshold=100_000.0,
+        decision_id="decision-alert-1",
+    )
+    await repo.save(alert)
+    await db.close()
+
+    reopened = Database(str(db_path))
+    await reopened.connect()
+    loaded = await AlertRepo(reopened).load_active()
+    cursor = await reopened.require_conn().execute("PRAGMA table_info(alerts)")
+    columns = await cursor.fetchall()
+
+    assert "decision_id" in {row["name"] for row in columns}
+    assert len(loaded) == 1
+    assert loaded[0].decision_id == "decision-alert-1"
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_event_sequence_survives_restart_and_dedupe_does_not_consume_it(tmp_path):
+    db_path = tmp_path / "event-sequence.db"
+    db = Database(str(db_path))
+    await db.connect()
+    repo = EventOutboxRepo(db)
+    first = await repo.insert_event("first", {"message": "first"}, dedupe_key="duplicate")
+    duplicate = await repo.insert_event("first", {"message": "duplicate"}, dedupe_key="duplicate")
+    second = await repo.insert_event("second", {"message": "second"})
+    await db.close()
+
+    reopened = Database(str(db_path))
+    await reopened.connect()
+    third = await EventOutboxRepo(reopened).insert_event("third", {"message": "third"})
+    cursor = await reopened.require_conn().execute(
+        "SELECT event_id, event_sequence, payload_json FROM event_outbox ORDER BY event_sequence"
+    )
+    rows = await cursor.fetchall()
+
+    assert duplicate is None
+    assert [row["event_id"] for row in rows] == [first, second, third]
+    assert [row["event_sequence"] for row in rows] == [1, 2, 3]
+    assert [json.loads(row["payload_json"])["event_sequence"] for row in rows] == [1, 2, 3]
+    await reopened.close()
 
 
 @pytest.mark.asyncio
@@ -88,6 +169,40 @@ async def test_decision_repo_accepts_pnl_outcomes():
 
 
 @pytest.mark.asyncio
+async def test_decision_repo_accepts_atomic_bracket_management_actions():
+    db = Database(":memory:")
+    await db.connect()
+    repo = DecisionRepo(db)
+    actions = (
+        "move_stop",
+        "move_stop_to_breakeven",
+        "trail_stop",
+        "cancel_pending_setup",
+        "close_position_and_cancel_protection",
+        "replace_bracket",
+    )
+
+    for index, action in enumerate(actions):
+        decision_id = f"decision-action-{index}"
+        await repo.create(
+            decision_id=decision_id,
+            instrument="BTC-PERPETUAL",
+            reasoning="atomic bracket management",
+            action_taken=action,
+        )
+        assert (await repo.get(decision_id))["action_taken"] == action
+
+    with pytest.raises(ValueError, match="Invalid action_taken"):
+        await repo.create(
+            decision_id="decision-read-only",
+            instrument="BTC-PERPETUAL",
+            reasoning="read only check",
+            action_taken="verify_protection",
+        )
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_idempotency_repo_returns_cached_response():
     db = Database(":memory:")
     await db.connect()
@@ -157,6 +272,11 @@ async def test_event_outbox_filters_payload_and_dedupes():
     await db.connect()
     repo = EventOutboxRepo(db)
 
+    # Register before inserting: a consumer is never delivered events that
+    # predate its registration (see the pending_events registration floor).
+    registered = await repo.register_consumer("consumer-1", "test")
+    assert await repo.authenticate_consumer("consumer-1", registered["token"])
+
     first = await repo.insert_event(
         "price_alert_triggered",
         {
@@ -175,8 +295,6 @@ async def test_event_outbox_filters_payload_and_dedupes():
     assert first is not None
     assert second is None
 
-    registered = await repo.register_consumer("consumer-1", "test")
-    assert await repo.authenticate_consumer("consumer-1", registered["token"])
     events = await repo.pending_events("consumer-1")
 
     assert len(events) == 1
@@ -190,6 +308,11 @@ async def test_event_outbox_inserts_news_event_with_dedupe():
     db = Database(":memory:")
     await db.connect()
     repo = EventOutboxRepo(db)
+
+    # Register before inserting so the pending_events registration floor does
+    # not (correctly) filter out news that predates the consumer.
+    registered = await repo.register_consumer("consumer-news", "test")
+    assert await repo.authenticate_consumer("consumer-news", registered["token"])
 
     news = {
         "id": "news-1",
@@ -207,10 +330,7 @@ async def test_event_outbox_inserts_news_event_with_dedupe():
     assert first is not None
     assert second is None
 
-    registered = await repo.register_consumer("consumer-news", "test")
     events = await repo.pending_events("consumer-news")
-
-    assert await repo.authenticate_consumer("consumer-news", registered["token"])
     assert events[0]["type"] == "news_ready"
     payload = events[0]["payload"]
     assert payload["news_id"] == "news-1"

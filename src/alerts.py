@@ -50,6 +50,7 @@ class PriceAlert:
     cooldown_seconds: int = 300  # Cooldown period before re-triggering
     last_trigger_time: Optional[datetime] = None
     fire_at: Optional[datetime] = None
+    decision_id: Optional[str] = None
 
     # Internal state for tracking
     _last_price: Optional[float] = None
@@ -67,6 +68,7 @@ class PriceAlert:
             "created_at": self.created_at.isoformat(),
             "triggered_at": self.triggered_at.isoformat() if self.triggered_at else None,
             "fire_at": self.fire_at.isoformat() if self.fire_at else None,
+            "decision_id": self.decision_id,
             "message": self.message,
             "repeat": self.repeat,
             "cooldown_seconds": self.cooldown_seconds,
@@ -98,6 +100,7 @@ class AlertManager:
         message: Optional[str] = None,
         repeat: bool = False,
         cooldown_seconds: int = 300,
+        decision_id: Optional[str] = None,
     ) -> PriceAlert:
         """Add a new price alert."""
         async with self._lock:
@@ -119,6 +122,7 @@ class AlertManager:
                 message=message,
                 repeat=repeat,
                 cooldown_seconds=cooldown_seconds,
+                decision_id=decision_id,
             )
 
             self.alerts[alert.id] = alert
@@ -136,6 +140,7 @@ class AlertManager:
         notification_channel: str = "outbox",
         repeat: bool = False,
         cooldown_seconds: int = 300,
+        decision_id: Optional[str] = None,
     ) -> PriceAlert:
         """Add a new absolute time alert."""
         if fire_at.tzinfo is None:
@@ -151,6 +156,7 @@ class AlertManager:
                 repeat=repeat,
                 cooldown_seconds=cooldown_seconds,
                 fire_at=fire_at,
+                decision_id=decision_id,
             )
             self.alerts[alert.id] = alert
             if self.repo:

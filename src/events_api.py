@@ -21,6 +21,21 @@ class RegisterConsumerRequest(BaseModel):
     display_name: str
 
 
+def _encode_event_ndjson(event: dict) -> str:
+    """Encode one compact UTF-8-friendly NDJSON event line."""
+    return (
+        json.dumps(
+            event,
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    )
+
+
 def _bearer_token(authorization: Optional[str]) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Bearer token required")
@@ -72,7 +87,7 @@ async def stream_events(
                 await repo.renew_stream(consumer_id, settings.deribit_event_stream_claim_seconds)
                 events = await repo.pending_events(consumer_id)
                 for event in events:
-                    yield json.dumps(event, sort_keys=True, default=str) + "\n"
+                    yield _encode_event_ndjson(event)
                 await asyncio.sleep(1)
         finally:
             await repo.release_stream(consumer_id)

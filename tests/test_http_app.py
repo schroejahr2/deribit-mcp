@@ -100,6 +100,17 @@ def test_mcp_endpoint_allows_matching_shared_secret(monkeypatch):
     assert response.status_code != 401
 
 
+def test_stateless_mcp_rejects_get_after_auth(monkeypatch):
+    monkeypatch.setattr(http_app.settings, "mcp_shared_secret", "secret")
+    monkeypatch.setattr(http_app.settings, "mcp_http_stateless", True)
+    client = TestClient(http_app.app)
+
+    response = client.get("/mcp/", headers={"X-Deribit-MCP-Secret": "secret"})
+
+    assert response.status_code == 405
+    assert response.json() == {"error": "method not allowed"}
+
+
 def test_news_routes_return_compact_and_full_rows():
     repo = FakeNewsRepo()
     http_app.app.state.deribit = SimpleNamespace(news_repo=repo)

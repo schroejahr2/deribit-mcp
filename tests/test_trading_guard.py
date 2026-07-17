@@ -359,3 +359,157 @@ async def test_close_position_missing_size_fields_raises(monkeypatch):
 
     with pytest.raises(trading.TradingValidationError, match="determine open position size"):
         await trading.enforce_close_position_limit(app_ctx, "BTC_USDC-PERPETUAL")
+
+
+# ---------------------------------------------------------------------------
+# Pure position/protection helpers
+# ---------------------------------------------------------------------------
+
+
+def test_position_order_amount_uses_family_specific_units_and_absolute_value():
+    position = {"size": -3031.0, "size_currency": -0.04}
+
+    assert trading.position_order_amount(LINEAR_PERP, position) == 0.04
+    assert trading.position_order_amount(INVERSE_PERP, position) == 3031.0
+    assert (
+        trading.position_order_amount(
+            {"instrument_name": "BTC-30MAY26-65000-C", "kind": "option"},
+            {"size": -0.5},
+        )
+        == 0.5
+    )
+
+
+def test_position_order_amount_falls_back_and_rejects_missing_or_nonfinite_size():
+    assert trading.position_order_amount(LINEAR_PERP, {"size": -0.25}) == 0.25
+    assert trading.position_order_amount(INVERSE_PERP, {"size_currency": -50}) == 50
+
+    with pytest.raises(trading.TradingValidationError, match="determine open position size"):
+        trading.position_order_amount(LINEAR_PERP, {"average_price": 80_000})
+    with pytest.raises(trading.TradingValidationError, match="Invalid open position size"):
+        trading.position_order_amount(INVERSE_PERP, {"size": float("nan")})
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        (
+            {"order_type": "limit", "order_state": "open", "reduce_only": False},
+            {"role": "entry", "status": "active"},
+        ),
+        (
+            {"order_type": "stop_market", "order_state": "untriggered", "reduce_only": True},
+            {"role": "sl", "status": "active"},
+        ),
+        (
+            {"order_type": "trailing_stop", "order_state": "open", "reduce_only": True},
+            {"role": "sl", "status": "active"},
+        ),
+        (
+            {"order_type": "take_market", "order_state": "open", "reduce_only": True},
+            {"role": "tp", "status": "active"},
+        ),
+        (
+            {"order_type": "market", "order_state": "filled", "reduce_only": True},
+            {"role": "exit", "status": "filled"},
+        ),
+        (
+            {"order_type": "stop_market", "order_state": "cancelled", "reduce_only": True},
+            {"role": "sl", "status": "cancelled"},
+        ),
+        (
+            {"order_type": "limit", "order_state": "rejected", "reduce_only": False},
+            {"role": "entry", "status": "rejected"},
+        ),
+        (
+            {"order_type": "stop_market", "order_state": "triggered", "reduce_only": True},
+            {"role": "sl", "status": "triggered"},
+        ),
+    ],
+)
+def test_classify_order_role_status_maps_deribit_roles_and_states(order, expected):
+    assert trading.classify_order_role_status(order) == expected
+
+
+def test_classify_order_role_status_distinguishes_dormant_and_active_oto_children():
+    child = {
+        "order_type": "stop_market",
+        "order_state": "untriggered",
+        "reduce_only": True,
+        "is_secondary_oto": True,
+    }
+
+    assert trading.classify_order_role_status(child) == {"role": "sl", "status": "dormant"}
+    assert trading.classify_order_role_status(child, primary_order_state="open") == {
+        "role": "sl",
+        "status": "dormant",
+    }
+    assert trading.classify_order_role_status(child, primary_order_state="filled") == {
+        "role": "sl",
+        "status": "active",
+    }
+    assert trading.classify_order_role_status(child, position_open=True) == {
+        "role": "sl",
+        "status": "active",
+    }
+
+
+def test_validate_stop_improvement_accepts_equal_or_tighter_long_and_short_stops():
+    trading.validate_stop_improvement("buy", 79_000, 79_000, current_price=80_000)
+    trading.validate_stop_improvement("long", 79_000, 79_500, current_price=80_000)
+    trading.validate_stop_improvement("sell", 81_000, 81_000, current_price=80_000)
+    trading.validate_stop_improvement("short", 81_000, 80_500, current_price=80_000)
+
+
+def test_validate_stop_improvement_rejects_worsening_long_and_short_stops():
+    with pytest.raises(trading.TradingValidationError, match="worsen long protection"):
+        trading.validate_stop_improvement("buy", 79_000, 78_999, current_price=80_000)
+    with pytest.raises(trading.TradingValidationError, match="worsen short protection"):
+        trading.validate_stop_improvement("sell", 81_000, 81_001, current_price=80_000)
+
+
+def test_validate_stop_improvement_rejects_current_price_crossing():
+    with pytest.raises(trading.TradingValidationError, match="stay below current price"):
+        trading.validate_stop_improvement("buy", 79_000, 80_000, current_price=80_000)
+    with pytest.raises(trading.TradingValidationError, match="stay above current price"):
+        trading.validate_stop_improvement("sell", 81_000, 80_000, current_price=80_000)
+
+
+@pytest.mark.parametrize(
+    ("direction", "current", "new", "price", "match"),
+    [
+        ("zero", 79_000, 79_500, 80_000, "position_direction"),
+        ("buy", float("nan"), 79_500, 80_000, "current_trigger"),
+        ("buy", 79_000, float("inf"), 80_000, "new_trigger"),
+        ("buy", 79_000, 79_500, 0, "current_price"),
+    ],
+)
+def test_validate_stop_improvement_rejects_invalid_inputs(direction, current, new, price, match):
+    with pytest.raises(trading.TradingValidationError, match=match):
+        trading.validate_stop_improvement(direction, current, new, current_price=price)
+
+
+def test_breakeven_trigger_applies_offset_toward_profit_for_each_side():
+    assert trading.breakeven_trigger("buy", 80_000, 25) == 80_025
+    assert trading.breakeven_trigger("long", 80_000) == 80_000
+    assert trading.breakeven_trigger("sell", 80_000, 25) == 79_975
+    assert trading.breakeven_trigger("short", 80_000) == 80_000
+
+
+def test_breakeven_trigger_rejects_negative_offset_and_nonpositive_target():
+    with pytest.raises(trading.TradingValidationError, match="offset"):
+        trading.breakeven_trigger("buy", 80_000, -1)
+    with pytest.raises(trading.TradingValidationError, match="greater than zero"):
+        trading.breakeven_trigger("sell", 10, 10)
+
+
+def test_validate_trailing_distance_accepts_equal_or_tighter_and_rejects_widening():
+    trading.validate_trailing_distance(500, 500)
+    trading.validate_trailing_distance(500, 250)
+
+    with pytest.raises(trading.TradingValidationError, match="would worsen protection"):
+        trading.validate_trailing_distance(500, 501)
+    with pytest.raises(trading.TradingValidationError, match="new_distance"):
+        trading.validate_trailing_distance(500, 0)
+    with pytest.raises(trading.TradingValidationError, match="current_distance"):
+        trading.validate_trailing_distance(float("nan"), 100)

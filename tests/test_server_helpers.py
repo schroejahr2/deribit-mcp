@@ -7,7 +7,9 @@ from src import server as server_module
 from src import trading
 from src.news import compact_news_row, format_news_message, push_news
 from src.server import (
+    _cancel_pending_setup_impl,
     _cancel_orders_by_label_impl,
+    _close_position_and_cancel_protection_impl,
     _compact_account_summaries,
     _compact_account_summary,
     _compact_chart_bars,
@@ -18,10 +20,15 @@ from src.server import (
     _edit_order_by_label_impl,
     _execute_audited,
     _find_order_by_client_id_impl,
+    _move_stop_impl,
+    _move_stop_to_breakeven_impl,
     _place_bracket_impl,
     _place_order_impl,
     _prepare_mutating_tool,
+    _replace_bracket_impl,
+    _trail_stop_impl,
     _truncate_text,
+    _verify_protection_impl,
 )
 
 
@@ -42,8 +49,9 @@ class AuditRepo:
 
 
 class FakeDecisionRepo:
-    def __init__(self, known_ids):
+    def __init__(self, known_ids, instruments=None):
         self.known_ids = set(known_ids)
+        self.instruments = instruments or {}
         self.outcomes: list[tuple[str, str, str]] = []
 
     async def exists(self, decision_id):
@@ -53,6 +61,14 @@ class FakeDecisionRepo:
         if decision_id not in self.known_ids:
             raise ValueError(f"Unknown decision_id: {decision_id}")
         self.outcomes.append((decision_id, outcome, outcome_note))
+
+    async def get(self, decision_id):
+        if decision_id not in self.known_ids:
+            return None
+        return {
+            "id": decision_id,
+            "instrument": self.instruments.get(decision_id, "BTC-PERPETUAL"),
+        }
 
 
 class FakeRest:
@@ -897,7 +913,7 @@ async def test_edit_order_by_label_invalid_args_reject_decision(monkeypatch):
     )
 
     # Pre-validation must auto-reject the linked decision so it doesn't sit at NULL.
-    with pytest.raises(ValueError, match="amount or price is required"):
+    with pytest.raises(ValueError, match="amount, price or trigger_price is required"):
         await _edit_order_by_label_impl(
             app_ctx,
             instrument="BTC-PERPETUAL",
@@ -910,7 +926,7 @@ async def test_edit_order_by_label_invalid_args_reject_decision(monkeypatch):
     assert rest.edit_calls == []
     assert len(decision_repo.outcomes) == 1
     assert decision_repo.outcomes[0][1] == "rejected"
-    assert "amount or price is required" in decision_repo.outcomes[0][2]
+    assert "amount, price or trigger_price is required" in decision_repo.outcomes[0][2]
 
 
 @pytest.mark.asyncio
@@ -1021,6 +1037,7 @@ async def test_edit_order_by_label_cross_instrument_preflight_passes(monkeypatch
             {
                 "amount": 100.0,
                 "price": 49_500,
+                "trigger_price": None,
                 "post_only": None,
                 "reject_post_only": None,
                 "reduce_only": None,
@@ -1072,6 +1089,63 @@ async def test_edit_order_by_label_price_only_backfills_amount(monkeypatch):
     audit_request = audit_repo.records[0]["request"]
     assert audit_request["amount"] is None  # caller intent preserved
     assert audit_request["effective_amount"] == 100.0  # what was actually sent
+
+
+@pytest.mark.asyncio
+async def test_edit_order_by_label_trigger_price_only_backfills_amount(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+
+    audit_repo = AuditRepo()
+    rest = FakeLabelRest(
+        open_orders=[{"order_id": "order-1", "instrument_name": "BTC-PERPETUAL", "amount": 100.0}],
+        edit_response={
+            "order": {
+                "order_id": "order-1",
+                "instrument_name": "BTC-PERPETUAL",
+                "amount": 100.0,
+                "trigger_price": 49_500,
+            },
+            "trades": [],
+        },
+    )
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=audit_repo,
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    response = await _edit_order_by_label_impl(
+        app_ctx,
+        instrument="BTC-PERPETUAL",
+        currency="BTC",
+        decision_id="decision-1",
+        trigger_price=49_500,
+        client_order_id="cid-1",
+    )
+
+    assert response["result"]["order"]["trigger_price"] == 49_500
+    assert rest.edit_calls == [
+        (
+            "BTC-PERPETUAL",
+            "decision-1",
+            {
+                "amount": 100.0,
+                "price": None,
+                "trigger_price": 49_500,
+                "post_only": None,
+                "reject_post_only": None,
+                "reduce_only": None,
+                "advanced": None,
+            },
+        )
+    ]
+    audit_request = audit_repo.records[0]["request"]
+    assert audit_request["amount"] is None
+    assert audit_request["effective_amount"] == 100.0
+    assert audit_request["trigger_price"] == 49_500
 
 
 @pytest.mark.asyncio
@@ -2625,3 +2699,1805 @@ async def test_place_bracket_stop_market_requires_sl_trigger_price(monkeypatch):
         )
 
     assert rest.place_otoco_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "sl_trigger_price", "sl_limit_price", "message"),
+    [
+        ("buy", 75_000.0, 75_500.0, "at or below"),
+        ("sell", 85_000.0, 84_500.0, "at or above"),
+    ],
+)
+async def test_place_bracket_rejects_misaligned_protective_stop_limit(
+    monkeypatch,
+    side,
+    sl_trigger_price,
+    sl_limit_price,
+    message,
+):
+    _enable_inverse_trading(monkeypatch)
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(trading.TradingValidationError, match=message):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side=side,
+            amount=10,
+            entry_type="market",
+            sl_type="stop_limit",
+            sl_trigger_price=sl_trigger_price,
+            sl_limit_price=sl_limit_price,
+            tp_type="take_market",
+            tp_trigger_price=95_000 if side == "buy" else 65_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id=f"bracket-bad-stop-limit-{side}",
+        )
+
+    assert rest.place_otoco_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Decision-scoped protection and bracket management
+# ---------------------------------------------------------------------------
+
+
+def _management_position(direction="buy", *, size=100.0, average_price=80_000.0):
+    return {
+        "instrument_name": "BTC-PERPETUAL",
+        "direction": direction if size else "zero",
+        "size": size,
+        "average_price": average_price if size else None,
+        "mark_price": 81_000.0,
+        "floating_profit_loss": 0.01 if size else 0.0,
+        "estimated_liquidation_price": 40_000.0 if size else None,
+    }
+
+
+def _management_order(
+    order_id,
+    order_type,
+    *,
+    direction="sell",
+    amount=100.0,
+    trigger_price=None,
+    trigger_offset=None,
+    price=None,
+    reduce_only=True,
+    order_state="untriggered",
+    is_secondary_oto=False,
+    oco_ref=None,
+    primary_order_id=None,
+):
+    return {
+        "order_id": order_id,
+        "instrument_name": "BTC-PERPETUAL",
+        "label": "decision-1",
+        "order_type": order_type,
+        "order_state": order_state,
+        "direction": direction,
+        "amount": amount,
+        "filled_amount": 0.0,
+        "reduce_only": reduce_only,
+        "trigger": "mark_price" if reduce_only else None,
+        "trigger_price": trigger_price,
+        "trigger_offset": trigger_offset,
+        "price": price,
+        "is_secondary_oto": is_secondary_oto,
+        "oco_ref": oco_ref,
+        "primary_order_id": primary_order_id,
+    }
+
+
+class FakeManagementRest:
+    def __init__(
+        self,
+        *,
+        position,
+        orders,
+        mark_price=81_000.0,
+        fill_entry_on_cancel=None,
+        cancel_error_on=None,
+        close_to_flat=False,
+        verify_new_oco=True,
+        flat_after_new_oco_verification=False,
+        position_size_after_new_oco_verification=None,
+        new_entry_after_cancel=None,
+        cancel_failures=None,
+        close_order_state="open",
+        close_order_state_error=None,
+        oco_response_with_slot_ref=False,
+        flat_immediately_after_oco=False,
+        omit_new_tp_after_oco=False,
+    ):
+        self.position = dict(position)
+        self.orders = [dict(order) for order in orders]
+        self.mark_price = mark_price
+        self.fill_entry_on_cancel = fill_entry_on_cancel
+        self.cancel_error_on = cancel_error_on
+        self.close_to_flat = close_to_flat
+        self.verify_new_oco = verify_new_oco
+        self.flat_after_new_oco_verification = flat_after_new_oco_verification
+        self.position_size_after_new_oco_verification = position_size_after_new_oco_verification
+        self.new_entry_after_cancel = (
+            dict(new_entry_after_cancel) if new_entry_after_cancel is not None else None
+        )
+        self.cancel_failures = dict(cancel_failures or {})
+        self.close_order_state = close_order_state
+        self.close_order_state_error = close_order_state_error
+        self.oco_response_with_slot_ref = oco_response_with_slot_ref
+        self.flat_immediately_after_oco = flat_immediately_after_oco
+        self.omit_new_tp_after_oco = omit_new_tp_after_oco
+        self.new_oco_verification_seen = False
+        self.edit_calls = []
+        self.cancel_calls = []
+        self.close_calls = []
+        self.place_oco_calls = []
+        self.events = []
+
+    async def get_instrument(self, instrument):
+        assert instrument == "BTC-PERPETUAL"
+        return {
+            "instrument_name": instrument,
+            "kind": "future",
+            "instrument_type": "inverse",
+            "quote_currency": "USD",
+            "settlement_currency": "BTC",
+        }
+
+    async def get_ticker(self, instrument):
+        assert instrument == "BTC-PERPETUAL"
+        return {
+            "mark_price": self.mark_price,
+            "last_price": self.mark_price,
+            "index_price": self.mark_price,
+        }
+
+    async def get_position(self, instrument):
+        assert instrument == "BTC-PERPETUAL"
+        self.events.append(("read_position", self.position.get("size")))
+        return dict(self.position)
+
+    async def get_open_orders_by_label(self, currency, label=None):
+        assert currency == "BTC"
+        assert label == "decision-1"
+        self.events.append(("read_orders", tuple(order["order_id"] for order in self.orders)))
+        if (
+            (
+                self.flat_after_new_oco_verification
+                or self.position_size_after_new_oco_verification is not None
+            )
+            and not self.new_oco_verification_seen
+            and any(order["order_id"] == "new-sl" for order in self.orders)
+        ):
+            # get_position is the first coroutine in the gather, so this models
+            # the old TP closing the position immediately after new OCO verify.
+            self.new_oco_verification_seen = True
+            next_size = (
+                0.0
+                if self.flat_after_new_oco_verification
+                else float(self.position_size_after_new_oco_verification)
+            )
+            self.position = _management_position(size=next_size)
+        return [dict(order) for order in self.orders]
+
+    async def edit_order(self, order_id, **kwargs):
+        self.events.append(("edit", order_id))
+        self.edit_calls.append((order_id, kwargs))
+        order = next(order for order in self.orders if order["order_id"] == order_id)
+        for key in ("amount", "trigger_price", "trigger_offset", "reduce_only"):
+            if key in kwargs and kwargs[key] is not None:
+                order[key] = kwargs[key]
+        return {"order": dict(order), "trades": []}
+
+    async def cancel_order(self, order_id):
+        self.events.append(("cancel", order_id))
+        self.cancel_calls.append(order_id)
+        failures_remaining = int(self.cancel_failures.get(order_id, 0))
+        if failures_remaining > 0:
+            self.cancel_failures[order_id] = failures_remaining - 1
+            raise ValueError("temporary cancel failure")
+        self.orders = [order for order in self.orders if order["order_id"] != order_id]
+        if self.new_entry_after_cancel is not None:
+            self.orders.append(self.new_entry_after_cancel)
+            self.new_entry_after_cancel = None
+        if order_id == self.fill_entry_on_cancel:
+            self.position = _management_position()
+        if order_id == self.cancel_error_on:
+            raise ValueError("order_not_found after concurrent fill")
+        return {"order_id": order_id, "order_state": "cancelled"}
+
+    async def close_position(self, instrument, order_type="market", price=None):
+        self.events.append(("close", instrument))
+        self.close_calls.append((instrument, order_type, price))
+        if self.close_to_flat:
+            self.position = _management_position(size=0.0)
+        return {
+            "order": {
+                "order_id": "close-1",
+                "instrument_name": instrument,
+                "order_state": "filled" if self.close_to_flat else "open",
+            },
+            "trades": [],
+        }
+
+    async def get_order_state(self, order_id):
+        self.events.append(("get_order_state", order_id))
+        if self.close_order_state_error is not None:
+            raise self.close_order_state_error
+        return {"order_id": order_id, "order_state": self.close_order_state}
+
+    async def place_oco(self, **kwargs):
+        self.events.append(("place_oco", kwargs["label"]))
+        self.place_oco_calls.append(kwargs)
+        oco_ref = "oco-new" if self.oco_response_with_slot_ref else None
+        new_orders = [
+            _management_order(
+                "new-sl",
+                kwargs["primary_type"],
+                direction=kwargs["side"],
+                amount=kwargs["amount"],
+                trigger_price=kwargs["primary_trigger_price"],
+                trigger_offset=kwargs["primary_trigger_offset"],
+                oco_ref=oco_ref,
+            ),
+            _management_order(
+                "new-tp",
+                kwargs["secondary_type"],
+                direction=kwargs["side"],
+                amount=kwargs["amount"],
+                trigger_price=kwargs["secondary_trigger_price"],
+                oco_ref=oco_ref,
+                primary_order_id=("new-sl" if self.oco_response_with_slot_ref else None),
+            ),
+        ]
+        if self.verify_new_oco:
+            self.orders.extend(new_orders[:1] if self.omit_new_tp_after_oco else new_orders)
+        if self.flat_immediately_after_oco:
+            self.position = _management_position(size=0.0)
+        if self.oco_response_with_slot_ref:
+            primary = dict(new_orders[0])
+            primary["oto_order_ids"] = ["OTO-slot-secondary"]
+            return {"order": primary, "trades": []}
+        return {"orders": [dict(order) for order in new_orders], "trades": []}
+
+
+def _enable_management_trading(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 100_000_000)
+
+
+def _management_context(rest):
+    return SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+
+def _management_scope(tool_name, decision_id="decision-1", *, variant=False):
+    params = {
+        "move_stop": {"new_trigger": 79_600.0 if variant else 79_500.0},
+        "move_stop_to_breakeven": {"offset": 20.0 if variant else 10.0},
+        "trail_stop": {"distance": 350.0 if variant else 400.0},
+        "cancel_pending_setup": {},
+        "close_position_and_cancel_protection": {
+            "order_type": "limit" if variant else "market",
+            "price": 80_000.0 if variant else None,
+        },
+        "replace_bracket": {
+            "tp_trigger_price": 86_500.0 if variant else 86_000.0,
+            "trigger_source": "mark_price",
+            "sl_type": "stop_market",
+            "sl_trigger_price": 79_500.0,
+            "sl_trigger_offset": None,
+            "sl_limit_price": None,
+            "tp_type": "take_market",
+        },
+    }[tool_name]
+    return server_module._management_idempotency_scope(tool_name, decision_id, **params)
+
+
+async def _invoke_cached_management_tool(
+    tool_name,
+    app_ctx,
+    client_order_id,
+    *,
+    decision_id="decision-1",
+    variant=False,
+):
+    if tool_name == "move_stop":
+        return await _move_stop_impl(
+            app_ctx,
+            decision_id=decision_id,
+            new_trigger=79_600 if variant else 79_500,
+            client_order_id=client_order_id,
+        )
+    if tool_name == "move_stop_to_breakeven":
+        return await _move_stop_to_breakeven_impl(
+            app_ctx,
+            decision_id=decision_id,
+            offset=20 if variant else 10,
+            client_order_id=client_order_id,
+        )
+    if tool_name == "trail_stop":
+        return await _trail_stop_impl(
+            app_ctx,
+            decision_id=decision_id,
+            distance=350 if variant else 400,
+            client_order_id=client_order_id,
+        )
+    if tool_name == "cancel_pending_setup":
+        return await _cancel_pending_setup_impl(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+        )
+    if tool_name == "close_position_and_cancel_protection":
+        return await _close_position_and_cancel_protection_impl(
+            app_ctx,
+            decision_id=decision_id,
+            order_type="limit" if variant else "market",
+            price=80_000 if variant else None,
+            client_order_id=client_order_id,
+        )
+    return await _replace_bracket_impl(
+        app_ctx,
+        decision_id=decision_id,
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_500 if variant else 86_000,
+        client_order_id=client_order_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "move_stop",
+        "move_stop_to_breakeven",
+        "trail_stop",
+        "cancel_pending_setup",
+        "close_position_and_cancel_protection",
+        "replace_bracket",
+    ],
+)
+async def test_management_idempotency_exact_retry_is_scoped_for_every_tool(
+    monkeypatch,
+    tool_name,
+):
+    _enable_management_trading(monkeypatch)
+    repo = FakeIdempotencyRepo()
+    client_order_id = f"scoped-{tool_name}"
+    repo.cache[client_order_id] = {
+        "_idempotency_scope": _management_scope(tool_name),
+        "status": "done",
+        "marker": tool_name,
+    }
+    app_ctx = SimpleNamespace(idempotency_repo=repo)
+
+    response = await _invoke_cached_management_tool(tool_name, app_ctx, client_order_id)
+
+    assert response == {"status": "done", "marker": tool_name}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "move_stop",
+        "move_stop_to_breakeven",
+        "trail_stop",
+        "close_position_and_cancel_protection",
+        "replace_bracket",
+    ],
+)
+async def test_management_idempotency_rejects_changed_params_without_poisoning_retry(
+    monkeypatch,
+    tool_name,
+):
+    _enable_management_trading(monkeypatch)
+    repo = FakeIdempotencyRepo()
+    client_order_id = f"param-scope-{tool_name}"
+    repo.cache[client_order_id] = {
+        "_idempotency_scope": _management_scope(tool_name),
+        "status": "done",
+    }
+    app_ctx = SimpleNamespace(idempotency_repo=repo)
+
+    with pytest.raises(ValueError, match="different or legacy unscoped request"):
+        await _invoke_cached_management_tool(
+            tool_name,
+            app_ctx,
+            client_order_id,
+            variant=True,
+        )
+
+    assert await _invoke_cached_management_tool(tool_name, app_ctx, client_order_id) == {
+        "status": "done"
+    }
+
+
+@pytest.mark.asyncio
+async def test_management_idempotency_rejects_cross_tool_cross_decision_and_plain_cache(
+    monkeypatch,
+):
+    _enable_management_trading(monkeypatch)
+    repo = FakeIdempotencyRepo()
+    repo.cache["cross-tool"] = {
+        "_idempotency_scope": _management_scope("move_stop"),
+        "status": "done",
+    }
+    repo.cache["cross-decision"] = {
+        "_idempotency_scope": _management_scope("cancel_pending_setup"),
+        "status": "done",
+    }
+    repo.cache["plain"] = {"status": "legacy"}
+    app_ctx = SimpleNamespace(idempotency_repo=repo)
+
+    with pytest.raises(ValueError, match="different or legacy unscoped request"):
+        await _invoke_cached_management_tool("trail_stop", app_ctx, "cross-tool")
+    with pytest.raises(ValueError, match="different or legacy unscoped request"):
+        await _invoke_cached_management_tool(
+            "cancel_pending_setup",
+            app_ctx,
+            "cross-decision",
+            decision_id="decision-2",
+        )
+    with pytest.raises(ValueError, match="different or legacy unscoped request"):
+        await _invoke_cached_management_tool("move_stop", app_ctx, "plain")
+
+    assert await _invoke_cached_management_tool("move_stop", app_ctx, "cross-tool") == {
+        "status": "done"
+    }
+
+
+@pytest.mark.asyncio
+async def test_verify_protection_and_move_stop_select_sl_not_tp(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    # TP deliberately precedes SL to prove selection is semantic, not positional.
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+        ],
+    )
+    app_ctx = _management_context(rest)
+
+    before = await _verify_protection_impl(app_ctx, decision_id="decision-1")
+    response = await _move_stop_impl(
+        app_ctx,
+        decision_id="decision-1",
+        new_trigger=79_500,
+        client_order_id="move-1",
+    )
+
+    assert before["status"] == "protected"
+    assert [(order["order_id"], order["role"]) for order in before["orders"]] == [
+        ("tp-1", "tp"),
+        ("sl-1", "sl"),
+    ]
+    assert response["changed"] is True
+    assert rest.edit_calls == [
+        ("sl-1", {"amount": 100.0, "trigger_price": 79_500.0, "reduce_only": True})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_verify_protection_treats_empty_exchange_position_as_flat(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(position={}, orders=[])
+
+    response = await _verify_protection_impl(_management_context(rest), decision_id="decision-1")
+
+    assert response["status"] == "flat"
+    assert response["required_amount"] == 0.0
+    assert response["protected"] is True
+
+
+@pytest.mark.asyncio
+async def test_trail_stop_rejects_orphan_order_while_position_is_flat(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0.0),
+        orders=[_management_order("sl-1", "trailing_stop", trigger_offset=500)],
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="requires an open position"):
+        await _trail_stop_impl(
+            _management_context(rest),
+            decision_id="decision-1",
+            distance=400,
+            client_order_id="flat-trail",
+        )
+
+    assert rest.edit_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("direction", "exit_direction", "current_trigger", "worse_trigger"),
+    [
+        ("buy", "sell", 79_000.0, 78_500.0),
+        ("sell", "buy", 83_000.0, 83_500.0),
+    ],
+)
+async def test_move_stop_rejects_worse_long_and_short_protection(
+    monkeypatch,
+    direction,
+    exit_direction,
+    current_trigger,
+    worse_trigger,
+):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(direction),
+        orders=[
+            _management_order(
+                "sl-1",
+                "stop_market",
+                direction=exit_direction,
+                trigger_price=current_trigger,
+            )
+        ],
+    )
+    app_ctx = _management_context(rest)
+
+    with pytest.raises(trading.TradingValidationError, match="would worsen"):
+        await _move_stop_impl(
+            app_ctx,
+            decision_id="decision-1",
+            new_trigger=worse_trigger,
+            client_order_id=f"worse-{direction}",
+        )
+
+    assert rest.edit_calls == []
+    assert app_ctx.decision_repo.outcomes == []
+
+
+@pytest.mark.asyncio
+async def test_move_stop_to_breakeven_is_noop_when_stop_is_already_better(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(average_price=80_000),
+        orders=[_management_order("sl-1", "stop_market", trigger_price=80_250)],
+    )
+    app_ctx = _management_context(rest)
+
+    response = await _move_stop_to_breakeven_impl(
+        app_ctx,
+        decision_id="decision-1",
+        offset=0,
+        client_order_id="be-1",
+    )
+
+    assert response["changed"] is False
+    assert response["before"]["trigger_price"] == 80_250
+    assert response["after"]["trigger_price"] == 80_250
+    assert rest.edit_calls == []
+    assert app_ctx.order_audit_repo.records[0]["tool_name"] == "move_stop_to_breakeven"
+    assert app_ctx.decision_repo.outcomes == []
+
+
+@pytest.mark.asyncio
+async def test_trail_stop_rejects_widening_and_fixed_stop_conversion(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    trailing_rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[_management_order("sl-1", "trailing_stop", trigger_offset=500)],
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="would worsen"):
+        await _trail_stop_impl(
+            _management_context(trailing_rest),
+            decision_id="decision-1",
+            distance=600,
+            client_order_id="trail-wide",
+        )
+
+    fixed_rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[_management_order("sl-2", "stop_market", trigger_price=79_000)],
+    )
+    with pytest.raises(trading.TradingValidationError, match="use replace_bracket"):
+        await _trail_stop_impl(
+            _management_context(fixed_rest),
+            decision_id="decision-1",
+            distance=400,
+            client_order_id="trail-fixed",
+        )
+
+    assert trailing_rest.edit_calls == []
+    assert fixed_rest.edit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_setup_retains_children_when_entry_fills_during_cancel(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0.0),
+        orders=[
+            _management_order(
+                "entry-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order(
+                "sl-child",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+            ),
+            _management_order(
+                "tp-child",
+                "take_market",
+                trigger_price=85_000,
+                is_secondary_oto=True,
+            ),
+        ],
+        fill_entry_on_cancel="entry-1",
+        cancel_error_on="entry-1",
+    )
+    app_ctx = _management_context(rest)
+
+    response = await _cancel_pending_setup_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="cancel-race",
+    )
+
+    assert response["status"] == "position_opened_during_cancel"
+    assert response["race_detected"] is True
+    assert response["protection_retained"] is True
+    assert response["protection"]["status"] == "protected"
+    assert rest.cancel_calls == ["entry-1"]
+    assert {order["order_id"] for order in rest.orders} == {"sl-child", "tp-child"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_setup_detects_new_flat_entry_before_child_cleanup(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0.0),
+        orders=[
+            _management_order(
+                "entry-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order(
+                "sl-child",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+            ),
+            _management_order(
+                "tp-child",
+                "take_market",
+                trigger_price=85_000,
+                is_secondary_oto=True,
+            ),
+        ],
+        new_entry_after_cancel=_management_order(
+            "entry-2",
+            "limit",
+            direction="buy",
+            reduce_only=False,
+            order_state="open",
+        ),
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _cancel_pending_setup_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="cancel-new-entry-race",
+    )
+
+    assert first["status"] == "new_entry_detected"
+    assert first["cleanup_needed"] is True
+    assert first["new_entry_order_ids"] == ["entry-2"]
+    assert rest.cancel_calls == ["entry-1"]
+    assert {order["order_id"] for order in rest.orders} == {
+        "entry-2",
+        "sl-child",
+        "tp-child",
+    }
+
+    second = await _cancel_pending_setup_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="cancel-new-entry-race",
+    )
+
+    assert second["status"] == "cancelled"
+    assert second["cleanup_needed"] is False
+    assert set(second["cancelled_order_ids"]) == {
+        "entry-1",
+        "entry-2",
+        "sl-child",
+        "tp-child",
+    }
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_close_not_flat_retains_all_protection(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+    )
+    app_ctx = _management_context(rest)
+
+    response = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-1",
+    )
+
+    assert response["status"] == "closing"
+    assert response["position_closed"] is False
+    assert response["protection_retained"] is True
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.cancel_calls == []
+    assert {order["order_id"] for order in rest.orders} == {"sl-1", "tp-1"}
+
+
+@pytest.mark.asyncio
+async def test_close_cap_rejection_happens_before_active_entry_cancel(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order(
+                "scale-in-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+    )
+
+    async def reject_close(_app_ctx, _instrument):
+        raise trading.TradingValidationError("position exceeds configured close cap")
+
+    monkeypatch.setattr(server_module, "enforce_close_position_limit", reject_close)
+
+    with pytest.raises(trading.TradingValidationError, match="exceeds configured close cap"):
+        await _close_position_and_cancel_protection_impl(
+            _management_context(rest),
+            decision_id="decision-1",
+            client_order_id="close-cap-reject",
+        )
+
+    assert rest.cancel_calls == []
+    assert rest.close_calls == []
+    assert {order["order_id"] for order in rest.orders} == {"scale-in-1", "sl-1", "tp-1"}
+
+
+@pytest.mark.asyncio
+async def test_close_reports_post_cancel_fill_that_exceeds_cap(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0.0),
+        orders=[
+            _management_order(
+                "entry-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order(
+                "sl-child",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+            ),
+            _management_order(
+                "tp-child",
+                "take_market",
+                trigger_price=85_000,
+                is_secondary_oto=True,
+            ),
+        ],
+        fill_entry_on_cancel="entry-1",
+    )
+
+    async def reject_close(_app_ctx, _instrument):
+        raise trading.TradingValidationError("filled position exceeds close cap")
+
+    monkeypatch.setattr(server_module, "enforce_close_position_limit", reject_close)
+
+    response = await _close_position_and_cancel_protection_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        client_order_id="close-fill-cap",
+    )
+
+    assert response["status"] == "close_blocked_after_entry_cancel"
+    assert response["cancelled_entry_order_ids"] == ["entry-1"]
+    assert response["protection"]["status"] == "protected"
+    assert rest.close_calls == []
+    assert {order["order_id"] for order in rest.orders} == {"sl-child", "tp-child"}
+
+
+@pytest.mark.asyncio
+async def test_close_retry_reconciles_flat_without_duplicate_close(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-reconcile",
+    )
+    rest.position = _management_position(size=0.0)
+    second = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-reconcile",
+    )
+
+    assert first["status"] == "closing"
+    assert second["status"] == "closed"
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert set(second["cancelled_order_ids"]) == {"sl-1", "tp-1"}
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("order_state", "expected_status"),
+    [("cancelled", "close_cancelled"), ("rejected", "close_rejected")],
+)
+async def test_close_retry_surfaces_terminal_close_order_state_without_reissue(
+    monkeypatch,
+    order_state,
+    expected_status,
+):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+        close_order_state=order_state,
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id=f"close-{order_state}",
+    )
+    second = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id=f"close-{order_state}",
+    )
+
+    assert first["status"] == "closing"
+    assert second["status"] == expected_status
+    assert second["close_order_state"] == order_state
+    assert second["position_closed"] is False
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert ("get_order_state", "close-1") in rest.events
+    assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_close_retry_surfaces_missing_close_order_without_reissue(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+        close_order_state_error=ValueError("order_not_found"),
+    )
+    app_ctx = _management_context(rest)
+
+    await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-missing",
+    )
+    response = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-missing",
+    )
+
+    assert response["status"] == "close_order_missing"
+    assert response["close_order_state"] == "missing"
+    assert "order_not_found" in response["close_order_state_error"]
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_close_retry_rechecks_unknown_order_state_without_reissue(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+        close_order_state_error=RuntimeError("temporary network failure"),
+    )
+    app_ctx = _management_context(rest)
+
+    await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-state-unknown",
+    )
+    unknown = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-state-unknown",
+    )
+    rest.close_order_state_error = None
+    rest.close_order_state = "cancelled"
+    terminal = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-state-unknown",
+    )
+
+    assert unknown["status"] == "close_order_state_unknown"
+    assert "temporary network failure" in unknown["close_order_state_error"]
+    assert terminal["status"] == "close_cancelled"
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.events.count(("get_order_state", "close-1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_close_cleanup_retry_preserves_progress_without_duplicate_close(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=True,
+        cancel_failures={"sl-1": 1},
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-cleanup-retry",
+    )
+    second = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-cleanup-retry",
+    )
+
+    assert first["status"] == "closed_cleanup_needed"
+    assert first["cancelled_order_ids"] == ["tp-1"]
+    assert second["status"] == "closed"
+    assert set(second["cancelled_order_ids"]) == {"sl-1", "tp-1"}
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_close_cleanup_retry_reports_live_reopened_position(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=True,
+        cancel_failures={"sl-1": 1},
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-reopened-cleanup",
+    )
+    rest.position = _management_position()
+    second = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-reopened-cleanup",
+    )
+
+    assert first["status"] == "closed_cleanup_needed"
+    assert second["status"] == "position_reopened"
+    assert second["position_closed"] is False
+    assert second["protection_retained"] is True
+    assert second["protection"]["status"] == "protected"
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.cancel_calls == ["sl-1", "tp-1"]
+
+
+@pytest.mark.asyncio
+async def test_close_filled_order_with_live_position_reports_reopened(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=False,
+        close_order_state="filled",
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-filled-reopened",
+    )
+    second = await _close_position_and_cancel_protection_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="close-filled-reopened",
+    )
+
+    assert first["status"] == "closing"
+    assert second["status"] == "position_reopened"
+    assert second["position_closed"] is False
+    assert second["close_order_state"] == "filled"
+    assert rest.close_calls == [("BTC-PERPETUAL", "market", None)]
+    assert rest.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_close_flat_cancels_all_captured_protection(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=True,
+    )
+
+    response = await _close_position_and_cancel_protection_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        client_order_id="close-flat",
+    )
+
+    assert response["status"] == "closed"
+    assert response["position_closed"] is True
+    assert response["cleanup_needed"] is False
+    assert set(response["cancelled_order_ids"]) == {"sl-1", "tp-1"}
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_close_flat_cancels_active_entry_before_dormant_children(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0.0),
+        orders=[
+            _management_order(
+                "entry-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order(
+                "sl-child",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+            ),
+            _management_order(
+                "tp-child",
+                "take_market",
+                trigger_price=85_000,
+                is_secondary_oto=True,
+            ),
+        ],
+    )
+
+    response = await _close_position_and_cancel_protection_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        client_order_id="close-flat-entry",
+    )
+
+    assert response["status"] == "closed"
+    assert response["cancelled_entry_order_ids"] == ["entry-1"]
+    assert set(response["cancelled_order_ids"]) == {"sl-child", "tp-child"}
+    assert rest.close_calls == []
+    assert rest.cancel_calls[0] == "entry-1"
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_close_open_position_cancels_scale_in_before_close(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order(
+                "scale-in-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order("sl-1", "stop_market", trigger_price=79_000),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+        close_to_flat=True,
+    )
+
+    response = await _close_position_and_cancel_protection_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        client_order_id="close-scale-in",
+    )
+
+    cancel_entry_index = rest.events.index(("cancel", "scale-in-1"))
+    close_index = rest.events.index(("close", "BTC-PERPETUAL"))
+    assert cancel_entry_index < close_index
+    assert response["status"] == "closed"
+    assert response["cancelled_entry_order_ids"] == ["scale-in-1"]
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_verifies_new_coverage_before_old_cancel(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=True,
+    )
+    app_ctx = _management_context(rest)
+
+    response = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-1",
+    )
+
+    place_index = next(i for i, event in enumerate(rest.events) if event[0] == "place_oco")
+    verify_index = next(
+        i
+        for i, event in enumerate(rest.events[place_index + 1 :], place_index + 1)
+        if event[0] == "read_orders"
+    )
+    cancel_index = next(i for i, event in enumerate(rest.events) if event[0] == "cancel")
+    assert place_index < verify_index < cancel_index
+    assert response["status"] == "replaced"
+    assert response["protection_gap"] is False
+    assert response["exchange_atomic"] is False
+    assert set(response["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert set(response["new_order_ids"]) == {"new-sl", "new-tp"}
+    assert response["protection"]["status"] == "protected"
+    assert {order["order_id"] for order in rest.orders} == {"new-sl", "new-tp"}
+
+
+@pytest.mark.asyncio
+async def test_replace_resolves_operative_oco_pair_instead_of_returned_slot_ref(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=True,
+        oco_response_with_slot_ref=True,
+    )
+
+    response = await _replace_bracket_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-slot-ref",
+    )
+
+    assert response["status"] == "replaced"
+    assert response["expected_new_order_ids"] == ["new-sl", "new-tp"]
+    assert "OTO-slot-secondary" not in response["expected_new_order_ids"]
+    assert response["oco_response_identity_hints"] == {
+        "explicit_order_ids": [],
+        "primary_order_id": "new-sl",
+        "oto_refs": ["OTO-slot-secondary"],
+    }
+    assert set(response["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert {order["order_id"] for order in rest.orders} == {"new-sl", "new-tp"}
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_keeps_old_orders_when_new_coverage_is_unverified(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=False,
+    )
+    app_ctx = _management_context(rest)
+
+    response = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-unverified",
+    )
+
+    assert response["status"] == "new_protection_unverified"
+    assert response["protection_gap"] is False
+    assert response["exchange_atomic"] is False
+    assert response["old_order_ids_cancelled"] == []
+    assert response["cleanup_needed"] is True
+    assert rest.cancel_calls == []
+    assert {order["order_id"] for order in rest.orders} == {"old-sl", "old-tp"}
+
+
+@pytest.mark.asyncio
+async def test_replace_retry_reconciles_delayed_oco_without_duplicate_placement(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=False,
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-reconcile",
+    )
+    rest.orders.extend(
+        [
+            _management_order("new-sl", "stop_market", trigger_price=79_500),
+            _management_order("new-tp", "take_market", trigger_price=86_000),
+        ]
+    )
+    second = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-reconcile",
+    )
+
+    assert first["status"] == "new_protection_unverified"
+    assert first["old_order_ids"] == ["old-sl", "old-tp"]
+    assert second["status"] == "replaced"
+    assert len(rest.place_oco_calls) == 1
+    assert set(second["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert {order["order_id"] for order in rest.orders} == {"new-sl", "new-tp"}
+
+
+@pytest.mark.asyncio
+async def test_replace_retry_ignores_unrelated_full_coverage_when_expected_ids_are_absent(
+    monkeypatch,
+):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=False,
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-unrelated",
+    )
+    rest.orders.extend(
+        [
+            _management_order("unrelated-sl", "stop_market", trigger_price=79_600),
+            _management_order("unrelated-tp", "take_market", trigger_price=86_100),
+        ]
+    )
+    second = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-unrelated",
+    )
+
+    assert first["expected_new_order_ids"] == ["new-sl", "new-tp"]
+    assert second["status"] == "new_protection_unverified"
+    assert second["expected_new_order_ids"] == ["new-sl", "new-tp"]
+    assert second["verified_new_order_ids"] == []
+    assert second["old_order_ids_cancelled"] == []
+    assert rest.cancel_calls == []
+    assert {order["order_id"] for order in rest.orders} == {
+        "old-sl",
+        "old-tp",
+        "unrelated-sl",
+        "unrelated-tp",
+    }
+
+
+@pytest.mark.asyncio
+async def test_replace_cleanup_retry_preserves_cancelled_ids_without_duplicate_oco(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=True,
+        cancel_failures={"old-sl": 1},
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-cleanup-retry",
+    )
+    second = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-cleanup-retry",
+    )
+
+    assert first["status"] == "protected_cleanup_needed"
+    assert first["old_order_ids_cancelled"] == ["old-tp"]
+    assert second["status"] == "replaced"
+    assert set(second["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert len(rest.place_oco_calls) == 1
+    assert {order["order_id"] for order in rest.orders} == {"new-sl", "new-tp"}
+
+
+@pytest.mark.asyncio
+async def test_replace_retry_cleans_old_protection_once_position_is_flat(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=False,
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-flat-delayed",
+    )
+    rest.position = _management_position(size=0.0)
+    second = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-flat-delayed",
+    )
+    assert first["status"] == "new_protection_unverified"
+    assert second["status"] == "position_closed_during_replace"
+    assert second["protection"]["status"] == "flat"
+    assert rest.place_oco_calls and len(rest.place_oco_calls) == 1
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_cleans_new_oco_if_old_tp_closes_position(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        flat_after_new_oco_verification=True,
+    )
+
+    response = await _replace_bracket_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-flat-race",
+    )
+
+    assert response["status"] == "position_closed_during_replace"
+    assert response["cleanup_needed"] is False
+    assert set(response["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert set(response["new_order_ids_cancelled"]) == {"new-sl", "new-tp"}
+    assert response["protection"]["status"] == "flat"
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_replace_cleans_orphans_when_new_stop_immediately_closes_position(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        verify_new_oco=True,
+        flat_immediately_after_oco=True,
+        omit_new_tp_after_oco=True,
+    )
+
+    response = await _replace_bracket_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-immediate-stop",
+    )
+
+    assert response["status"] == "position_closed_during_replace"
+    assert response["replacement_verified_once"] is False
+    assert response["cleanup_needed"] is False
+    assert set(response["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert response["new_order_ids_cancelled"] == ["new-sl"]
+    assert response["protection"]["status"] == "flat"
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_replace_flat_cleanup_retry_does_not_require_cancelled_new_coverage(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        flat_after_new_oco_verification=True,
+        cancel_failures={"old-sl": 1},
+    )
+    app_ctx = _management_context(rest)
+
+    first = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-flat-cleanup-retry",
+    )
+    second = await _replace_bracket_impl(
+        app_ctx,
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-flat-cleanup-retry",
+    )
+
+    assert first["status"] == "position_closed_cleanup_needed"
+    assert first["replacement_verified_once"] is True
+    assert second["status"] == "position_closed_during_replace"
+    assert second["cleanup_needed"] is False
+    assert set(second["old_order_ids_cancelled"]) == {"old-sl", "old-tp"}
+    assert set(second["new_order_ids_cancelled"]) == {"new-sl", "new-tp"}
+    assert len(rest.place_oco_calls) == 1
+    assert rest.orders == []
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_retains_old_protection_if_position_size_grows(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=100),
+        orders=[
+            _management_order("old-sl", "stop_market", amount=100, trigger_price=79_000),
+            _management_order("old-tp", "take_market", amount=100, trigger_price=85_000),
+        ],
+        position_size_after_new_oco_verification=150,
+    )
+
+    response = await _replace_bracket_impl(
+        _management_context(rest),
+        decision_id="decision-1",
+        sl_trigger_price=79_500,
+        tp_trigger_price=86_000,
+        client_order_id="replace-size-race",
+    )
+
+    assert response["status"] == "protected_cleanup_needed"
+    assert response["cleanup_needed"] is True
+    assert response["old_order_ids_cancelled"] == []
+    assert rest.cancel_calls == []
+    assert response["protection"]["required_amount"] == 150
+    assert response["protection"]["status"] == "protected"
+    assert {order["order_id"] for order in rest.orders} == {
+        "old-sl",
+        "old-tp",
+        "new-sl",
+        "new-tp",
+    }
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_rejects_take_profit_already_past_market(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+        mark_price=81_000,
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="must stay above current price"):
+        await _replace_bracket_impl(
+            _management_context(rest),
+            decision_id="decision-1",
+            sl_trigger_price=79_500,
+            tp_trigger_price=80_500,
+            client_order_id="past-tp",
+        )
+
+    assert rest.place_oco_calls == []
+
+
+@pytest.mark.asyncio
+async def test_verify_protection_rejects_misaligned_stop_limit(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order(
+                "bad-sl",
+                "stop_limit",
+                trigger_price=79_500,
+                price=80_000,
+            ),
+            _management_order("tp-1", "take_market", trigger_price=85_000),
+        ],
+    )
+
+    response = await _verify_protection_impl(_management_context(rest), decision_id="decision-1")
+
+    assert response["status"] == "unprotected"
+    assert response["active_stop_coverage"] == 0
+    assert response["orders"][0]["valid_protection"] is False
+    assert "at or below" in response["issues"][0]
+
+
+@pytest.mark.asyncio
+async def test_replace_bracket_rejects_misaligned_stop_limit(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order("old-sl", "stop_market", trigger_price=79_000),
+            _management_order("old-tp", "take_market", trigger_price=85_000),
+        ],
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="at or below"):
+        await _replace_bracket_impl(
+            _management_context(rest),
+            decision_id="decision-1",
+            sl_type="stop_limit",
+            sl_trigger_price=79_500,
+            sl_limit_price=80_000,
+            tp_trigger_price=86_000,
+            client_order_id="replace-bad-stop-limit",
+        )
+
+    assert rest.place_oco_calls == []
+
+
+class FakeTradingStateBuilder:
+    def __init__(self):
+        self.capture_calls = []
+        self.observations = []
+
+    async def capture(self, **kwargs):
+        self.capture_calls.append(kwargs)
+        return {"captured_at": "2026-07-17T14:00:00+00:00", "scope": kwargs}
+
+    def observe_ticker(self, instrument, ticker):
+        self.observations.append((instrument, ticker))
+
+
+class FakeAlertToolManager:
+    def __init__(self):
+        self.time_calls = []
+        self.price_calls = []
+
+    async def add_time_alert(self, **kwargs):
+        self.time_calls.append(kwargs)
+        return SimpleNamespace(
+            instrument=(kwargs.get("instrument") or "").upper(),
+            to_dict=lambda: {"instrument": (kwargs.get("instrument") or "").upper()},
+        )
+
+    async def add_alert(self, **kwargs):
+        self.price_calls.append(kwargs)
+        return SimpleNamespace(
+            instrument=kwargs["instrument"].upper(),
+            to_dict=lambda: {"instrument": kwargs["instrument"].upper()},
+        )
+
+    async def process_price_update(self, instrument, price):
+        return None
+
+
+class FakeAlertWs:
+    def __init__(self):
+        self.price_update_callback = lambda instrument, ticker: None
+        self.subscriptions = []
+
+    async def subscribe_ticker(self, instrument, callback):
+        self.subscriptions.append((instrument, callback))
+
+    async def get_ticker(self, instrument):
+        return {"instrument_name": instrument, "mark_price": 80_000, "open_interest": 10}
+
+
+def _tool_context(app_ctx):
+    return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app_ctx))
+
+
+@pytest.mark.asyncio
+async def test_get_trading_state_tool_delegates_one_bounded_capture():
+    builder = FakeTradingStateBuilder()
+    app_ctx = SimpleNamespace(trading_state_builder=builder)
+    tools = await server_module.build_mcp(lifespan=None).get_tools()
+
+    response = json.loads(
+        await tools["get_trading_state"].fn(
+            instrument="BTC-PERPETUAL",
+            decision_id="decision-1",
+            currency="BTC",
+            include_day_pnl=False,
+            ctx=_tool_context(app_ctx),
+        )
+    )
+
+    assert builder.capture_calls == [
+        {
+            "instrument": "BTC-PERPETUAL",
+            "decision_id": "decision-1",
+            "currency": "BTC",
+            "include_day_pnl": False,
+        }
+    ]
+    assert response["scope"]["decision_id"] == "decision-1"
+
+
+@pytest.mark.asyncio
+async def test_time_alert_infers_decision_instrument_and_starts_ticker_sampling():
+    builder = FakeTradingStateBuilder()
+    alerts = FakeAlertToolManager()
+    ws = FakeAlertWs()
+    scheduler = SimpleNamespace(wake=lambda: None)
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(
+            known_ids={"decision-1"},
+            instruments={"decision-1": "BTC-PERPETUAL"},
+        ),
+        alert_manager=alerts,
+        ws_client=ws,
+        trading_state_builder=builder,
+        price_cache={},
+        scheduler=scheduler,
+    )
+    tools = await server_module.build_mcp(lifespan=None).get_tools()
+
+    response = json.loads(
+        await tools["set_time_alert"].fn(
+            message="review",
+            delay_seconds=60,
+            decision_id="decision-1",
+            ctx=_tool_context(app_ctx),
+        )
+    )
+
+    assert alerts.time_calls[0]["instrument"] == "BTC-PERPETUAL"
+    assert alerts.time_calls[0]["decision_id"] == "decision-1"
+    assert response["alert"]["instrument"] == "BTC-PERPETUAL"
+    assert ws.subscriptions[0][0] == "BTC-PERPETUAL"
+    assert builder.observations[0][0] == "BTC-PERPETUAL"
+
+
+@pytest.mark.asyncio
+async def test_price_alert_rejects_instrument_conflicting_with_decision():
+    alerts = FakeAlertToolManager()
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(
+            known_ids={"decision-1"},
+            instruments={"decision-1": "ETH-PERPETUAL"},
+        ),
+        alert_manager=alerts,
+    )
+    tools = await server_module.build_mcp(lifespan=None).get_tools()
+
+    with pytest.raises(ValueError, match="conflicts with decision"):
+        await tools["set_price_alert"].fn(
+            instrument="BTC-PERPETUAL",
+            condition="above",
+            threshold=90_000,
+            decision_id="decision-1",
+            ctx=_tool_context(app_ctx),
+        )
+
+    assert alerts.price_calls == []

@@ -189,8 +189,8 @@ curl -s -X POST http://<host>:8000/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -50
 ```
 
-You should see ~60 tool names including `get_current_price`, `buy`,
-`sell`, `set_price_alert`, `daily_briefings`. If you see
+You should see the full tool catalog including `get_trading_state`, `buy`,
+`sell`, `place_bracket`, `move_stop`, `replace_bracket`, and `set_price_alert`. If you see
 `unauthorized`, the shared secret header is wrong.
 
 ---

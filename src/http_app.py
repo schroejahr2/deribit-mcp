@@ -42,6 +42,15 @@ async def mcp_shared_secret_middleware(request: Request, call_next):
         supplied = request.headers.get("X-Deribit-MCP-Secret", "")
         if not secrets.compare_digest(supplied, settings.mcp_shared_secret):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if (
+        settings.mcp_http_stateless
+        and request.method == "GET"
+        and request.url.path.startswith("/mcp")
+    ):
+        # Stateless mode has no server-initiated messages; a hanging GET/SSE
+        # stream ties up the client's keep-alive connection and stalls
+        # subsequent POSTs (Claude Code bun fetch pool). 405 per MCP spec.
+        return JSONResponse({"error": "method not allowed"}, status_code=405)
     return await call_next(request)
 
 
@@ -50,6 +59,7 @@ mcp_app = mcp.http_app(
     path="/",
     transport="streamable-http",
     json_response=json_response,
+    stateless_http=settings.mcp_http_stateless,
 )
 
 

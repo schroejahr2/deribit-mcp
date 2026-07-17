@@ -80,6 +80,7 @@ class Database:
               condition TEXT NOT NULL,
               threshold REAL,
               fire_at TEXT,
+              decision_id TEXT,
               notification_channel TEXT NOT NULL,
               status TEXT NOT NULL,
               message TEXT,
@@ -145,6 +146,7 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS event_outbox (
               event_id TEXT PRIMARY KEY,
+              event_sequence INTEGER,
               created_at TEXT NOT NULL,
               type TEXT NOT NULL,
               severity TEXT NOT NULL,
@@ -163,6 +165,29 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_event_outbox_expires
               ON event_outbox(expires_at);
+
+            CREATE TABLE IF NOT EXISTS event_sequence_counter (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              value INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO event_sequence_counter (singleton, value)
+              VALUES (1, 0);
+
+            CREATE TABLE IF NOT EXISTS trading_event_state (
+              entity_key TEXT PRIMARY KEY,
+              entity_type TEXT NOT NULL,
+              decision_id TEXT,
+              instrument TEXT,
+              state_json TEXT NOT NULL,
+              last_event_sequence INTEGER,
+              updated_at TEXT NOT NULL,
+              schema_version INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trading_event_state_decision
+              ON trading_event_state(decision_id)
+              WHERE decision_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS event_consumers (
               consumer_id TEXT PRIMARY KEY,
@@ -257,7 +282,105 @@ class Database:
         await self._migrate_drop_briefings(conn)
         await self._migrate_news_add_dedupe_key(conn)
         await self._migrate_alerts_add_last_price_at(conn)
+        await self._migrate_alerts_add_decision_id(conn)
+        await self._migrate_event_outbox_sequence(conn)
         await conn.commit()
+
+    async def _migrate_event_outbox_sequence(self, conn: aiosqlite.Connection) -> None:
+        """Add a durable gap-free sequence assigned only after a successful insert.
+
+        The trigger runs as part of the same SQLite statement that inserts the
+        outbox row. ``INSERT OR IGNORE`` dedupe conflicts therefore never fire
+        the trigger and never advance the counter.
+        """
+        cursor = await conn.execute("PRAGMA table_info(event_outbox)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "event_sequence" not in columns:
+            await conn.execute("ALTER TABLE event_outbox ADD COLUMN event_sequence INTEGER")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_sequence_counter (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              value INTEGER NOT NULL
+            )
+            """)
+        await conn.execute(
+            "INSERT OR IGNORE INTO event_sequence_counter (singleton, value) VALUES (1, 0)"
+        )
+
+        cursor = await conn.execute(
+            "SELECT COALESCE(MAX(event_sequence), 0) AS value FROM event_outbox"
+        )
+        next_sequence = int((await cursor.fetchone())["value"])
+        cursor = await conn.execute("""
+            SELECT event_id
+            FROM event_outbox
+            WHERE event_sequence IS NULL
+            ORDER BY created_at, rowid
+            """)
+        for row in await cursor.fetchall():
+            next_sequence += 1
+            await conn.execute(
+                """
+                UPDATE event_outbox
+                SET event_sequence = ?,
+                    payload_json = CASE
+                      WHEN json_valid(payload_json)
+                      THEN json_set(payload_json, '$.event_sequence', ?)
+                      ELSE payload_json
+                    END
+                WHERE event_id = ?
+                """,
+                (next_sequence, next_sequence, row["event_id"]),
+            )
+
+        await conn.execute("""
+            UPDATE event_outbox
+            SET payload_json = json_set(payload_json, '$.event_sequence', event_sequence)
+            WHERE event_sequence IS NOT NULL
+              AND json_valid(payload_json)
+              AND COALESCE(json_extract(payload_json, '$.event_sequence'), -1) != event_sequence
+            """)
+        await conn.execute(
+            """
+            UPDATE event_sequence_counter
+            SET value = MAX(value, ?)
+            WHERE singleton = 1
+            """,
+            (next_sequence,),
+        )
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_event_outbox_sequence
+              ON event_outbox(event_sequence)
+              WHERE event_sequence IS NOT NULL
+            """)
+        await conn.execute("DROP TRIGGER IF EXISTS trg_event_outbox_assign_sequence")
+        await conn.execute("""
+            CREATE TRIGGER trg_event_outbox_assign_sequence
+            AFTER INSERT ON event_outbox
+            FOR EACH ROW
+            WHEN NEW.event_sequence IS NULL
+            BEGIN
+              UPDATE event_sequence_counter
+              SET value = value + 1
+              WHERE singleton = 1;
+
+              UPDATE event_outbox
+              SET event_sequence = (
+                    SELECT value FROM event_sequence_counter WHERE singleton = 1
+                  ),
+                  payload_json = CASE
+                    WHEN json_valid(payload_json)
+                    THEN json_set(
+                      payload_json,
+                      '$.event_sequence',
+                      (SELECT value FROM event_sequence_counter WHERE singleton = 1)
+                    )
+                    ELSE payload_json
+                  END
+              WHERE event_id = NEW.event_id;
+            END
+            """)
 
     async def _migrate_alerts_add_last_price_at(self, conn: aiosqlite.Connection) -> None:
         """Stamp the last price-sample arrival so operators can detect stale alerts."""
@@ -265,6 +388,17 @@ class Database:
         columns = {row["name"] for row in await cursor.fetchall()}
         if "last_price_at" not in columns:
             await conn.execute("ALTER TABLE alerts ADD COLUMN last_price_at TEXT")
+
+    async def _migrate_alerts_add_decision_id(self, conn: aiosqlite.Connection) -> None:
+        """Persist the strategy decision associated with price and time alerts."""
+        cursor = await conn.execute("PRAGMA table_info(alerts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "decision_id" not in columns:
+            await conn.execute("ALTER TABLE alerts ADD COLUMN decision_id TEXT")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_decision_id "
+            "ON alerts(decision_id) WHERE decision_id IS NOT NULL"
+        )
 
     async def _migrate_news_add_dedupe_key(self, conn: aiosqlite.Connection) -> None:
         """Add dedupe_key column + unique partial index to pre-existing news table."""
@@ -313,15 +447,16 @@ class AlertRepo:
         await conn.execute(
             """
             INSERT INTO alerts (
-              id, instrument, condition, threshold, fire_at, notification_channel,
+              id, instrument, condition, threshold, fire_at, decision_id, notification_channel,
               status, message, repeat, cooldown_seconds, created_at, triggered_at,
               last_trigger_time, last_price, last_price_at, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(id) DO UPDATE SET
               instrument=excluded.instrument,
               condition=excluded.condition,
               threshold=excluded.threshold,
               fire_at=excluded.fire_at,
+              decision_id=excluded.decision_id,
               notification_channel=excluded.notification_channel,
               status=excluded.status,
               message=excluded.message,
@@ -338,6 +473,7 @@ class AlertRepo:
                 alert.condition.value,
                 alert.threshold,
                 to_iso(alert.fire_at),
+                alert.decision_id,
                 alert.notification_channel,
                 alert.status.value,
                 alert.message,
@@ -377,6 +513,7 @@ class AlertRepo:
                 cooldown_seconds=row["cooldown_seconds"],
                 last_trigger_time=parse_iso(row["last_trigger_time"]),
                 fire_at=parse_iso(row["fire_at"]),
+                decision_id=row["decision_id"],
             )
             alert._last_price = row["last_price"]
             alert._last_price_at = parse_iso(row["last_price_at"])
@@ -423,6 +560,7 @@ class AlertRepo:
                 cooldown_seconds=row["cooldown_seconds"],
                 last_trigger_time=parse_iso(row["last_trigger_time"]),
                 fire_at=parse_iso(row["fire_at"]),
+                decision_id=row["decision_id"],
             )
             alert._last_price = row["last_price"]
             alert._last_price_at = parse_iso(row["last_price_at"])
@@ -494,6 +632,12 @@ VALID_ACTIONS = {
     "edit_order",
     "edit_order_by_label",
     "close_position",
+    "move_stop",
+    "move_stop_to_breakeven",
+    "trail_stop",
+    "cancel_pending_setup",
+    "close_position_and_cancel_protection",
+    "replace_bracket",
     "create_combo",
     "hold",
     "observe",
