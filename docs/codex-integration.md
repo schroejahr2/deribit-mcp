@@ -229,6 +229,22 @@ are strictly field-allowlisted, capped by item count and encoded size, and stay 
 snapshot-size limit. OI deltas report `warming_up` until the in-process 1/5/15-minute sample history
 exists.
 
+Before dispatch, the bridge compacts oversized application context to at most 3,800 UTF-8 bytes so
+the managed app-server cannot clip the JSON in the middle. `context_compacted=true` describes only
+that transport representation: account data is scoped to the requested currency, order rows are
+bounded, and chart blocks become explicit bounded-window summaries. It does **not** mean the
+exchange source was truncated. Source truth remains in `snapshot.truncated`, `status`, and
+`source_issues`; refresh a relevant section with `get_trading_state` only when those fields or age
+require it.
+
+If the rich compact projection still exceeds 3,800 bytes, the bridge falls back to a deterministic
+minimal projection instead of blocking the FIFO stream. It keeps trigger identifiers, typed status,
+market, position, order, protection, and bounded chart summaries where they fit, sets
+`context_minimal=true` and `refresh_required=true`, and progressively drops optional account/PnL
+detail. A final essential projection is always available, so one oversized event can never prevent
+later timer, order, or position events from being delivered. The target thread must call
+`get_trading_state` when `refresh_required=true`.
+
 The bridge ACKs an event only after app-server validates and accepts the RPC request:
 
 - `turn/start` must return a valid `turn.id`;
@@ -263,6 +279,7 @@ approval.
 | Symptom | Check |
 |---|---|
 | Deribit tools are absent | start a fresh Codex task after config/env changes; verify the Codex process inherited `MCP_SHARED_SECRET` |
+| Existing task does not see newly added tools | stop Codex, start a new Codex process, and resume the same task so MCP discovery and project instructions reload; then restart only `deribit-codex-bridge` |
 | MCP returns `401` | verify `env_http_headers` names `MCP_SHARED_SECRET`; do not paste its value into the TOML mapping |
 | Bridge cannot open the socket | run `codex app-server daemon version`; confirm bridge and TUI use the same `CODEX_HOME` and `unix://` socket |
 | `turn/steer` says no active turn or turn mismatch | let the bridge refresh state; do not ACK on the failed request |

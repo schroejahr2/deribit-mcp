@@ -396,8 +396,15 @@ class TradingStateBuilder:
         if callable(primary):
             try:
                 value = await primary(extended=False)
-                if _account_rows(value) is not None:
-                    return value
+                rows = _account_rows(value)
+                if rows is not None:
+                    if currency:
+                        return [
+                            row
+                            for row in rows
+                            if str(row.get("currency") or "").upper() == currency
+                        ]
+                    return rows
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -848,6 +855,27 @@ class TradingStateBuilder:
         data_age_ms = max(
             (metadata_row["age_ms"] for metadata_row in source_meta.values()), default=0
         )
+        statuses = {name: row["status"] for name, row in source_meta.items()}
+        if not instrument:
+            market_status = SOURCE_SKIPPED
+        else:
+            has_market_price = any(
+                _number(market_alias.get(key)) is not None
+                for key in (
+                    "mark_price",
+                    "last_price",
+                    "index_price",
+                    "best_bid_price",
+                    "best_ask_price",
+                )
+            )
+            ticker_status = statuses.get("ticker", SOURCE_FAILED)
+            if ticker_status == SOURCE_OK and has_market_price:
+                market_status = SOURCE_OK
+            elif has_market_price:
+                market_status = SOURCE_PARTIAL
+            else:
+                market_status = ticker_status
 
         return {
             "schema_version": 1,
@@ -874,7 +902,7 @@ class TradingStateBuilder:
                 "trading_day_start": _iso_ms(trading_day_start_ms),
             },
             "sources": source_meta,
-            "status": {name: row["status"] for name, row in source_meta.items()},
+            "status": {"market": market_status, **statuses},
             "account": {"summaries": account_rows},
             "positions": positions,
             "positions_total": len(raw_positions),

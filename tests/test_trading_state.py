@@ -242,6 +242,7 @@ async def test_capture_builds_compact_linear_state_with_pnl_and_protection():
     assert state["tp_status"] == "active"
     assert state["scope"]["instrument"] == instrument
     assert state["scope"]["consistent"] is True
+    assert state["status"]["market"] == "ok"
     assert set(state["status"].values()) <= {"ok", "skipped"}
     assert state["data_age_ms"] < 5_000
     assert state["sources"]["chart_60m"]["content_age_ms"] >= 3_600_000
@@ -369,9 +370,28 @@ async def test_currency_only_capture_includes_complete_day_pnl_without_market_ca
     assert state["scope"]["currency"] == "USDC"
     assert state["scope"]["instrument"] is None
     assert state["snapshot_complete"] is True
+    assert state["status"]["market"] == "skipped"
     assert state["pnl"]["trading_day"]["complete"] is True
     assert state["pnl"]["trading_day"]["net_realized"]["USDC"] == pytest.approx(10.3)
     assert "ticker" not in state["sources"]
+
+
+async def test_instrument_capture_keeps_only_scoped_account_summary():
+    class MultiCurrencyRest(CompleteRest):
+        async def get_account_summaries(self, extended=False):
+            return [
+                {"currency": "BTC", "balance": 1, "available_funds": 1},
+                {"currency": "USDC", "balance": 100, "available_funds": 90},
+            ]
+
+    state = await TradingStateBuilder(MultiCurrencyRest()).capture(
+        instrument="BTC_USDC-PERPETUAL",
+        include_day_pnl=False,
+    )
+
+    assert state["account"]["summaries"] == [
+        {"currency": "USDC", "balance": 100, "available_funds": 90}
+    ]
 
 
 async def test_user_trade_has_more_marks_pnl_and_snapshot_partial():

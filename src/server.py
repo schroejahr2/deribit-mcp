@@ -4098,7 +4098,9 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Independent Deribit sources are fetched concurrently inside a bounded capture
         window. The response exposes per-source status and age, truncation, capture
         skew, decision-grouped entry/SL/TP lifecycle, top-of-book and market structure,
-        OI changes, net PnL after fees/funding, and current stop exposure.
+        OI changes, net PnL after fees/funding, and current stop exposure. ``status.market``
+        is a derived compatibility status for the compact market view; the underlying
+        ``ticker`` and ``order_book`` source statuses remain available separately.
         """
         app_ctx = _ctx(ctx)
         return _json(

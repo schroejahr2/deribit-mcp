@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 MAX_NDJSON_LINE_BYTES = 1_000_000
 MAX_CONTEXT_STRING_CHARS = 8_000
 MAX_CONTEXT_LIST_ITEMS = 100
+# The managed Codex app-server currently clips each application-context value at
+# roughly 4 KiB and inserts a human-readable marker in the middle. Stay below that
+# boundary so the injected Deribit event remains valid, parseable JSON.
+MAX_CODEX_EVENT_CONTEXT_BYTES = 3_800
+MAX_CODEX_CONTEXT_POSITIONS = 4
+MAX_CODEX_CONTEXT_ORDERS = 6
+MAX_CODEX_CONTEXT_DECISIONS = 3
 
 
 class OutboxError(RuntimeError):
@@ -420,12 +427,7 @@ def prepare_event(raw_event: dict[str, Any]) -> PreparedEvent:
     ):
         if payload.get(key) is not None:
             public_event[key] = payload[key]
-    context_json = json.dumps(
-        public_event,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    public_event, context_json = _fit_codex_event_context(public_event, payload)
     client_message_id = f"deribit:{event_id}"
     turn_params = {
         "clientUserMessageId": client_message_id,
@@ -442,10 +444,13 @@ def prepare_event(raw_event: dict[str, Any]) -> PreparedEvent:
                 "value": (
                     "Process the Deribit event under the thread's existing strategy. The event "
                     "and trigger-time snapshot are authoritative Deribit MCP application data. "
-                    "Refresh through Deribit MCP when captured_at is older than 60 seconds, a "
-                    "relevant status is not ok, data is missing or truncated, or a mutating action "
-                    "needs newer confirmation. Preserve decision_id, confirm_live_trade, "
-                    "amount/notional caps, and all trading safety guards."
+                    "Refresh with get_trading_state through Deribit MCP when refresh_required is "
+                    "true, captured_at is older than 60 seconds, a relevant source status is not "
+                    "ok, source data is missing or source-truncated, or a mutating action needs "
+                    "newer confirmation. "
+                    "context_compacted and bounded chart windows are transport properties, not "
+                    "source failures. Preserve decision_id, confirm_live_trade, amount/notional "
+                    "caps, and all trading safety guards."
                 ),
             },
             "deribit_outbox_event": {"kind": "application", "value": context_json},
@@ -680,6 +685,911 @@ def _bounded_payload_context(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (dict, list)):
             bounded[key] = _bounded_snapshot_value(value)
     return bounded
+
+
+def _selected_fields(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in keys if key in value and value[key] is not None}
+
+
+def _compact_rows(value: Any, keys: tuple[str, ...], limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        selected for selected in (_selected_fields(row, keys) for row in value[:limit]) if selected
+    ]
+
+
+_CONTEXT_POSITION_KEYS = (
+    "instrument",
+    "direction",
+    "size",
+    "size_currency",
+    "average_price",
+    "mark_price",
+    "floating_profit_loss",
+    "floating_profit_loss_usd",
+    "estimated_liquidation_price",
+)
+_CONTEXT_ORDER_KEYS = (
+    "order_id",
+    "order_state",
+    "order_type",
+    "direction",
+    "amount",
+    "filled_amount",
+    "price",
+    "trigger",
+    "trigger_price",
+    "trigger_offset",
+    "reduce_only",
+    "label",
+)
+_CONTEXT_ACCOUNT_KEYS = (
+    "currency",
+    "balance",
+    "equity",
+    "margin_balance",
+    "available_funds",
+    "initial_margin",
+    "maintenance_margin",
+    "total_pl",
+    "session_rpl",
+    "session_upl",
+)
+
+
+def _compact_order_leg(value: Any) -> dict[str, Any]:
+    result = _selected_fields(
+        value,
+        (
+            "status",
+            "amount",
+            "filled_amount",
+            "partial",
+            "orders_total",
+            "orders_truncated",
+        ),
+    )
+    orders = value.get("orders") if isinstance(value, dict) else None
+    compact_orders = _compact_rows(orders, _CONTEXT_ORDER_KEYS, 3)
+    if compact_orders:
+        result["orders"] = compact_orders
+    return result
+
+
+def _compact_order_groups(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    groups: list[dict[str, Any]] = []
+    for raw_group in value[:MAX_CODEX_CONTEXT_DECISIONS]:
+        group = _selected_fields(
+            raw_group,
+            (
+                "decision_id",
+                "instrument",
+                "position_attribution",
+                "position_status",
+                "coverage_ratio",
+            ),
+        )
+        if isinstance(raw_group, dict):
+            for leg_name in ("entry", "sl", "tp"):
+                leg = _compact_order_leg(raw_group.get(leg_name))
+                if leg:
+                    group[leg_name] = leg
+        if group:
+            groups.append(group)
+    return groups
+
+
+def _compact_chart(value: Any, *, keep_recent: bool) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = _selected_fields(
+        value,
+        ("resolution_minutes", "count", "complete_through", "truncated"),
+    )
+    closes = [item for item in value.get("close", []) if isinstance(item, (int, float))]
+    highs = [item for item in value.get("high", []) if isinstance(item, (int, float))]
+    lows = [item for item in value.get("low", []) if isinstance(item, (int, float))]
+    volumes = [item for item in value.get("volume", []) if isinstance(item, (int, float))]
+    if closes:
+        result.update(
+            {
+                "first_close": closes[0],
+                "last_close": closes[-1],
+                "recent_close": closes[-4:] if keep_recent else closes[-2:],
+            }
+        )
+    if highs:
+        result["window_high"] = max(highs)
+    if lows:
+        result["window_low"] = min(lows)
+    if volumes:
+        result["volume_total"] = sum(volumes)
+        result["latest_volume"] = volumes[-1]
+    result["bounded_window"] = True
+    return result
+
+
+def _compact_protection(value: Any) -> dict[str, Any]:
+    result = _selected_fields(
+        value,
+        (
+            "decision_id",
+            "position_status",
+            "entry_status",
+            "sl_status",
+            "tp_status",
+            "coverage_ratio",
+            "all_protected",
+            "positions_total",
+            "positions_truncated",
+        ),
+    )
+    positions = _compact_rows(
+        value.get("positions") if isinstance(value, dict) else None,
+        (
+            "decision_id",
+            "instrument",
+            "status",
+            "position_amount",
+            "covered_amount",
+            "coverage_ratio",
+            "active_stop_order_ids",
+            "active_stop_order_ids_truncated",
+        ),
+        MAX_CODEX_CONTEXT_POSITIONS,
+    )
+    if positions:
+        result["positions"] = positions
+    return result
+
+
+def _compact_account(value: Any, currency: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    rows = value.get("summaries")
+    rows = rows if isinstance(rows, list) else []
+    normalized_currency = str(currency or "").upper()
+    scoped = [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("currency") or "").upper() == normalized_currency
+    ]
+    if not scoped:
+        scoped = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and any(
+                isinstance(row.get(key), (int, float)) and row.get(key) != 0
+                for key in ("balance", "equity", "available_funds", "margin_balance")
+            )
+        ]
+    result = {
+        "summaries": _compact_rows(scoped or rows, _CONTEXT_ACCOUNT_KEYS, 3),
+        "summaries_total": value.get("summaries_total", len(rows)),
+        "summaries_truncated": bool(value.get("summaries_truncated")),
+    }
+    return result
+
+
+def _compact_market_signals(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    tape = _selected_fields(
+        value.get("tape"),
+        (
+            "count",
+            "buy_amount",
+            "sell_amount",
+            "imbalance",
+            "direction_basis",
+            "window_start",
+            "window_end",
+            "truncated",
+        ),
+    )
+    if tape:
+        result["tape"] = tape
+    oi = _selected_fields(value.get("open_interest"), ("status", "current", "age_ms"))
+    raw_oi = value.get("open_interest")
+    if isinstance(raw_oi, dict):
+        for label in ("delta_1m", "delta_5m", "delta_15m"):
+            delta = _selected_fields(raw_oi.get(label), ("status", "value", "percent"))
+            if delta:
+                oi[label] = delta
+    if oi:
+        result["open_interest"] = oi
+    volume = value.get("volume")
+    if isinstance(volume, dict):
+        result["volume"] = {
+            label: selected
+            for label, row in volume.items()
+            if (selected := _selected_fields(row, ("status", "latest", "change", "change_percent")))
+        }
+    return result
+
+
+def _compact_pnl(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = (
+        "status",
+        "complete",
+        "truncated",
+        "attribution",
+        "funding_attribution",
+        "trade_count",
+        "realized_gross",
+        "fees",
+        "funding",
+        "net_realized",
+        "unrealized",
+    )
+    return {
+        name: compact
+        for name in ("trading_day", "decision")
+        if (compact := _selected_fields(value.get(name), keys))
+    }
+
+
+def _compact_risk(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    aggregate = _selected_fields(
+        value.get("aggregate"),
+        (
+            "open_notional_usd",
+            "open_risk_to_stops_usd",
+            "unprotected_notional_usd",
+            "realized_losses_today_usd",
+            "risk_consumed_usd",
+        ),
+    )
+    if aggregate:
+        result["aggregate"] = aggregate
+    decision = _selected_fields(
+        value.get("decision"),
+        (
+            "status",
+            "attribution",
+            "reason",
+            "notional_usd",
+            "risk_to_stop_usd",
+            "stop_exposure_attribution",
+            "stop_exposures_total",
+            "stop_exposures_truncated",
+        ),
+    )
+    if decision:
+        result["decision"] = decision
+    result["truncated"] = bool(value.get("truncated"))
+    return result
+
+
+def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
+    result = _selected_fields(
+        snapshot,
+        (
+            "schema_version",
+            "capture_id",
+            "captured_at",
+            "data_age_ms",
+            "snapshot_complete",
+            "complete",
+            "truncated",
+            "currency",
+            "decision_id",
+            "position_status",
+            "entry_status",
+            "sl_status",
+            "tp_status",
+        ),
+    )
+    scope = _selected_fields(
+        snapshot.get("scope"), ("instrument", "currency", "decision_id", "consistent")
+    )
+    if scope:
+        result["scope"] = scope
+    status = snapshot.get("status")
+    if isinstance(status, dict):
+        status = dict(status)
+        if "market" not in status:
+            raw_market = snapshot.get("market")
+            has_market_price = isinstance(raw_market, dict) and any(
+                isinstance(raw_market.get(key), (int, float))
+                for key in (
+                    "mark_price",
+                    "last_price",
+                    "index_price",
+                    "best_bid_price",
+                    "best_ask_price",
+                )
+            )
+            ticker_status = status.get("ticker")
+            if ticker_status == "ok" and has_market_price:
+                status["market"] = "ok"
+            elif has_market_price:
+                status["market"] = "partial"
+        result["status"] = status
+    sources = snapshot.get("sources")
+    if isinstance(sources, dict):
+        issues = {
+            name: issue
+            for name, row in sources.items()
+            if isinstance(row, dict)
+            and (row.get("status") not in {"ok", "skipped"} or row.get("truncated"))
+            and (issue := _selected_fields(row, ("status", "age_ms", "truncated", "reason")))
+        }
+        if issues:
+            result["source_issues"] = issues
+    account = _compact_account(snapshot.get("account"), snapshot.get("currency"))
+    if account.get("summaries"):
+        result["account"] = account
+    result["positions"] = _compact_rows(
+        snapshot.get("positions"), _CONTEXT_POSITION_KEYS, MAX_CODEX_CONTEXT_POSITIONS
+    )
+    result["positions_total"] = snapshot.get("positions_total", len(result["positions"]))
+    result["positions_truncated"] = bool(snapshot.get("positions_truncated"))
+    result["open_orders"] = _compact_rows(
+        snapshot.get("open_orders"), _CONTEXT_ORDER_KEYS, MAX_CODEX_CONTEXT_ORDERS
+    )
+    result["open_orders_total"] = snapshot.get("open_orders_total", len(result["open_orders"]))
+    result["open_orders_truncated"] = bool(snapshot.get("open_orders_truncated"))
+    groups = _compact_order_groups(snapshot.get("orders_by_decision"))
+    if groups:
+        result["orders_by_decision"] = groups
+    protection = _compact_protection(snapshot.get("protection"))
+    if protection:
+        result["protection"] = protection
+    market = _selected_fields(
+        snapshot.get("market"),
+        (
+            "instrument",
+            "timestamp",
+            "state",
+            "mark_price",
+            "last_price",
+            "index_price",
+            "best_bid_price",
+            "best_bid_amount",
+            "best_ask_price",
+            "best_ask_amount",
+            "open_interest",
+            "current_funding",
+            "funding_8h",
+        ),
+    )
+    if market:
+        result["market"] = market
+    book = _selected_fields(
+        snapshot.get("order_book"),
+        (
+            "instrument",
+            "timestamp",
+            "best_bid_price",
+            "best_bid_amount",
+            "best_ask_price",
+            "best_ask_amount",
+            "mid_price",
+            "spread",
+            "spread_bps",
+            "depth_imbalance",
+        ),
+    )
+    raw_book = snapshot.get("order_book")
+    if isinstance(raw_book, dict):
+        for side in ("bids", "asks"):
+            levels = raw_book.get(side)
+            if isinstance(levels, list):
+                book[side] = levels[:3]
+    if book:
+        result["order_book"] = book
+    raw_market_data = snapshot.get("market_data")
+    raw_market_data = raw_market_data if isinstance(raw_market_data, dict) else {}
+    raw_candles = raw_market_data.get("candles")
+    raw_candles = raw_candles if isinstance(raw_candles, dict) else {}
+    charts: dict[str, Any] = {}
+    for label in ("1m", "5m", "15m", "60m"):
+        raw_chart = snapshot.get(f"chart_{label}") or raw_candles.get(label)
+        chart = _compact_chart(raw_chart, keep_recent=label in {"1m", "5m"})
+        if chart:
+            charts[label] = chart
+    if charts:
+        result["charts"] = charts
+    signals = _compact_market_signals(raw_market_data)
+    if signals:
+        result["market_signals"] = signals
+    pnl = _compact_pnl(snapshot.get("pnl"))
+    if pnl:
+        result["pnl"] = pnl
+    risk = _compact_risk(snapshot.get("risk"))
+    if risk:
+        result["risk"] = risk
+    result["context_compacted"] = True
+    return result
+
+
+def _minimal_fields(
+    value: Any,
+    keys: tuple[str, ...],
+    *,
+    string_limit: int = 200,
+) -> dict[str, Any]:
+    """Select scalar fields while keeping the emergency projection predictably small."""
+    selected = _selected_fields(value, keys)
+    return {
+        key: item[:string_limit] if isinstance(item, str) else item
+        for key, item in selected.items()
+        if item is None or isinstance(item, (bool, int, float, str))
+    }
+
+
+def _minimal_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep decision-critical state when the richer compact snapshot still does not fit."""
+    result = _minimal_fields(
+        snapshot,
+        (
+            "captured_at",
+            "data_age_ms",
+            "snapshot_complete",
+            "truncated",
+            "currency",
+            "decision_id",
+            "position_status",
+            "entry_status",
+            "sl_status",
+            "tp_status",
+        ),
+    )
+    scope = _minimal_fields(
+        snapshot.get("scope"),
+        ("instrument", "currency", "decision_id", "consistent"),
+    )
+    if scope:
+        result["scope"] = scope
+
+    status = _minimal_fields(
+        snapshot.get("status"),
+        (
+            "market",
+            "account",
+            "positions",
+            "open_orders",
+            "order_book",
+            "ticker",
+            "tape",
+            "decision",
+            "decision_orders",
+            "chart_1m",
+            "chart_5m",
+            "chart_15m",
+            "chart_60m",
+        ),
+        string_limit=40,
+    )
+    if status:
+        result["status"] = status
+
+    account = _compact_account(snapshot.get("account"), snapshot.get("currency"))
+    summaries = account.get("summaries")
+    if isinstance(summaries, list) and summaries:
+        result["account"] = {"summaries": summaries[:1]}
+
+    result["positions"] = [
+        _minimal_fields(row, _CONTEXT_POSITION_KEYS)
+        for row in (snapshot.get("positions") or [])[:1]
+        if isinstance(row, dict)
+    ]
+    result["positions_total"] = snapshot.get("positions_total", len(result["positions"]))
+    result["positions_truncated"] = bool(snapshot.get("positions_truncated"))
+    result["open_orders"] = [
+        _minimal_fields(row, _CONTEXT_ORDER_KEYS, string_limit=120)
+        for row in (snapshot.get("open_orders") or [])[:2]
+        if isinstance(row, dict)
+    ]
+    result["open_orders_total"] = snapshot.get("open_orders_total", len(result["open_orders"]))
+    result["open_orders_truncated"] = bool(snapshot.get("open_orders_truncated"))
+
+    protection = _minimal_fields(
+        snapshot.get("protection"),
+        (
+            "decision_id",
+            "position_status",
+            "entry_status",
+            "sl_status",
+            "tp_status",
+            "coverage_ratio",
+            "all_protected",
+        ),
+    )
+    if protection:
+        result["protection"] = protection
+
+    market = _minimal_fields(
+        snapshot.get("market"),
+        (
+            "instrument",
+            "timestamp",
+            "state",
+            "mark_price",
+            "last_price",
+            "index_price",
+            "best_bid_price",
+            "best_ask_price",
+            "open_interest",
+        ),
+    )
+    if market:
+        result["market"] = market
+    order_book = _minimal_fields(
+        snapshot.get("order_book"),
+        (
+            "timestamp",
+            "best_bid_price",
+            "best_bid_amount",
+            "best_ask_price",
+            "best_ask_amount",
+            "spread_bps",
+            "depth_imbalance",
+        ),
+    )
+    if order_book:
+        result["order_book"] = order_book
+
+    raw_market_data = snapshot.get("market_data")
+    raw_market_data = raw_market_data if isinstance(raw_market_data, dict) else {}
+    raw_candles = raw_market_data.get("candles")
+    raw_candles = raw_candles if isinstance(raw_candles, dict) else {}
+    charts: dict[str, Any] = {}
+    for label in ("1m", "5m", "60m"):
+        raw_chart = snapshot.get(f"chart_{label}") or raw_candles.get(label)
+        chart = _compact_chart(raw_chart, keep_recent=False)
+        chart = _minimal_fields(
+            chart,
+            (
+                "resolution_minutes",
+                "count",
+                "complete_through",
+                "last_close",
+                "window_high",
+                "window_low",
+                "volume_total",
+                "truncated",
+                "bounded_window",
+            ),
+        )
+        if chart:
+            charts[label] = chart
+    if charts:
+        result["charts"] = charts
+
+    market_signals: dict[str, Any] = {}
+    tape = _minimal_fields(raw_market_data.get("tape"), ("count", "imbalance", "truncated"))
+    if tape:
+        market_signals["tape"] = tape
+    open_interest = _minimal_fields(
+        raw_market_data.get("open_interest"),
+        ("status", "current", "age_ms"),
+        string_limit=40,
+    )
+    if open_interest:
+        market_signals["open_interest"] = open_interest
+    if market_signals:
+        result["market_signals"] = market_signals
+
+    pnl = snapshot.get("pnl")
+    if isinstance(pnl, dict):
+        trading_day = _minimal_fields(
+            pnl.get("trading_day"),
+            ("status", "complete", "truncated", "trade_count", "net_realized", "unrealized"),
+        )
+        if trading_day:
+            result["pnl"] = {"trading_day": trading_day}
+    risk = snapshot.get("risk")
+    if isinstance(risk, dict):
+        aggregate = _minimal_fields(
+            risk.get("aggregate"),
+            (
+                "open_notional_usd",
+                "open_risk_to_stops_usd",
+                "unprotected_notional_usd",
+                "risk_consumed_usd",
+            ),
+        )
+        if aggregate:
+            result["risk"] = {"aggregate": aggregate}
+
+    result.update(
+        {
+            "context_compacted": True,
+            "context_minimal": True,
+            "refresh_required": True,
+            "context_omitted": [
+                "full_snapshot",
+                "order_groups",
+                "book_depth",
+                "chart_series",
+                "detailed_signals",
+            ],
+        }
+    )
+    return result
+
+
+def _minimal_codex_event_context(
+    public_event: dict[str, Any], sanitized_payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload = _minimal_fields(
+        sanitized_payload,
+        (
+            "alert_id",
+            "decision_id",
+            "instrument",
+            "condition",
+            "threshold",
+            "triggered_price",
+            "fire_at",
+            "message",
+            "order_id",
+            "trade_id",
+            "order_state",
+            "order_type",
+            "direction",
+            "amount",
+            "filled_amount",
+            "price",
+            "average_price",
+            "trigger",
+            "trigger_price",
+            "trigger_offset",
+            "reduce_only",
+            "label",
+        ),
+        string_limit=200,
+    )
+    snapshot = sanitized_payload.get("snapshot")
+    if isinstance(snapshot, dict):
+        payload["snapshot"] = _minimal_snapshot_context(snapshot)
+    payload.update(
+        {
+            "context_compacted": True,
+            "context_minimal": True,
+            "refresh_required": True,
+        }
+    )
+    return {
+        **{key: value for key, value in public_event.items() if key != "payload"},
+        "payload": payload,
+        "context_compacted": True,
+        "context_minimal": True,
+        "refresh_required": True,
+    }
+
+
+def _encode_context(value: dict[str, Any]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _fit_codex_event_context(
+    public_event: dict[str, Any], sanitized_payload: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    context_json = _encode_context(public_event)
+    if len(context_json.encode("utf-8")) <= MAX_CODEX_EVENT_CONTEXT_BYTES:
+        return public_event, context_json
+
+    compact_payload = _bounded_context_value(
+        {
+            key: value
+            for key, value in sanitized_payload.items()
+            if key
+            not in {
+                "snapshot",
+                "transitions",
+                "previous_state",
+                "current_state",
+                # These values are already lifted into the outer public event.
+                "event_id",
+                "event_type",
+                "severity",
+                "created_at",
+                "delivered_at",
+                "decision_id",
+                "snapshot_complete",
+                "data_age_ms",
+                "position_status",
+                "entry_status",
+                "sl_status",
+                "tp_status",
+            }
+        }
+    )
+    if not isinstance(compact_payload, dict):
+        compact_payload = {}
+    message = compact_payload.get("message")
+    if isinstance(message, str):
+        compact_payload["message"] = message[:400]
+    snapshot = sanitized_payload.get("snapshot")
+    if isinstance(snapshot, dict):
+        compact_payload["snapshot"] = _compact_snapshot_context(snapshot)
+    for key in ("previous_state", "current_state"):
+        value = sanitized_payload.get(key)
+        if isinstance(value, dict):
+            compact_payload[key] = _bounded_snapshot_value(value)
+    transitions = sanitized_payload.get("transitions")
+    if isinstance(transitions, list):
+        compact_payload["transitions"] = _bounded_snapshot_value(transitions[:4])
+    compact_payload["context_compacted"] = True
+    compact_event = {**public_event, "payload": compact_payload, "context_compacted": True}
+
+    def encoded_size() -> tuple[str, int]:
+        encoded = _encode_context(compact_event)
+        return encoded, len(encoded.encode("utf-8"))
+
+    context_json, size = encoded_size()
+    compact_snapshot = compact_payload.get("snapshot")
+    compact_snapshot = compact_snapshot if isinstance(compact_snapshot, dict) else {}
+    omitted: list[str] = []
+
+    def omit_snapshot_section(key: str) -> None:
+        if compact_snapshot.pop(key, None) is not None:
+            omitted.append(key)
+            compact_snapshot["context_omitted"] = omitted
+
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        signals = compact_snapshot.get("market_signals")
+        if isinstance(signals, dict):
+            signals.pop("volume", None)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        book = compact_snapshot.get("order_book")
+        if isinstance(book, dict):
+            book.pop("bids", None)
+            book.pop("asks", None)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        pnl = compact_snapshot.get("pnl")
+        if isinstance(pnl, dict):
+            decision_pnl = pnl.get("decision")
+            if isinstance(decision_pnl, dict) and decision_pnl.get("status") == "skipped":
+                pnl.pop("decision", None)
+        risk = compact_snapshot.get("risk")
+        if isinstance(risk, dict):
+            decision_risk = risk.get("decision")
+            if isinstance(decision_risk, dict) and decision_risk.get("status") == "skipped":
+                risk.pop("decision", None)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        charts = compact_snapshot.get("charts")
+        if isinstance(charts, dict):
+            charts.pop("15m", None)
+            for chart in charts.values():
+                if isinstance(chart, dict):
+                    chart.pop("first_close", None)
+                    chart.pop("latest_volume", None)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("market_signals")
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("pnl")
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("account")
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("risk")
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        compact_snapshot["positions"] = compact_snapshot.get("positions", [])[:1]
+        compact_snapshot["open_orders"] = compact_snapshot.get("open_orders", [])[:2]
+        omit_snapshot_section("orders_by_decision")
+        compact_payload["message"] = str(compact_payload.get("message") or "")[:200]
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        compact_snapshot.pop("capture_id", None)
+        compact_snapshot.pop("complete", None)
+        status = compact_snapshot.get("status")
+        if isinstance(status, dict):
+            compact_snapshot["status"] = {
+                name: value for name, value in status.items() if value != "skipped"
+            }
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        compact_event = _minimal_codex_event_context(public_event, sanitized_payload)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        minimal_snapshot = compact_event.get("payload", {}).get("snapshot")
+        if isinstance(minimal_snapshot, dict):
+            minimal_omitted = minimal_snapshot.get("context_omitted")
+            if not isinstance(minimal_omitted, list):
+                minimal_omitted = []
+                minimal_snapshot["context_omitted"] = minimal_omitted
+            for section in ("pnl", "account", "risk", "charts", "market_signals"):
+                if size <= MAX_CODEX_EVENT_CONTEXT_BYTES:
+                    break
+                if minimal_snapshot.pop(section, None) is not None:
+                    minimal_omitted.append(section)
+                    context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        essential_payload = _minimal_fields(
+            sanitized_payload,
+            (
+                "alert_id",
+                "decision_id",
+                "instrument",
+                "condition",
+                "threshold",
+                "triggered_price",
+                "fire_at",
+                "message",
+                "order_id",
+                "trade_id",
+                "order_state",
+                "direction",
+                "amount",
+                "filled_amount",
+                "price",
+            ),
+            string_limit=120,
+        )
+        essential_payload.update(
+            {
+                "context_compacted": True,
+                "context_minimal": True,
+                "refresh_required": True,
+            }
+        )
+        compact_event = _minimal_fields(
+            public_event,
+            (
+                "event_id",
+                "event_type",
+                "severity",
+                "created_at",
+                "triggered_at",
+                "event_sequence",
+                "captured_at",
+                "decision_id",
+                "snapshot_complete",
+                "data_age_ms",
+                "position_status",
+                "entry_status",
+                "sl_status",
+                "tp_status",
+            ),
+            string_limit=120,
+        )
+        compact_event.update(
+            {
+                "payload": essential_payload,
+                "context_compacted": True,
+                "context_minimal": True,
+                "refresh_required": True,
+            }
+        )
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        compact_event = {
+            "event_id": _bounded_identifier(public_event.get("event_id")) or "unknown",
+            "event_type": _bounded_identifier(public_event.get("event_type")) or "unknown",
+            "payload": {
+                "context_compacted": True,
+                "context_minimal": True,
+                "refresh_required": True,
+            },
+            "context_compacted": True,
+            "context_minimal": True,
+            "refresh_required": True,
+        }
+        context_json, _size = encoded_size()
+    return compact_event, context_json
 
 
 def _ensure_private_directory(path: Path) -> None:
