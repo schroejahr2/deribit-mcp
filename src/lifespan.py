@@ -80,7 +80,7 @@ async def _price_update_worker(
                 continue
             numeric_price = float(price)
             price_cache[instrument] = numeric_price
-            await alert_manager.process_price_update(instrument, numeric_price)
+            await alert_manager.process_price_update(instrument, tick_data)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -306,6 +306,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
     trading_state_builder = TradingStateBuilder(
         rest_client,
         decision_repo=decision_repo,
+        alert_repo=alert_repo,
     )
 
     notification_manager = NotificationManager(
@@ -335,6 +336,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
         alert: Any,
         *,
         triggered_price: float | None = None,
+        price_snapshot: dict[str, float | None] | None = None,
     ) -> bool:
         try:
             result = await notification_manager.send_notification(
@@ -342,6 +344,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 message,
                 alert=alert,
                 triggered_price=triggered_price,
+                price_snapshot=price_snapshot,
             )
             if result:
                 logger.info("Notification sent via %s for alert %s", channel, alert.id)
@@ -462,7 +465,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 if current_price:
                     trading_state_builder.observe_ticker(instrument, ticker)
                     price_cache[instrument] = float(current_price)
-                    await alert_manager.process_price_update(instrument, float(current_price))
+                    await alert_manager.process_price_update(instrument, ticker)
             except Exception as exc:
                 logger.error("Initial price check failed for %s: %s", instrument, exc)
 

@@ -150,12 +150,21 @@ async def test_place_oco_submits_reduce_only_pair_in_one_json_rpc_request():
         {
             "amount": 10,
             "direction": "sell",
+            "type": "stop_market",
+            "label": "decision-1",
+            "reduce_only": True,
+            "trigger": "mark_price",
+            "trigger_price": 75_000,
+        },
+        {
+            "amount": 10,
+            "direction": "sell",
             "type": "take_market",
             "label": "decision-1",
             "reduce_only": True,
             "trigger": "mark_price",
             "trigger_price": 82_000,
-        }
+        },
     ]
 
 

@@ -18,6 +18,7 @@ from src.event_outbox import (
     TICKER_SNAPSHOT_KEYS,
     TICKER_STATS_SNAPSHOT_KEYS,
     EventOutboxRepo,
+    sanitize_alert_snapshot,
     sanitize_payload,
 )
 from src.events_api import _encode_event_ndjson
@@ -69,6 +70,90 @@ async def test_pending_events_exposes_only_the_public_stream_contract():
     }
     assert "api_key" not in event["payload"]
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_price_alert_event_includes_trigger_source_and_all_prices():
+    db, repo, _ = await _setup()
+    alert = SimpleNamespace(
+        id="alert-source",
+        decision_id="decision-1",
+        instrument="BTC_USDC-PERPETUAL",
+        condition=SimpleNamespace(value="crosses_above"),
+        threshold=65_000.0,
+        trigger_source="last_price",
+        fire_at=None,
+        last_trigger_time=None,
+        cooldown_seconds=300,
+    )
+
+    await repo.insert_alert_event(
+        alert,
+        "breakout",
+        triggered_price=65_001.0,
+        price_snapshot={
+            "last_price": 65_001.0,
+            "mark_price": 65_010.0,
+            "index_price": 64_995.0,
+        },
+    )
+    payload = (await repo.pending_events("c1"))[0]["payload"]
+
+    assert payload["trigger_source"] == "last_price"
+    assert payload["source_price"] == 65_001.0
+    assert payload["triggered_price"] == 65_001.0
+    assert payload["last_price"] == 65_001.0
+    assert payload["mark_price"] == 65_010.0
+    assert payload["index_price"] == 64_995.0
+    await db.close()
+
+
+def test_alert_snapshot_preserves_monitoring_fee_state_token_and_tape_windows():
+    token = "a" * 64
+    sanitized = sanitize_alert_snapshot(
+        {
+            "state_token": token,
+            "monitoring": {
+                "alerts": [
+                    {
+                        "id": "a1",
+                        "condition": "crosses_above",
+                        "trigger_source": "last_price",
+                        "monitor_plan_name": "breakout",
+                        "secret": "drop-me",
+                    }
+                ],
+                "timers": [{"id": "t1", "condition": "time"}],
+                "alerts_total": 1,
+                "timers_total": 1,
+            },
+            "fee_aware": {
+                "status": "ok",
+                "net_pnl_after_fees": 1.25,
+                "break_even_exit_price": 80_100,
+                "minimum_profitable_stop": 80_100.5,
+                "private": "drop-me",
+            },
+            "market_data": {
+                "tape": {
+                    "windows": {
+                        "1m": {
+                            "buy_volume": 3,
+                            "sell_volume": 1,
+                            "imbalance": 0.5,
+                        }
+                    }
+                }
+            },
+        }
+    )
+
+    assert sanitized["state_token"] == token
+    assert sanitized["monitoring"]["alerts"][0]["monitor_plan_name"] == "breakout"
+    assert "secret" not in sanitized["monitoring"]["alerts"][0]
+    assert sanitized["fee_aware"]["net_pnl_after_fees"] == 1.25
+    assert "private" not in sanitized["fee_aware"]
+    assert sanitized["market_data"]["tape"]["windows"]["1m"]["buy_volume"] == 3
 
 
 @pytest.mark.asyncio
@@ -913,10 +998,16 @@ async def test_subscription_batch_emits_one_wakeup_with_entry_sl_and_tp_transiti
     payload = pending[0]["payload"]
     assert pending[0]["type"] == "sl_activated"
     assert {transition["event_type"] for transition in payload["transitions"]} == {
-        "entry_opened",
+        "entry_armed",
         "sl_activated",
         "tp_activated",
     }
+    assert {transition["leg_role"] for transition in payload["transitions"]} == {
+        "entry",
+        "stop_loss",
+        "take_profit",
+    }
+    assert payload["leg_role"] == "stop_loss"
     assert payload["decision_id"] == "decision-bracket"
     assert payload["entry_status"] == "active"
     assert payload["sl_status"] == "active"

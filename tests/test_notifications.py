@@ -7,7 +7,9 @@ from src.notifications import KNOWN_NOTIFICATION_CHANNELS, OutboxNotificationCha
 
 
 class DedupeOutboxRepo:
-    async def insert_alert_event(self, alert, message, triggered_price=None, snapshot=None):
+    async def insert_alert_event(
+        self, alert, message, triggered_price=None, price_snapshot=None, snapshot=None
+    ):
         return None
 
     async def insert_news_event(self, news, message):
@@ -18,8 +20,10 @@ class CapturingOutboxRepo:
     def __init__(self):
         self.calls = []
 
-    async def insert_alert_event(self, alert, message, triggered_price=None, snapshot=None):
-        self.calls.append((alert, message, triggered_price, snapshot))
+    async def insert_alert_event(
+        self, alert, message, triggered_price=None, price_snapshot=None, snapshot=None
+    ):
+        self.calls.append((alert, message, triggered_price, price_snapshot, snapshot))
         return "event-1"
 
     async def insert_news_event(self, news, message):
@@ -117,8 +121,9 @@ async def test_alert_event_includes_account_book_and_completed_market_structure(
     ]
     assert rest.position_calls == 1
     assert rest.open_order_calls == 1
-    _, _, triggered_price, snapshot = repo.calls[0]
+    _, _, triggered_price, price_snapshot, snapshot = repo.calls[0]
     assert triggered_price == 62_901.0
+    assert price_snapshot is None
     assert snapshot["status"] == {
         "market": "ok",
         "positions": "ok",
@@ -150,7 +155,7 @@ async def test_time_alert_without_instrument_skips_only_market_snapshot():
     sent = await channel.send("maintenance check", alert=alert)
 
     assert sent is True
-    snapshot = repo.calls[0][3]
+    snapshot = repo.calls[0][4]
     assert rest.order_book_calls == []
     assert rest.chart_calls == []
     assert rest.position_calls == 1
@@ -189,7 +194,7 @@ async def test_alert_snapshot_failures_and_timeouts_do_not_drop_event():
     sent = await channel.send("price crossed", alert=alert)
 
     assert sent is True
-    snapshot = repo.calls[0][3]
+    snapshot = repo.calls[0][4]
     assert snapshot["status"] == {
         "market": "failed",
         "positions": "timeout",
@@ -224,7 +229,7 @@ async def test_alert_snapshot_rejects_malformed_success_shapes():
     sent = await channel.send("price crossed", alert=alert)
 
     assert sent is True
-    snapshot = repo.calls[0][3]
+    snapshot = repo.calls[0][4]
     assert snapshot["status"] == {
         "market": "failed",
         "positions": "failed",
@@ -255,7 +260,7 @@ async def test_alert_snapshot_rejects_malformed_collection_items():
     sent = await channel.send("price crossed", alert=alert)
 
     assert sent is True
-    snapshot = repo.calls[0][3]
+    snapshot = repo.calls[0][4]
     assert snapshot["status"] == {
         "market": "ok",
         "positions": "failed",

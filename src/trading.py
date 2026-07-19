@@ -443,6 +443,50 @@ def validate_trailing_distance(current_distance: float, new_distance: float) -> 
         )
 
 
+def validate_bracket_price_geometry(
+    *,
+    side: str,
+    entry_price: float,
+    sl_trigger_price: Optional[float],
+    tp_trigger_price: float,
+) -> None:
+    """Require fixed bracket exits to remain protective around the entry.
+
+    ``sl_trigger_price`` is optional for a native trailing stop, whose positive
+    distance is validated separately. Equality is rejected because it can make
+    a child trigger immediately as soon as the entry fills.
+    """
+
+    entry = _finite_number(entry_price, "entry_price", positive=True)
+    take = _finite_number(tp_trigger_price, "tp_trigger_price", positive=True)
+    stop = (
+        None
+        if sl_trigger_price is None
+        else _finite_number(sl_trigger_price, "sl_trigger_price", positive=True)
+    )
+    if side == "buy":
+        if stop is not None and stop >= entry:
+            raise TradingValidationError(
+                f"long stop-loss trigger {stop:g} must stay below entry price {entry:g}"
+            )
+        if take <= entry:
+            raise TradingValidationError(
+                f"long take-profit trigger {take:g} must stay above entry price {entry:g}"
+            )
+        return
+    if side == "sell":
+        if stop is not None and stop <= entry:
+            raise TradingValidationError(
+                f"short stop-loss trigger {stop:g} must stay above entry price {entry:g}"
+            )
+        if take >= entry:
+            raise TradingValidationError(
+                f"short take-profit trigger {take:g} must stay below entry price {entry:g}"
+            )
+        return
+    raise TradingValidationError("side must be 'buy' or 'sell'")
+
+
 def validate_trigger_params(
     order_type: str,
     *,

@@ -34,9 +34,12 @@ logger = logging.getLogger(__name__)
 MAX_NDJSON_LINE_BYTES = 1_000_000
 MAX_CONTEXT_STRING_CHARS = 8_000
 MAX_CONTEXT_LIST_ITEMS = 100
-# The managed Codex app-server currently clips each application-context value at
-# roughly 4 KiB and inserts a human-readable marker in the middle. Stay below that
-# boundary so the injected Deribit event remains valid, parseable JSON.
+# Codex caps every additionalContext value at MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS
+# = 1_000 approximated tokens (codex-rs/context-fragments/src/additional_context.rs)
+# with APPROX_BYTES_PER_TOKEN = 4 (codex-rs/utils/string/src/truncate.rs): values
+# above exactly 4_000 bytes are middle-cut with an "…N tokens truncated…" marker
+# that breaks the JSON. Verified against codex-cli 0.144.5; the constant is not
+# configurable, so keep a margin under that version-dependent boundary.
 MAX_CODEX_EVENT_CONTEXT_BYTES = 3_800
 MAX_CODEX_CONTEXT_POSITIONS = 4
 MAX_CODEX_CONTEXT_ORDERS = 6
@@ -424,6 +427,12 @@ def prepare_event(raw_event: dict[str, Any]) -> PreparedEvent:
         "entry_status",
         "sl_status",
         "tp_status",
+        "trigger_source",
+        "source_price",
+        "last_price",
+        "mark_price",
+        "index_price",
+        "leg_role",
     ):
         if payload.get(key) is not None:
             public_event[key] = payload[key]
@@ -444,13 +453,16 @@ def prepare_event(raw_event: dict[str, Any]) -> PreparedEvent:
                 "value": (
                     "Process the Deribit event under the thread's existing strategy. The event "
                     "and trigger-time snapshot are authoritative Deribit MCP application data. "
-                    "Refresh with get_trading_state through Deribit MCP when refresh_required is "
-                    "true, captured_at is older than 60 seconds, a relevant source status is not "
-                    "ok, source data is missing or source-truncated, or a mutating action needs "
-                    "newer confirmation. "
-                    "context_compacted and bounded chart windows are transport properties, not "
-                    "source failures. Preserve decision_id, confirm_live_trade, amount/notional "
-                    "caps, and all trading safety guards."
+                    "When refresh_required is false, decide directly from the pushed snapshot "
+                    "without calling get_trading_state; a no-trade decision then needs zero MCP "
+                    "calls. Refresh with get_trading_state only when refresh_required is true or "
+                    "captured_at is older than 60 seconds. For mutations, pass the snapshot's "
+                    "state_token as expected_state_token so the server revalidates position, "
+                    "orders and price atomically in the same call; the token ignores alert and "
+                    "timer changes. context_compacted, context_minimal, and bounded chart "
+                    "windows are transport properties, not source failures; reuse earlier chart "
+                    "and structure reads. Preserve decision_id, confirm_live_trade, "
+                    "amount/notional caps, and all trading safety guards."
                 ),
             },
             "deribit_outbox_event": {"kind": "application", "value": context_json},
@@ -693,6 +705,23 @@ def _selected_fields(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
     return {key: value[key] for key in keys if key in value and value[key] is not None}
 
 
+def _round_floats(value: Any, digits: int = 8) -> Any:
+    """Shorten float noise (0.19530203556464631 -> 0.19530204) in transport projections.
+
+    Eight significant digits keep prices, sizes, and ratios decision-exact while
+    reclaiming context bytes for whole sections that would otherwise be dropped.
+    """
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return value
+        return float(f"{value:.{digits}g}")
+    if isinstance(value, list):
+        return [_round_floats(item, digits) for item in value]
+    if isinstance(value, dict):
+        return {key: _round_floats(item, digits) for key, item in value.items()}
+    return value
+
+
 def _compact_rows(value: Any, keys: tuple[str, ...], limit: int) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -889,11 +918,25 @@ def _compact_market_signals(value: Any) -> dict[str, Any]:
             "sell_amount",
             "imbalance",
             "direction_basis",
-            "window_start",
-            "window_end",
             "truncated",
         ),
     )
+    raw_tape = value.get("tape")
+    if isinstance(raw_tape, dict):
+        raw_windows = raw_tape.get("windows")
+        if isinstance(raw_windows, dict):
+            windows = {
+                label: selected
+                for label in ("1m", "5m", "15m")
+                if (
+                    selected := _selected_fields(
+                        raw_windows.get(label),
+                        ("count", "buy_volume", "sell_volume", "imbalance", "truncated"),
+                    )
+                )
+            }
+            if windows:
+                tape["windows"] = windows
     if tape:
         result["tape"] = tape
     oi = _selected_fields(value.get("open_interest"), ("status", "current", "age_ms"))
@@ -935,6 +978,8 @@ def _compact_pnl(value: Any) -> dict[str, Any]:
         name: compact
         for name in ("trading_day", "decision")
         if (compact := _selected_fields(value.get(name), keys))
+        # A skipped decision section is only empty scaffolding; never spend bytes on it.
+        and not (name == "decision" and compact.get("status") == "skipped")
     }
 
 
@@ -967,29 +1012,25 @@ def _compact_risk(value: Any) -> dict[str, Any]:
             "stop_exposures_truncated",
         ),
     )
-    if decision:
+    if decision and decision.get("status") != "skipped":
         result["decision"] = decision
     result["truncated"] = bool(value.get("truncated"))
     return result
 
 
 def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
+    # captured_at, capture_id, data_age_ms and the leg statuses are already lifted
+    # into the outer public event; repeating them here would spend context bytes twice.
     result = _selected_fields(
         snapshot,
         (
             "schema_version",
-            "capture_id",
-            "captured_at",
-            "data_age_ms",
             "snapshot_complete",
             "complete",
             "truncated",
             "currency",
             "decision_id",
-            "position_status",
-            "entry_status",
-            "sl_status",
-            "tp_status",
+            "state_token",
         ),
     )
     scope = _selected_fields(
@@ -1017,7 +1058,11 @@ def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
                 status["market"] = "ok"
             elif has_market_price:
                 status["market"] = "partial"
-        result["status"] = status
+        # All-ok statuses are implicit in the transport projection; only deviations
+        # (partial/failed/unavailable/skipped) spend context bytes.
+        status = {name: value for name, value in status.items() if value != "ok"}
+        if status:
+            result["status"] = status
     sources = snapshot.get("sources")
     if isinstance(sources, dict):
         issues = {
@@ -1048,10 +1093,10 @@ def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     protection = _compact_protection(snapshot.get("protection"))
     if protection:
         result["protection"] = protection
+    # scope.instrument already names the instrument once for the whole snapshot.
     market = _selected_fields(
         snapshot.get("market"),
         (
-            "instrument",
             "timestamp",
             "state",
             "mark_price",
@@ -1071,7 +1116,6 @@ def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     book = _selected_fields(
         snapshot.get("order_book"),
         (
-            "instrument",
             "timestamp",
             "best_bid_price",
             "best_bid_amount",
@@ -1109,11 +1153,133 @@ def _compact_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     pnl = _compact_pnl(snapshot.get("pnl"))
     if pnl:
         result["pnl"] = pnl
+    fee_aware = _minimal_fields(
+        snapshot.get("fee_aware"),
+        (
+            "status",
+            "currency",
+            "net_pnl_after_fees",
+            "break_even_exit_price",
+            "minimum_profitable_stop",
+            "estimated_exit_fee",
+            "slippage_included",
+        ),
+    )
+    if fee_aware and fee_aware.get("status") not in {"unavailable", None}:
+        result["fee_aware"] = fee_aware
+    monitoring = snapshot.get("monitoring")
+    if isinstance(monitoring, dict):
+        compact_monitoring = {
+            "alerts": _compact_rows(
+                monitoring.get("alerts"),
+                (
+                    "id",
+                    "instrument",
+                    "condition",
+                    "threshold",
+                    "trigger_source",
+                    "decision_id",
+                    "monitor_plan_name",
+                ),
+                3,
+            ),
+            "timers": _compact_rows(
+                monitoring.get("timers"),
+                ("id", "instrument", "fire_at", "decision_id", "monitor_plan_name"),
+                3,
+            ),
+            "alerts_total": monitoring.get("alerts_total"),
+            "timers_total": monitoring.get("timers_total"),
+        }
+        if compact_monitoring["alerts"] or compact_monitoring["timers"]:
+            result["monitoring"] = compact_monitoring
     risk = _compact_risk(snapshot.get("risk"))
     if risk:
         result["risk"] = risk
     result["context_compacted"] = True
-    return result
+    return _round_floats(result)
+
+
+_DECISION_STATUS_SOURCES = (
+    "market",
+    "ticker",
+    "account",
+    "positions",
+    "open_orders",
+    "order_book",
+    "tape",
+    "decision",
+    "decision_orders",
+)
+
+
+def _has_context_content(value: Any) -> bool:
+    if isinstance(value, (dict, list)):
+        return bool(value)
+    return value is not None
+
+
+def _snapshot_refresh_required(projection: Any, original: Any) -> bool:
+    """Return True only when decision-relevant data is missing from the delivered projection.
+
+    `context_compacted` and `context_minimal` are transport properties and never force
+    a refresh on their own; dropped charts or monitoring rows do not either. Chart and
+    historical structure can be reused from an earlier full read.
+    """
+    if not isinstance(original, dict) or not original:
+        return True
+    if not isinstance(projection, dict) or not projection:
+        return True
+    status = original.get("status")
+    if isinstance(status, dict):
+        for name in _DECISION_STATUS_SOURCES:
+            value = status.get(name)
+            if value is not None and value not in {"ok", "skipped"}:
+                return True
+    sources = original.get("sources")
+    if isinstance(sources, dict):
+        for name in _DECISION_STATUS_SOURCES:
+            row = sources.get(name)
+            if isinstance(row, dict) and row.get("status") not in {None, "ok", "skipped"}:
+                return True
+    if isinstance(original.get("state_token"), str) and not isinstance(
+        projection.get("state_token"), str
+    ):
+        return True
+    for key in ("positions", "open_orders"):
+        original_rows = original.get(key)
+        if not isinstance(original_rows, list):
+            return True
+        kept_rows = projection.get(key)
+        if not isinstance(kept_rows, list) or len(kept_rows) < len(original_rows):
+            return True
+    if projection.get("positions_truncated") or projection.get("open_orders_truncated"):
+        return True
+    original_market = original.get("market")
+    if isinstance(original_market, dict) and original_market:
+        kept_market = projection.get("market")
+        if not isinstance(kept_market, dict) or not any(
+            isinstance(kept_market.get(name), (int, float))
+            for name in (
+                "mark_price",
+                "last_price",
+                "index_price",
+                "best_bid_price",
+                "best_ask_price",
+            )
+        ):
+            return True
+    for section in ("account", "pnl", "risk", "order_book"):
+        if _has_context_content(original.get(section)) and not _has_context_content(
+            projection.get(section)
+        ):
+            return True
+    if _has_context_content(original.get("market_data")) and not (
+        _has_context_content(projection.get("market_signals"))
+        or _has_context_content(projection.get("market_data"))
+    ):
+        return True
+    return False
 
 
 def _minimal_fields(
@@ -1146,6 +1312,7 @@ def _minimal_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
             "entry_status",
             "sl_status",
             "tp_status",
+            "state_token",
         ),
     )
     scope = _minimal_fields(
@@ -1174,6 +1341,7 @@ def _minimal_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
         ),
         string_limit=40,
     )
+    status = {name: value for name, value in status.items() if value != "ok"}
     if status:
         result["status"] = status
 
@@ -1305,12 +1473,22 @@ def _minimal_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
         )
         if aggregate:
             result["risk"] = {"aggregate": aggregate}
+    fee_aware = _minimal_fields(
+        snapshot.get("fee_aware"),
+        (
+            "status",
+            "net_pnl_after_fees",
+            "break_even_exit_price",
+            "minimum_profitable_stop",
+        ),
+    )
+    if fee_aware:
+        result["fee_aware"] = fee_aware
 
     result.update(
         {
             "context_compacted": True,
             "context_minimal": True,
-            "refresh_required": True,
             "context_omitted": [
                 "full_snapshot",
                 "order_groups",
@@ -1320,7 +1498,7 @@ def _minimal_snapshot_context(snapshot: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     )
-    return result
+    return _round_floats(result)
 
 
 def _minimal_codex_event_context(
@@ -1335,6 +1513,12 @@ def _minimal_codex_event_context(
             "condition",
             "threshold",
             "triggered_price",
+            "trigger_source",
+            "source_price",
+            "last_price",
+            "mark_price",
+            "index_price",
+            "leg_role",
             "fire_at",
             "message",
             "order_id",
@@ -1361,7 +1545,6 @@ def _minimal_codex_event_context(
         {
             "context_compacted": True,
             "context_minimal": True,
-            "refresh_required": True,
         }
     )
     return {
@@ -1369,7 +1552,6 @@ def _minimal_codex_event_context(
         "payload": payload,
         "context_compacted": True,
         "context_minimal": True,
-        "refresh_required": True,
     }
 
 
@@ -1380,6 +1562,18 @@ def _encode_context(value: dict[str, Any]) -> str:
 def _fit_codex_event_context(
     public_event: dict[str, Any], sanitized_payload: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
+    original_snapshot = sanitized_payload.get("snapshot")
+    original_snapshot = original_snapshot if isinstance(original_snapshot, dict) else None
+
+    def _apply_refresh(event_dict: dict[str, Any]) -> None:
+        payload_value = event_dict.get("payload")
+        projection = payload_value.get("snapshot") if isinstance(payload_value, dict) else None
+        refresh = _snapshot_refresh_required(projection, original_snapshot)
+        if isinstance(payload_value, dict):
+            payload_value["refresh_required"] = refresh
+        event_dict["refresh_required"] = refresh
+
+    _apply_refresh(public_event)
     context_json = _encode_context(public_event)
     if len(context_json.encode("utf-8")) <= MAX_CODEX_EVENT_CONTEXT_BYTES:
         return public_event, context_json
@@ -1388,7 +1582,8 @@ def _fit_codex_event_context(
         {
             key: value
             for key, value in sanitized_payload.items()
-            if key
+            if value is not None
+            and key
             not in {
                 "snapshot",
                 "transitions",
@@ -1407,6 +1602,13 @@ def _fit_codex_event_context(
                 "entry_status",
                 "sl_status",
                 "tp_status",
+                "event_sequence",
+                "trigger_source",
+                "source_price",
+                "last_price",
+                "mark_price",
+                "index_price",
+                "leg_role",
             }
         }
     )
@@ -1429,6 +1631,7 @@ def _fit_codex_event_context(
     compact_event = {**public_event, "payload": compact_payload, "context_compacted": True}
 
     def encoded_size() -> tuple[str, int]:
+        _apply_refresh(compact_event)
         encoded = _encode_context(compact_event)
         return encoded, len(encoded.encode("utf-8"))
 
@@ -1473,6 +1676,59 @@ def _fit_codex_event_context(
                 if isinstance(chart, dict):
                     chart.pop("first_close", None)
                     chart.pop("latest_volume", None)
+        context_json, size = encoded_size()
+    # Charts and monitoring rows go first: historical structure can be reused from an
+    # earlier full read, while the remaining sections carry decision-fresh data.
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("charts")
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        omit_snapshot_section("monitoring")
+        context_json, size = encoded_size()
+    # Before dropping whole decision sections, degrade them to their decision essence:
+    # window imbalances, OI deltas, and core account figures survive; labels and
+    # bookkeeping fields go.
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        signals = compact_snapshot.get("market_signals")
+        if isinstance(signals, dict):
+            tape = signals.get("tape")
+            if isinstance(tape, dict):
+                for key in ("buy_amount", "sell_amount", "direction_basis", "count"):
+                    tape.pop(key, None)
+                windows = tape.get("windows")
+                if isinstance(windows, dict):
+                    for row in windows.values():
+                        if isinstance(row, dict):
+                            row.pop("count", None)
+                            row.pop("truncated", None)
+            oi = signals.get("open_interest")
+            if isinstance(oi, dict):
+                oi.pop("age_ms", None)
+                for label in ("delta_1m", "delta_5m", "delta_15m"):
+                    delta = oi.get(label)
+                    if isinstance(delta, dict) and delta.get("status") == "ok":
+                        delta.pop("status", None)
+        context_json, size = encoded_size()
+    if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
+        account = compact_snapshot.get("account")
+        if isinstance(account, dict):
+            rows = account.get("summaries")
+            if isinstance(rows, list):
+                account["summaries"] = [
+                    {
+                        key: row[key]
+                        for key in (
+                            "currency",
+                            "balance",
+                            "equity",
+                            "margin_balance",
+                            "available_funds",
+                        )
+                        if key in row
+                    }
+                    for row in rows[:1]
+                    if isinstance(row, dict)
+                ]
         context_json, size = encoded_size()
     if size > MAX_CODEX_EVENT_CONTEXT_BYTES:
         omit_snapshot_section("market_signals")
@@ -1527,6 +1783,12 @@ def _fit_codex_event_context(
                 "condition",
                 "threshold",
                 "triggered_price",
+                "trigger_source",
+                "source_price",
+                "last_price",
+                "mark_price",
+                "index_price",
+                "leg_role",
                 "fire_at",
                 "message",
                 "order_id",
@@ -1543,7 +1805,6 @@ def _fit_codex_event_context(
             {
                 "context_compacted": True,
                 "context_minimal": True,
-                "refresh_required": True,
             }
         )
         compact_event = _minimal_fields(
@@ -1563,6 +1824,12 @@ def _fit_codex_event_context(
                 "entry_status",
                 "sl_status",
                 "tp_status",
+                "trigger_source",
+                "source_price",
+                "last_price",
+                "mark_price",
+                "index_price",
+                "leg_role",
             ),
             string_limit=120,
         )
@@ -1571,7 +1838,6 @@ def _fit_codex_event_context(
                 "payload": essential_payload,
                 "context_compacted": True,
                 "context_minimal": True,
-                "refresh_required": True,
             }
         )
         context_json, size = encoded_size()
@@ -1582,11 +1848,9 @@ def _fit_codex_event_context(
             "payload": {
                 "context_compacted": True,
                 "context_minimal": True,
-                "refresh_required": True,
             },
             "context_compacted": True,
             "context_minimal": True,
-            "refresh_required": True,
         }
         context_json, _size = encoded_size()
     return compact_event, context_json

@@ -10,6 +10,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from typing_extensions import NotRequired, TypedDict
+
 try:
     from fastmcp import FastMCP
     from fastmcp.server.dependencies import get_context as _fastmcp_get_context
@@ -19,6 +21,7 @@ except ImportError:
     _fastmcp_get_context = None  # type: ignore[assignment]
 
 from .alerts import AlertStatus
+from .deribit_rest import DeribitAPIError
 from .news import compact_news_row, push_news
 from .config import settings
 from .lifespan import deribit_lifespan
@@ -36,6 +39,7 @@ from .trading import (
     get_instrument_meta,
     instrument_family,
     position_order_amount,
+    validate_bracket_price_geometry,
     validate_stop_improvement,
     validate_trailing_distance,
     validate_trigger_params,
@@ -635,6 +639,58 @@ async def _try_mark_decision_rejected(app_ctx: Any, decision_id: str, reason: st
         logger.warning("Failed to auto-reject decision %s: %s", decision_id, exc)
 
 
+async def _try_mark_decision_failed(app_ctx: Any, decision_id: str, reason: str) -> None:
+    """Best-effort persistence for failures that are not exchange rejections."""
+    try:
+        await app_ctx.decision_repo.update_outcome(decision_id, "failed", reason[:500])
+    except Exception as exc:
+        logger.warning("Failed to mark decision %s failed: %s", decision_id, exc)
+
+
+async def _mark_decision_submitted(app_ctx: Any, decision_id: str) -> None:
+    """Persist exchange acceptance without regressing a later terminal outcome."""
+    decision = await app_ctx.decision_repo.get(decision_id)
+    if decision is None:
+        raise ValueError(f"Unknown decision_id: {decision_id}")
+    if decision.get("outcome") not in {None, "rejected", "failed"}:
+        return
+    await app_ctx.decision_repo.update_outcome(
+        decision_id,
+        "submitted",
+        "Deribit accepted the native OTOCO bracket.",
+    )
+
+
+async def _assert_expected_state_token(
+    app_ctx: Any,
+    expected_state_token: Optional[str],
+    *,
+    decision_id: Optional[str] = None,
+    instrument: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> None:
+    """Reject a mutation when its coherent snapshot token is no longer current."""
+    if expected_state_token is None:
+        return
+    if not expected_state_token or len(expected_state_token) != 64:
+        raise TradingValidationError("expected_state_token must be a 64-character state token")
+    builder = getattr(app_ctx, "trading_state_builder", None)
+    if builder is None:
+        raise TradingValidationError("state-token verification is unavailable")
+    current = await builder.capture(
+        instrument=instrument,
+        decision_id=decision_id,
+        currency=currency,
+        include_day_pnl=False,
+    )
+    current_token = current.get("state_token")
+    if current_token != expected_state_token:
+        raise TradingValidationError(
+            "state_token mismatch; trading state changed since the supplied snapshot "
+            f"(current_state_token={current_token})"
+        )
+
+
 async def _prepare_mutating_tool(
     app_ctx: Any,
     *,
@@ -649,6 +705,8 @@ async def _prepare_mutating_tool(
     global_cancel_all: bool = False,
     confirm_cancel_all: bool = False,
     idempotency_scope: Optional[dict[str, Any]] = None,
+    expected_state_token: Optional[str] = None,
+    currency: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     ensure_trading_enabled()
     ensure_live_trade_confirmed(confirm_live_trade)
@@ -685,6 +743,13 @@ async def _prepare_mutating_tool(
             request_scopes.setdefault(actual_client_order_id, idempotency_scope)
 
     await _ensure_decision(app_ctx, decision_id, decision_required)
+    await _assert_expected_state_token(
+        app_ctx,
+        expected_state_token,
+        decision_id=decision_id,
+        instrument=instrument,
+        currency=currency,
+    )
 
     try:
         if global_cancel_all and not confirm_cancel_all:
@@ -804,6 +869,7 @@ async def _reject_already_triggered_entry(
     instrument: str,
     side: str,
     entry_trigger_price: Optional[float],
+    current_price: Optional[float] = None,
 ) -> None:
     """Reject stop-* bracket entries whose trigger is already past current price.
 
@@ -817,15 +883,9 @@ async def _reject_already_triggered_entry(
     """
     if entry_trigger_price is None:
         return
-    snapshot = await _get_current_price_impl(
-        app_ctx,
-        instrument=instrument,
-        skip_cache=True,
-    )
-    current = snapshot.get("last_price") or snapshot.get("mark_price")
-    if current is None:
-        return
-    current_float = float(current)
+    current_float = current_price
+    if current_float is None:
+        current_float = await _get_fresh_bracket_price(app_ctx, instrument)
     if side == "buy" and current_float >= entry_trigger_price:
         raise TradingValidationError(
             f"buy stop-entry trigger {entry_trigger_price} is already at or below "
@@ -836,6 +896,32 @@ async def _reject_already_triggered_entry(
             f"sell stop-entry trigger {entry_trigger_price} is already at or above "
             f"current price {current_float}; trigger would fire immediately"
         )
+
+
+async def _get_fresh_bracket_price(app_ctx: Any, instrument: str) -> float:
+    """Fetch a non-cached Last/Mark/Index reference for bracket validation."""
+    if getattr(app_ctx, "ws_client", None) is not None and hasattr(app_ctx, "price_cache"):
+        snapshot = await _get_current_price_impl(
+            app_ctx,
+            instrument=instrument,
+            skip_cache=True,
+        )
+    else:
+        snapshot = await app_ctx.rest_client.get_ticker(instrument)
+    current = (
+        snapshot.get("last_price") or snapshot.get("mark_price") or snapshot.get("index_price")
+    )
+    try:
+        current_float = float(current)
+    except (TypeError, ValueError) as exc:
+        raise TradingValidationError(
+            f"Fresh price unavailable for bracket validation on {instrument}"
+        ) from exc
+    if not math.isfinite(current_float) or current_float <= 0:
+        raise TradingValidationError(
+            f"Fresh price unavailable for bracket validation on {instrument}"
+        )
+    return current_float
 
 
 async def _get_current_price_impl(
@@ -896,6 +982,7 @@ async def _place_order_impl(
     trigger_offset: Optional[float],
     client_order_id: Optional[str],
     confirm_live_trade: bool,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared buy/sell implementation. Top-level so tests can import it.
 
@@ -927,6 +1014,12 @@ async def _place_order_impl(
     await _ensure_decision(app_ctx, decision_id, required=True)
     if decision_id is None:
         raise RuntimeError("decision_id missing after _ensure_decision")
+    await _assert_expected_state_token(
+        app_ctx,
+        expected_state_token,
+        decision_id=decision_id,
+        instrument=instrument,
+    )
 
     # 5: trigger-param validation, mit decision-reject
     try:
@@ -1076,6 +1169,7 @@ async def _create_combo_impl(
     decision_id: Optional[str],
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1084,6 +1178,7 @@ async def _create_combo_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        expected_state_token=expected_state_token,
     )
     if cached is not None:
         return cached
@@ -1283,12 +1378,155 @@ def _validate_bracket_params(
         trigger_offset=None,
         price=None,
     )
+    planned_entry_price = entry_trigger_price or entry_price
+    if planned_entry_price is not None:
+        validate_bracket_price_geometry(
+            side=side,
+            entry_price=planned_entry_price,
+            sl_trigger_price=sl_trigger_price,
+            tp_trigger_price=tp_trigger_price,
+        )
+
+
+class PlaceBracketDecision(TypedDict):
+    reasoning: str
+    alert_id: NotRequired[str]
+    metadata: NotRequired[Dict[str, Any]]
+
+
+_PLACE_BRACKET_DECISION_FIELDS = frozenset(PlaceBracketDecision.__annotations__)
+
+
+def _normalize_place_bracket_decision(decision: PlaceBracketDecision) -> dict[str, Any]:
+    """Validate the inline audit payload without accepting duplicate order data."""
+    if not isinstance(decision, dict):
+        raise ValueError("decision must be an object")
+    unexpected = sorted(set(decision) - _PLACE_BRACKET_DECISION_FIELDS)
+    if unexpected:
+        raise ValueError(
+            "decision accepts only reasoning, alert_id, and metadata; "
+            f"unexpected fields: {', '.join(unexpected)}"
+        )
+    reasoning = decision.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        raise ValueError("decision.reasoning must be a non-empty string")
+    alert_id = decision.get("alert_id")
+    if alert_id is not None and (not isinstance(alert_id, str) or not alert_id.strip()):
+        raise ValueError("decision.alert_id must be a non-empty string when provided")
+    metadata = decision.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("decision.metadata must be an object when provided")
+    return {
+        "reasoning": reasoning.strip(),
+        "alert_id": alert_id.strip() if isinstance(alert_id, str) else None,
+        "metadata": metadata,
+    }
+
+
+def _place_bracket_idempotency_scope(**params: Any) -> dict[str, Any]:
+    """Bind one retry key to the exchange-relevant bracket request."""
+    return {"version": 1, "tool": "place_bracket", "params": params}
+
+
+async def _load_scoped_place_bracket_response(
+    app_ctx: Any,
+    keys: list[Optional[str]],
+    scope: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    for key in dict.fromkeys(value for value in keys if value):
+        cached = await app_ctx.idempotency_repo.get(key)
+        if cached is None:
+            continue
+        if cached.get("_idempotency_scope") != scope:
+            raise ValueError(
+                f"idempotency key {key!r} is already bound to a different "
+                "or legacy unscoped place_bracket request"
+            )
+        return {name: value for name, value in cached.items() if name != "_idempotency_scope"}
+    return None
+
+
+def _place_bracket_response_from_audit(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Rebuild the compact response from a durable successful audit row."""
+    if row.get("tool_name") != "place_bracket" or row.get("error"):
+        return None
+    request = row.get("request")
+    response = row.get("response")
+    if not isinstance(request, dict) or not isinstance(response, dict):
+        return None
+    decision_id = row.get("decision_id") or request.get("decision_id")
+    client_order_id = row.get("client_order_id") or request.get("client_order_id")
+    if not decision_id or not client_order_id:
+        return None
+
+    order = response.get("order")
+    entry_order_id = (
+        str(order["order_id"]) if isinstance(order, dict) and order.get("order_id") else None
+    )
+    order_ids = [str(value) for value in row.get("deribit_order_ids") or [] if value]
+    child_ids = [value for value in order_ids if value != entry_order_id]
+    resolved_children = {
+        "sl": child_ids[0] if child_ids else None,
+        "tp": child_ids[1] if len(child_ids) > 1 else None,
+    }
+    children_resolved = bool(resolved_children["sl"] and resolved_children["tp"])
+    return {
+        "decision_id": str(decision_id),
+        "client_order_id": str(client_order_id),
+        "result": _compact_deribit_order_result(response),
+        "deribit_order_ids": order_ids or _extract_bracket_order_ids(response) or None,
+        "entry_order_id": entry_order_id,
+        "child_order_ids": resolved_children,
+        "child_order_ids_resolved": children_resolved,
+        "child_order_resolution": "resolved" if children_resolved else "pending",
+    }
+
+
+async def _load_audited_place_bracket_response(
+    app_ctx: Any,
+    *,
+    client_order_id: str,
+    decision_id: str,
+    scope: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Recover accepted brackets after cache expiry without resubmitting."""
+    audit_repo = app_ctx.order_audit_repo
+    rows: list[Optional[dict[str, Any]]] = []
+    find_client = getattr(audit_repo, "find_by_client_order_id", None)
+    if find_client is not None:
+        rows.append(await find_client(client_order_id))
+    find_decision = getattr(audit_repo, "find_successful_place_bracket_by_decision_id", None)
+    if find_decision is not None:
+        rows.append(await find_decision(decision_id))
+
+    for row in rows:
+        if not row:
+            continue
+        request = row.get("request")
+        if not isinstance(request, dict) or request.get("_idempotency_scope") != scope:
+            raise ValueError(
+                "Retry key is bound to a different or legacy unscoped audited "
+                "place_bracket request"
+            )
+        envelope = _place_bracket_response_from_audit(row)
+        if envelope is None:
+            continue
+        for key in dict.fromkeys((client_order_id, envelope["decision_id"])):
+            await _store_management_idempotent_response(
+                app_ctx,
+                key,
+                envelope,
+                scope,
+            )
+        return envelope
+    return None
 
 
 async def _place_bracket_impl(
     app_ctx: Any,
     *,
-    decision_id: Optional[str],
+    decision_id: Optional[str] = None,
+    decision: Optional[PlaceBracketDecision] = None,
     instrument: str,
     side: str,
     amount: float,
@@ -1310,6 +1548,141 @@ async def _place_bracket_impl(
     sl_trigger_source: Optional[str] = None,
     tp_trigger_source: Optional[str] = None,
     client_order_id: Optional[str] = None,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve/create one decision and place its bracket exactly once per retry key."""
+    if (decision_id is None) == (decision is None):
+        raise ValueError("Provide exactly one of decision or decision_id")
+    normalized_decision = (
+        _normalize_place_bracket_decision(decision) if decision is not None else None
+    )
+    resolved_decision_id = decision_id or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"deribit-mcp:place_bracket:{client_order_id}")
+        if client_order_id
+        else uuid.uuid4()
+    )
+    actual_client_order_id = client_order_id or resolved_decision_id
+    scope = _place_bracket_idempotency_scope(
+        instrument=instrument,
+        side=side,
+        amount=amount,
+        entry_type=entry_type,
+        sl_type=sl_type,
+        tp_type=tp_type,
+        tp_trigger_price=tp_trigger_price,
+        trigger_source=trigger_source,
+        sl_trigger_price=sl_trigger_price,
+        sl_trigger_offset=sl_trigger_offset,
+        entry_price=entry_price,
+        entry_trigger_price=entry_trigger_price,
+        entry_post_only=entry_post_only,
+        entry_reject_post_only=entry_reject_post_only,
+        sl_limit_price=sl_limit_price,
+        trigger_fill_condition=trigger_fill_condition,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+    )
+    lock_key = decision_id or actual_client_order_id
+    async with _decision_mutation_lock(app_ctx, f"place_bracket:{lock_key}"):
+        cached = await _load_scoped_place_bracket_response(
+            app_ctx,
+            [actual_client_order_id, decision_id],
+            scope,
+        )
+        if cached is not None:
+            cached_decision_id = cached.get("decision_id") or decision_id
+            if not cached_decision_id:
+                raise ValueError("Cached place_bracket response is missing decision_id")
+            await _mark_decision_submitted(app_ctx, str(cached_decision_id))
+            return {**cached, "decision_id": str(cached_decision_id)}
+
+        audited = await _load_audited_place_bracket_response(
+            app_ctx,
+            client_order_id=actual_client_order_id,
+            decision_id=resolved_decision_id,
+            scope=scope,
+        )
+        if audited is not None:
+            await _mark_decision_submitted(app_ctx, audited["decision_id"])
+            return audited
+
+        if normalized_decision is not None:
+            await app_ctx.decision_repo.create(
+                decision_id=resolved_decision_id,
+                instrument=instrument,
+                reasoning=normalized_decision["reasoning"],
+                action_taken="place_bracket",
+                alert_id=normalized_decision["alert_id"],
+                metadata=normalized_decision["metadata"],
+            )
+
+        try:
+            response = await _place_bracket_order_impl(
+                app_ctx,
+                decision_id=resolved_decision_id,
+                instrument=instrument,
+                side=side,
+                amount=amount,
+                entry_type=entry_type,
+                sl_type=sl_type,
+                tp_type=tp_type,
+                tp_trigger_price=tp_trigger_price,
+                trigger_source=trigger_source,
+                confirm_live_trade=confirm_live_trade,
+                sl_trigger_price=sl_trigger_price,
+                sl_trigger_offset=sl_trigger_offset,
+                entry_price=entry_price,
+                entry_trigger_price=entry_trigger_price,
+                entry_post_only=entry_post_only,
+                entry_reject_post_only=entry_reject_post_only,
+                sl_limit_price=sl_limit_price,
+                trigger_fill_condition=trigger_fill_condition,
+                entry_trigger_source=entry_trigger_source,
+                sl_trigger_source=sl_trigger_source,
+                tp_trigger_source=tp_trigger_source,
+                client_order_id=actual_client_order_id,
+                expected_state_token=expected_state_token,
+                idempotency_scope=scope,
+            )
+        except (DeribitAPIError, TradingValidationError, ValueError) as exc:
+            await _try_mark_decision_rejected(app_ctx, resolved_decision_id, str(exc))
+            raise
+        except Exception as exc:
+            await _try_mark_decision_failed(app_ctx, resolved_decision_id, str(exc))
+            raise
+
+        await _mark_decision_submitted(app_ctx, resolved_decision_id)
+        return response
+
+
+async def _place_bracket_order_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    instrument: str,
+    side: str,
+    amount: float,
+    entry_type: str,
+    sl_type: str,
+    tp_type: str,
+    tp_trigger_price: float,
+    trigger_source: str,
+    confirm_live_trade: bool,
+    sl_trigger_price: Optional[float] = None,
+    sl_trigger_offset: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    entry_trigger_price: Optional[float] = None,
+    entry_post_only: bool = False,
+    entry_reject_post_only: Optional[bool] = None,
+    sl_limit_price: Optional[float] = None,
+    trigger_fill_condition: str = "incremental",
+    entry_trigger_source: Optional[str] = None,
+    sl_trigger_source: Optional[str] = None,
+    tp_trigger_source: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    expected_state_token: Optional[str] = None,
+    idempotency_scope: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1318,67 +1691,73 @@ async def _place_bracket_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        idempotency_scope=idempotency_scope,
+        instrument=instrument,
+        expected_state_token=expected_state_token,
     )
     if cached is not None:
-        return cached
-    if decision_id is None:
-        raise RuntimeError("decision_id missing after _prepare_mutating_tool")
+        return {**cached, "decision_id": decision_id}
 
-    try:
-        _validate_bracket_params(
+    _validate_bracket_params(
+        side=side,
+        entry_type=entry_type,
+        entry_price=entry_price,
+        entry_trigger_price=entry_trigger_price,
+        sl_type=sl_type,
+        sl_trigger_price=sl_trigger_price,
+        sl_trigger_offset=sl_trigger_offset,
+        sl_limit_price=sl_limit_price,
+        tp_type=tp_type,
+        tp_trigger_price=tp_trigger_price,
+        trigger_source=trigger_source,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+        trigger_fill_condition=trigger_fill_condition,
+    )
+    fresh_price = await _get_fresh_bracket_price(app_ctx, instrument)
+    if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
+        await _reject_already_triggered_entry(
+            app_ctx,
+            instrument=instrument,
             side=side,
-            entry_type=entry_type,
-            entry_price=entry_price,
             entry_trigger_price=entry_trigger_price,
-            sl_type=sl_type,
+            current_price=fresh_price,
+        )
+    elif entry_type == "market":
+        validate_bracket_price_geometry(
+            side=side,
+            entry_price=fresh_price,
             sl_trigger_price=sl_trigger_price,
-            sl_trigger_offset=sl_trigger_offset,
-            sl_limit_price=sl_limit_price,
-            tp_type=tp_type,
             tp_trigger_price=tp_trigger_price,
-            trigger_source=trigger_source,
-            entry_trigger_source=entry_trigger_source,
-            sl_trigger_source=sl_trigger_source,
-            tp_trigger_source=tp_trigger_source,
-            trigger_fill_condition=trigger_fill_condition,
         )
-        if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
-            await _reject_already_triggered_entry(
-                app_ctx,
-                instrument=instrument,
-                side=side,
-                entry_trigger_price=entry_trigger_price,
-            )
-        entry_effective_price = compute_effective_price(
-            entry_type,
-            entry_trigger_price,
-            entry_price,
-        )
-        if entry_effective_price is None and entry_type == "limit":
-            entry_effective_price = entry_price
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=entry_effective_price,
-        )
-        # Trailing-stop SL has no fixed trigger price at submit time, so the
-        # notional guard falls back to current mark (effective_price=None).
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=sl_trigger_price,
-        )
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=tp_trigger_price,
-        )
-    except (TradingValidationError, ValueError) as exc:
-        await _try_mark_decision_rejected(app_ctx, decision_id, str(exc))
-        raise
+    entry_effective_price = compute_effective_price(
+        entry_type,
+        entry_trigger_price,
+        entry_price,
+    )
+    if entry_effective_price is None and entry_type == "limit":
+        entry_effective_price = entry_price
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=entry_effective_price,
+    )
+    # Trailing-stop SL has no fixed trigger price at submit time, so the
+    # notional guard falls back to current mark (effective_price=None).
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=sl_trigger_price,
+    )
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=tp_trigger_price,
+    )
 
     # Hardening: a crossing post_only entry is silently repriced by Deribit to
     # the next maker price unless reject_post_only is set. Default post_only
@@ -1440,6 +1819,7 @@ async def _place_bracket_impl(
         "tp_trigger_source": resolved_sources["tp"],
         "trigger_fill_condition": trigger_fill_condition,
         "otoco_config": otoco_config,
+        "_idempotency_scope": idempotency_scope,
     }
     hydration_holder: dict[str, Optional[str]] = {"sl": None, "tp": None}
 
@@ -1504,6 +1884,7 @@ async def _place_bracket_impl(
         operative_ids.append(hydration_holder["tp"])
     fallback_ids = _extract_bracket_order_ids(result) or None
     envelope = {
+        "decision_id": decision_id,
         "client_order_id": actual_id,
         "result": _compact_deribit_order_result(result),
         "deribit_order_ids": operative_ids or fallback_ids,
@@ -1514,7 +1895,27 @@ async def _place_bracket_impl(
             "resolved" if hydration_holder.get("sl") and hydration_holder.get("tp") else "pending"
         ),
     }
-    await _store_idempotent_response(app_ctx, actual_id, envelope)
+    if idempotency_scope is None:
+        idempotency_scope = _place_bracket_idempotency_scope(
+            **{
+                key: value
+                for key, value in request.items()
+                if key not in {"decision_id", "client_order_id", "otoco_config"}
+            }
+        )
+    await _store_management_idempotent_response(
+        app_ctx,
+        actual_id,
+        envelope,
+        idempotency_scope,
+    )
+    if actual_id != decision_id:
+        await _store_management_idempotent_response(
+            app_ctx,
+            decision_id,
+            envelope,
+            idempotency_scope,
+        )
     return envelope
 
 
@@ -1525,6 +1926,7 @@ async def _cancel_orders_by_label_impl(
     decision_id: Optional[str],
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1533,6 +1935,8 @@ async def _cancel_orders_by_label_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        expected_state_token=expected_state_token,
+        currency=currency,
     )
     if cached is not None:
         return cached
@@ -1590,6 +1994,7 @@ async def _edit_order_by_label_impl(
     advanced: Optional[str] = None,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     # Pre-validation runs before _prepare_mutating_tool, so its failures need
     # the same auto-reject contract as the preflight checks below — otherwise a
@@ -1617,6 +2022,8 @@ async def _edit_order_by_label_impl(
         use_idempotency=True,
         instrument=instrument,
         amount=amount,
+        expected_state_token=expected_state_token,
+        currency=currency,
     )
     if cached is not None:
         return cached
@@ -1825,6 +2232,9 @@ async def _verify_protection_impl(app_ctx: Any, *, decision_id: str) -> dict[str
             "trigger_reference_price": order.get("trigger_reference_price"),
             "oco_ref": order.get("oco_ref"),
             "primary_order_id": primary_id,
+            "is_secondary_oto": order.get("is_secondary_oto") is True,
+            "is_primary_otoco": order.get("is_primary_otoco") is True,
+            "trigger_fill_condition": order.get("trigger_fill_condition"),
             "valid_protection": valid_protection,
         }
         orders.append(compact)
@@ -2004,9 +2414,11 @@ async def _move_stop_impl(
     new_trigger: float,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+    _idempotency_scope_override: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     async with _decision_mutation_lock(app_ctx, decision_id):
-        idempotency_scope = _management_idempotency_scope(
+        idempotency_scope = _idempotency_scope_override or _management_idempotency_scope(
             "move_stop",
             decision_id,
             new_trigger=float(new_trigger),
@@ -2019,6 +2431,7 @@ async def _move_stop_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return cached
@@ -2035,6 +2448,161 @@ async def _move_stop_impl(
         )
 
 
+def _incremental_otoco_replacement_params(
+    snapshot: dict[str, Any],
+    stop: dict[str, Any],
+    *,
+    new_trigger: float,
+) -> dict[str, Any]:
+    """Derive one full-size SL/TP pair from active incremental OTOCO children."""
+
+    take_profits = [
+        order
+        for order in snapshot["orders"]
+        if order["role"] == "tp" and order["status"] == "active" and order["valid_protection"]
+    ]
+    if len(take_profits) != 1:
+        raise TradingValidationError(
+            "Incremental OTOCO tightening requires exactly one active valid take-profit"
+        )
+    take_profit = take_profits[0]
+    required_amount = float(snapshot["required_amount"])
+    epsilon = max(1e-12, required_amount * 1e-9)
+    if float(take_profit["remaining_amount"]) + epsilon < required_amount:
+        raise TradingValidationError(
+            "Incremental OTOCO take-profit does not cover the full position"
+        )
+    tp_type = str(take_profit.get("order_type") or "")
+    if tp_type != "take_market":
+        raise TradingValidationError(
+            "Incremental OTOCO replacement requires an active take_market take-profit"
+        )
+    tp_trigger_price = _as_float(take_profit.get("trigger_price"))
+    if tp_trigger_price is None:
+        raise TradingValidationError("Incremental OTOCO take-profit has no trigger_price")
+    trigger_source = str(stop.get("trigger") or take_profit.get("trigger") or "mark_price")
+    tp_trigger_source = str(take_profit.get("trigger") or trigger_source)
+    if tp_trigger_source != trigger_source:
+        raise TradingValidationError(
+            "Incremental OTOCO replacement requires matching SL/TP trigger sources"
+        )
+    return {
+        "tp_trigger_price": tp_trigger_price,
+        "trigger_source": trigger_source,
+        "sl_type": str(stop["order_type"]),
+        "sl_trigger_price": new_trigger,
+        "sl_limit_price": _as_float(stop.get("price")),
+        "tp_type": tp_type,
+    }
+
+
+async def _tighten_protection_by_label_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    new_trigger_price: float,
+    require_positive_net_pnl: bool = False,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Tighten the labelled fixed SL, optionally gated by exact fee-aware PnL."""
+    fee_aware: Optional[dict[str, Any]] = None
+    if require_positive_net_pnl:
+        state = await app_ctx.trading_state_builder.capture(decision_id=decision_id)
+        fee_aware = state.get("fee_aware") or {}
+        if fee_aware.get("status") != "ok":
+            raise TradingValidationError(
+                "Positive net-PnL gate requires exact fee-aware decision attribution"
+            )
+        net_pnl = _as_float(fee_aware.get("net_pnl_after_fees"))
+        if net_pnl is None or net_pnl <= 0:
+            raise TradingValidationError(
+                "Protection tightening rejected because net_pnl_after_fees is not positive"
+            )
+    idempotency_scope = _management_idempotency_scope(
+        "tighten_protection_by_label",
+        decision_id,
+        new_trigger_price=float(new_trigger_price),
+        require_positive_net_pnl=bool(require_positive_net_pnl),
+    )
+    actual_id, cached = await _prepare_mutating_tool(
+        app_ctx,
+        confirm_live_trade=confirm_live_trade,
+        decision_id=decision_id,
+        decision_required=True,
+        client_order_id=client_order_id,
+        use_idempotency=True,
+        idempotency_scope=idempotency_scope,
+        expected_state_token=expected_state_token,
+    )
+    assert actual_id is not None
+    resumable_replacement = bool(
+        cached
+        and cached.get("status")
+        in {
+            "new_protection_unverified",
+            "protected_cleanup_needed",
+            "position_closed_cleanup_needed",
+        }
+        and cached.get("old_order_ids")
+    )
+    if cached is not None and not resumable_replacement:
+        result = cached
+    elif resumable_replacement:
+        # Cached replacement resumes before any new snapshot-derived inputs are
+        # needed. The replacement path uses the tighten request's idempotency
+        # scope, so a retry cannot place a second OCO pair.
+        result = await _replace_bracket_impl(
+            app_ctx,
+            decision_id=decision_id,
+            tp_trigger_price=0.0,
+            client_order_id=actual_id,
+            confirm_live_trade=confirm_live_trade,
+            expected_state_token=expected_state_token,
+            _idempotency_scope_override=idempotency_scope,
+        )
+    else:
+        snapshot = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        stop = _single_active_stop(snapshot)
+        incremental_otoco = bool(
+            stop.get("is_secondary_oto")
+            and str(stop.get("trigger_fill_condition") or "").lower() == "incremental"
+        )
+        if incremental_otoco:
+            replacement = _incremental_otoco_replacement_params(
+                snapshot,
+                stop,
+                new_trigger=float(new_trigger_price),
+            )
+            result = await _replace_bracket_impl(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=actual_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+                _idempotency_scope_override=idempotency_scope,
+                **replacement,
+            )
+        else:
+            result = await _move_stop_impl(
+                app_ctx,
+                decision_id=decision_id,
+                new_trigger=new_trigger_price,
+                client_order_id=actual_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+                _idempotency_scope_override=idempotency_scope,
+            )
+    return {
+        **result,
+        "label": decision_id,
+        "strategy": ("create_first_replacement" if result.get("old_order_ids") else "direct_edit"),
+        "positive_net_pnl_required": require_positive_net_pnl,
+        "fee_aware_preflight": fee_aware,
+    }
+
+
 async def _move_stop_to_breakeven_impl(
     app_ctx: Any,
     *,
@@ -2042,6 +2610,7 @@ async def _move_stop_to_breakeven_impl(
     offset: float = 0.0,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     async with _decision_mutation_lock(app_ctx, decision_id):
         idempotency_scope = _management_idempotency_scope(
@@ -2057,6 +2626,7 @@ async def _move_stop_to_breakeven_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return cached
@@ -2092,6 +2662,7 @@ async def _trail_stop_impl(
     distance: float,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     async with _decision_mutation_lock(app_ctx, decision_id):
         idempotency_scope = _management_idempotency_scope(
@@ -2107,6 +2678,7 @@ async def _trail_stop_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return cached
@@ -2319,6 +2891,7 @@ async def _cancel_pending_setup_impl(
     decision_id: str,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Cancel captured pending-entry IDs without racing away live protection."""
 
@@ -2335,6 +2908,7 @@ async def _cancel_pending_setup_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         assert actual_id is not None
         if cached is not None and cached.get("status") != "new_entry_detected":
@@ -2500,6 +3074,100 @@ async def _cancel_pending_setup_impl(
         return envelope
 
 
+async def _cancel_decision_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Cancel every captured labelled leg only while the decision remains flat."""
+
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope("cancel_decision", decision_id)
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        assert actual_id is not None
+        if cached is not None:
+            return cached
+
+        before = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if before["status"] != "flat":
+            raise TradingValidationError(
+                "Decision cannot be cancelled while its position is open; "
+                "close the position with protected close tooling first"
+            )
+
+        cancelled_ids, after, cleanup_needed = await _cancel_orders_while_flat(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=actual_id,
+            tool_name="cancel_decision",
+            phase="cancel_decision_leg",
+            roles={"entry", "sl", "tp", "other"},
+            initial=before,
+        )
+        remaining_ids = [
+            str(order["order_id"]) for order in after["orders"] if order.get("order_id")
+        ]
+        verified_cancelled = after["status"] == "flat" and not remaining_ids
+        status = (
+            "cancelled"
+            if verified_cancelled
+            else (
+                "position_opened_during_cancel" if after["status"] != "flat" else "cleanup_needed"
+            )
+        )
+        if not cancelled_ids:
+            await _execute_audited(
+                app_ctx,
+                "cancel_decision",
+                {
+                    "decision_id": decision_id,
+                    "client_order_id": actual_id,
+                    "phase": "verified_noop",
+                },
+                decision_id,
+                lambda: _constant_result({"cancelled": 0, "already_flat": True}),
+                deribit_order_ids_override=[],
+            )
+        if verified_cancelled:
+            await app_ctx.decision_repo.update_outcome(
+                decision_id,
+                "cancelled",
+                "All labelled parent/OTOCO legs removed and flat state verified.",
+            )
+
+        envelope = {
+            "client_order_id": actual_id,
+            "decision_id": decision_id,
+            "instrument": before["instrument"],
+            "status": status,
+            "cancelled_order_ids": cancelled_ids,
+            "remaining_order_ids": remaining_ids,
+            "flat_verified": after["status"] == "flat",
+            "outcome_updated": verified_cancelled,
+            "cleanup_needed": cleanup_needed or bool(remaining_ids),
+            "protection": after,
+        }
+        await _store_management_idempotent_response(
+            app_ctx,
+            actual_id,
+            envelope,
+            idempotency_scope,
+        )
+        return envelope
+
+
 def _close_order_state_value(response: Any) -> Optional[str]:
     if not isinstance(response, dict):
         return None
@@ -2544,6 +3212,7 @@ async def _close_position_and_cancel_protection_impl(
     price: Optional[float] = None,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Close first; cancel protection only after a fresh read confirms flat."""
 
@@ -2562,6 +3231,7 @@ async def _close_position_and_cancel_protection_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             if cached.get("status") not in {
@@ -3127,11 +3797,13 @@ async def _replace_bracket_impl(
     tp_type: str = "take_market",
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+    _idempotency_scope_override: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Replace live protection create-first, leaving no unprotected gap."""
 
     async with _decision_mutation_lock(app_ctx, decision_id):
-        idempotency_scope = _management_idempotency_scope(
+        idempotency_scope = _idempotency_scope_override or _management_idempotency_scope(
             "replace_bracket",
             decision_id,
             tp_trigger_price=float(tp_trigger_price),
@@ -3150,6 +3822,7 @@ async def _replace_bracket_impl(
             client_order_id=client_order_id,
             use_idempotency=True,
             idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             if cached.get("status") not in {
@@ -3367,6 +4040,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         instrument: str,
         condition: str,
         threshold: float,
+        trigger_source: str = "last_price",
         notification_channel: str = "outbox",
         message: Optional[str] = None,
         repeat: bool = False,
@@ -3374,7 +4048,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
-        """Set a price alert, optionally scoped to one persisted decision."""
+        """Set a price alert using last_price, mark_price, or index_price."""
         _validate_notification_channel(notification_channel)
         app_ctx = _ctx(ctx)
         if decision_id:
@@ -3393,6 +4067,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             repeat=repeat,
             cooldown_seconds=cooldown_seconds,
             decision_id=decision_id,
+            trigger_source=trigger_source,
         )
         callback = app_ctx.ws_client.price_update_callback
         if callback is None:
@@ -3406,9 +4081,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             )
             if current_price:
                 app_ctx.price_cache[alert.instrument] = float(current_price)
-                await app_ctx.alert_manager.process_price_update(
-                    alert.instrument, float(current_price)
-                )
+                await app_ctx.alert_manager.process_price_update(alert.instrument, ticker)
         except Exception as exc:
             logger.error("Immediate price check failed for %s: %s", alert.instrument, exc)
         return _json({"alert": alert.to_dict()})
@@ -3472,6 +4145,67 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         return _json({"alert": alert.to_dict()})
 
     @server.tool()
+    async def upsert_monitor_plan(
+        name: str,
+        instrument: str,
+        upper_threshold: float,
+        lower_threshold: float,
+        fire_at: Optional[str] = None,
+        delay_seconds: Optional[int] = None,
+        trigger_source: str = "last_price",
+        notification_channel: str = "outbox",
+        decision_id: Optional[str] = None,
+        cooldown_seconds: int = 300,
+        ctx: Any = None,
+    ) -> str:
+        """Atomically replace a named timer plus upper/lower price alerts."""
+        _validate_notification_channel(notification_channel)
+        app_ctx = _ctx(ctx)
+        instrument = instrument.upper()
+        if decision_id:
+            decision_instrument = await _decision_instrument(app_ctx, decision_id)
+            if decision_instrument != instrument:
+                raise ValueError(
+                    f"instrument {instrument} conflicts with decision "
+                    f"{decision_id} instrument {decision_instrument}"
+                )
+        callback = app_ctx.ws_client.price_update_callback
+        if callback is None:
+            raise RuntimeError("Price-update callback not configured; lifespan setup did not run")
+        await app_ctx.ws_client.subscribe_ticker(instrument, callback)
+        alerts = await app_ctx.alert_manager.upsert_monitor_plan(
+            name=name,
+            instrument=instrument,
+            upper_threshold=upper_threshold,
+            lower_threshold=lower_threshold,
+            fire_at=_parse_time_alert_fire_at(fire_at, delay_seconds),
+            trigger_source=trigger_source,
+            notification_channel=notification_channel,
+            decision_id=decision_id,
+            cooldown_seconds=cooldown_seconds,
+        )
+        try:
+            ticker = await app_ctx.ws_client.get_ticker(instrument)
+            app_ctx.trading_state_builder.observe_ticker(instrument, ticker)
+            current_price = (
+                ticker.get("mark_price") or ticker.get("last_price") or ticker.get("index_price")
+            )
+            if current_price:
+                app_ctx.price_cache[instrument] = float(current_price)
+                await app_ctx.alert_manager.process_price_update(instrument, ticker)
+        except Exception as exc:
+            logger.error("Initial monitor-plan price check failed for %s: %s", instrument, exc)
+        app_ctx.scheduler.wake()
+        return _json(
+            {
+                "name": name,
+                "instrument": instrument,
+                "alerts": [alert.to_dict() for alert in alerts],
+                "replaced_atomically": True,
+            }
+        )
+
+    @server.tool()
     async def remove_alert(alert_id: str, ctx: Any = None) -> str:
         """Remove an alert by ID."""
         app_ctx = _ctx(ctx)
@@ -3525,8 +4259,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Valid values fall into two groups:
 
         - **Execution state** (what happened to the order):
-          ``filled``, ``cancelled``, ``rejected``, ``expired``, ``partial``,
-          ``unknown``.
+          ``submitted``, ``failed``, ``filled``, ``cancelled``, ``rejected``,
+          ``expired``, ``partial``, ``unknown``.
         - **PnL state** (what happened to the position once an exit is
           final): ``win``, ``loss``, ``breakeven``. Use these for trade
           journal aggregation so consumers do not have to parse
@@ -3570,6 +4304,16 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         if row is None:
             raise ValueError(f"Unknown decision_id: {decision_id}")
         return _json({"decision": row})
+
+    @server.tool()
+    async def get_decision_state(decision_id: str, ctx: Any = None) -> str:
+        """Get one decision plus its coherent position/order/protection state."""
+        app_ctx = _ctx(ctx)
+        row = await app_ctx.decision_repo.get(decision_id)
+        if row is None:
+            raise ValueError(f"Unknown decision_id: {decision_id}")
+        state = await app_ctx.trading_state_builder.capture(decision_id=decision_id)
+        return _json({"decision": _compact_decision(row, 400), "state": state})
 
     @server.tool()
     async def add_note(
@@ -4170,6 +4914,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         trigger_offset: Optional[float] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards.
@@ -4211,6 +4956,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 trigger_offset=trigger_offset,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4230,6 +4976,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         trigger_offset: Optional[float] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. See `buy` for trigger-order semantics."""
@@ -4252,12 +4999,12 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 trigger_offset=trigger_offset,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
     @server.tool()
     async def place_bracket(
-        decision_id: str,
         instrument: str,
         side: str,
         amount: float,
@@ -4267,6 +5014,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         tp_trigger_price: float,
         trigger_source: str,
         confirm_live_trade: bool,
+        decision_id: Optional[str] = None,
+        decision: Optional[PlaceBracketDecision] = None,
         sl_trigger_price: Optional[float] = None,
         sl_trigger_offset: Optional[float] = None,
         entry_price: Optional[float] = None,
@@ -4279,6 +5028,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         sl_trigger_source: Optional[str] = None,
         tp_trigger_source: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Place a native Deribit OTOCO bracket.
@@ -4286,6 +5036,15 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Creates entry + stop-loss + take-profit in one Deribit call using
         ``linked_order_type=one_triggers_one_cancels_other``. Take-profit is
         intentionally limited to ``take_market``.
+
+        Pass exactly one decision source. ``decision`` creates the audit row
+        from ``reasoning``, optional ``alert_id``, and optional ``metadata``;
+        the server derives ``action_taken=place_bracket``. ``decision_id``
+        reuses an existing row. Order fields are rejected inside ``decision``
+        so the audit payload cannot diverge from the actual bracket request.
+        The decision ID is also the default idempotency key and Deribit label.
+        An explicit ``client_order_id`` is aliased to the same response, so
+        retries by either ID do not submit a second bracket.
 
         Entry-type matrix:
 
@@ -4337,6 +5096,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
           ``mark_price`` for SL/TP (wick-resistant).
 
         Response shape:
+          - ``decision_id`` / ``client_order_id``: retry-safe audit and call IDs.
           - ``entry_order_id``: cancelable id of the entry order.
           - ``child_order_ids``: ``{sl, tp}`` — cancelable trigger-order
             ids, hydrated from ``private/get_trigger_order_history``
@@ -4355,6 +5115,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             await _place_bracket_impl(
                 app_ctx,
                 decision_id=decision_id,
+                decision=decision,
                 instrument=instrument,
                 side=side,
                 amount=amount,
@@ -4376,6 +5137,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 sl_trigger_source=sl_trigger_source,
                 tp_trigger_source=tp_trigger_source,
                 client_order_id=client_order_id,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4385,6 +5147,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         new_trigger: float,
         confirm_live_trade: bool,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Tighten an existing fixed stop for one decision.
@@ -4402,6 +5165,39 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 new_trigger=new_trigger,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def tighten_protection_by_label(
+        decision_id: str,
+        new_trigger_price: float,
+        confirm_live_trade: bool,
+        require_positive_net_pnl: bool = False,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Tighten the labelled fixed stop-loss safely.
+
+        Set ``require_positive_net_pnl=True`` to require exact positive PnL after
+        actual entry fees and an estimated taker exit fee before mutation. Fixed
+        stops that are editable are changed directly. Incremental OTOCO children,
+        which Deribit does not permit editing, use a create-first full-size OCO
+        replacement; new SL/TP coverage is verified before old protection is
+        cancelled. The stop-improvement guard never permits widening protection.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _tighten_protection_by_label_impl(
+                app_ctx,
+                decision_id=decision_id,
+                new_trigger_price=new_trigger_price,
+                require_positive_net_pnl=require_positive_net_pnl,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4411,6 +5207,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         confirm_live_trade: bool,
         offset: float = 0.0,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Tighten a fixed stop to entry plus directional offset.
@@ -4427,6 +5224,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 offset=offset,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4436,6 +5234,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         distance: float,
         confirm_live_trade: bool,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Tighten an existing Deribit trailing stop.
@@ -4452,6 +5251,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 distance=distance,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4460,6 +5260,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: str,
         confirm_live_trade: bool,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Cancel one still-flat pending setup by captured IDs.
@@ -4475,6 +5276,31 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def cancel_decision(
+        decision_id: str,
+        confirm_live_trade: bool,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Cancel all labelled legs and verify flat atomically.
+
+        The decision outcome changes to ``cancelled`` only after every captured
+        parent/OTOCO child is absent and a fresh read confirms no open position.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _cancel_decision_impl(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4485,6 +5311,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         order_type: str = "market",
         price: Optional[float] = None,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Close first, then cancel protection after flat verify.
@@ -4502,6 +5329,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 price=price,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4517,6 +5345,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         sl_limit_price: Optional[float] = None,
         tp_type: str = "take_market",
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Replace live SL/TP with create-first OCO protection.
@@ -4541,6 +5370,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 tp_type=tp_type,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4550,6 +5380,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -4561,6 +5392,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=False,
             client_order_id=client_order_id,
             use_idempotency=True,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return _json(cached)
@@ -4591,6 +5423,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         advanced: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -4616,6 +5449,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             use_idempotency=True,
             instrument=checked_instrument,
             amount=amount,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return _json(cached)
@@ -4668,6 +5502,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         advanced: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Edit the open order labelled by decision_id.
@@ -4700,6 +5535,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 advanced=advanced,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4709,6 +5545,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Cancel open orders labelled by decision_id.
@@ -4728,6 +5565,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -4740,6 +5578,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         order_type: Optional[str] = None,
         confirm_cancel_all: bool = False,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -4752,6 +5591,9 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=True,
             global_cancel_all=global_cancel,
             confirm_cancel_all=confirm_cancel_all,
+            expected_state_token=expected_state_token,
+            instrument=instrument,
+            currency=currency,
         )
         request = {
             "currency": currency,
@@ -4783,6 +5625,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         order_type: str = "market",
         price: Optional[float] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -4794,6 +5637,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=True,
             instrument=instrument,
             close_position=True,
+            expected_state_token=expected_state_token,
         )
         request = {
             "instrument": instrument,
@@ -4816,6 +5660,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Create or fetch a Deribit combo instrument."""
@@ -4827,6 +5672,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 

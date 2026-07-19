@@ -336,7 +336,10 @@ def test_prepare_event_preserves_only_bounded_sanitized_alert_snapshot():
     assert decoded["context_compacted"] is True
     assert decoded["payload"]["context_compacted"] is True
     assert snapshot["context_compacted"] is True
-    assert snapshot["market"]["instrument"] == "BTC_USDC-PERPETUAL"
+    # The instrument is named once via the payload; the compact market block
+    # deliberately omits the duplicate.
+    assert decoded["payload"]["instrument"] == "BTC-PERPETUAL"
+    assert snapshot["market"]["mark_price"] == 62_900.0
     assert len(snapshot["positions"]) <= 4
     assert snapshot["positions_total"] == 105
     assert snapshot["positions_truncated"] is True
@@ -444,7 +447,8 @@ def test_prepare_event_keeps_large_central_snapshot_valid_below_app_context_limi
 
     assert len(raw_context.encode("utf-8")) <= MAX_CODEX_EVENT_CONTEXT_BYTES
     assert "tokens truncated" not in raw_context
-    assert decoded["payload"]["snapshot"]["status"]["market"] == "ok"
+    # All-ok statuses are implicit in the transport projection.
+    assert "status" not in decoded["payload"]["snapshot"]
     assert decoded["payload"]["snapshot"]["charts"]["60m"]["bounded_window"] is True
 
 
@@ -460,6 +464,13 @@ def test_prepare_event_falls_back_to_refreshable_minimal_context_instead_of_bloc
         "entry_status": "not_found",
         "sl_status": "not_found",
         "tp_status": "not_found",
+        "state_token": "a" * 64,
+        "fee_aware": {
+            "status": "ok",
+            "net_pnl_after_fees": 1.25,
+            "break_even_exit_price": 63_000,
+            "minimum_profitable_stop": 63_000.5,
+        },
         "scope": {
             "instrument": "BTC_USDC-PERPETUAL",
             "currency": "USDC",
@@ -503,9 +514,7 @@ def test_prepare_event_falls_back_to_refreshable_minimal_context_instead_of_bloc
                 )
             )
         },
-        "account": {
-            "summaries": [{"currency": "USDC", "equity": 862.32, "available_funds": 800}]
-        },
+        "account": {"summaries": [{"currency": "USDC", "equity": 862.32, "available_funds": 800}]},
         "positions": [
             {
                 "instrument": "BTC_USDC-PERPETUAL",
@@ -554,6 +563,12 @@ def test_prepare_event_falls_back_to_refreshable_minimal_context_instead_of_bloc
             "entry_status": "not_found",
             "sl_status": "not_found",
             "tp_status": "not_found",
+            "trigger_source": "last_price",
+            "source_price": 63_448,
+            "last_price": 63_448,
+            "mark_price": 63_450,
+            "index_price": 63_440,
+            "leg_role": "entry",
         }
     )
 
@@ -566,6 +581,10 @@ def test_prepare_event_falls_back_to_refreshable_minimal_context_instead_of_bloc
     assert decoded["refresh_required"] is True
     assert decoded["payload"]["snapshot"]["positions"][0]["direction"] == "zero"
     assert decoded["payload"]["snapshot"]["market"]["mark_price"] == 63_450
+    assert decoded["payload"]["snapshot"]["state_token"] == "a" * 64
+    assert decoded["payload"]["trigger_source"] == "last_price"
+    assert decoded["payload"]["source_price"] == 63_448
+    assert decoded["payload"]["leg_role"] == "entry"
     assert "source_issues" not in decoded["payload"]["snapshot"]
 
 
@@ -612,6 +631,236 @@ def test_prepare_event_has_a_guaranteed_essential_projection_for_pathological_va
     assert decoded["event_id"] == long_identifier
     assert decoded["context_minimal"] is True
     assert decoded["refresh_required"] is True
+
+
+def _decision_complete_snapshot() -> dict[str, Any]:
+    return {
+        "captured_at": "2026-07-19T09:00:00+00:00",
+        "data_age_ms": 120,
+        "snapshot_complete": True,
+        "truncated": False,
+        "currency": "USDC",
+        "decision_id": "decision-1",
+        "position_status": "protected",
+        "entry_status": "filled",
+        "sl_status": "active",
+        "tp_status": "active",
+        "state_token": "b" * 64,
+        "scope": {
+            "instrument": "BTC_USDC-PERPETUAL",
+            "currency": "USDC",
+            "decision_id": "decision-1",
+            "consistent": True,
+        },
+        "status": {
+            "ticker": "ok",
+            "order_book": "ok",
+            "positions": "ok",
+            "open_orders": "ok",
+            "account": "ok",
+            "tape": "ok",
+            "decision": "ok",
+            "decision_orders": "ok",
+        },
+        "account": {"summaries": [{"currency": "USDC", "equity": 862.32, "available_funds": 800}]},
+        "positions": [
+            {
+                "instrument": "BTC_USDC-PERPETUAL",
+                "direction": "buy",
+                "size_currency": 0.01,
+                "average_price": 63_000,
+                "mark_price": 63_450,
+            }
+        ],
+        "positions_total": 1,
+        "open_orders": [
+            {
+                "order_id": "sl-1",
+                "order_state": "untriggered",
+                "order_type": "stop_market",
+                "direction": "sell",
+                "amount": 0.01,
+                "trigger_price": 62_400,
+                "reduce_only": True,
+            },
+            {
+                "order_id": "tp-1",
+                "order_state": "open",
+                "order_type": "limit",
+                "direction": "sell",
+                "amount": 0.01,
+                "price": 64_400,
+                "reduce_only": True,
+            },
+        ],
+        "open_orders_total": 2,
+        "protection": {
+            "decision_id": "decision-1",
+            "position_status": "protected",
+            "entry_status": "filled",
+            "sl_status": "active",
+            "tp_status": "active",
+            "coverage_ratio": 1,
+            "all_protected": True,
+        },
+        "market": {
+            "instrument": "BTC_USDC-PERPETUAL",
+            "mark_price": 63_450,
+            "last_price": 63_448,
+            "index_price": 63_440,
+            "best_bid_price": 63_447.5,
+            "best_ask_price": 63_448.5,
+            "open_interest": 440.2,
+        },
+        "order_book": {
+            "best_bid_price": 63_447.5,
+            "best_bid_amount": 0.4,
+            "best_ask_price": 63_448.5,
+            "best_ask_amount": 0.6,
+            "spread_bps": 0.16,
+            "depth_imbalance": -0.1,
+            "bids": [[63_447.5, 0.4], [63_447, 0.5]],
+            "asks": [[63_448.5, 0.6], [63_449, 0.5]],
+        },
+        "market_data": {
+            "ticker": {
+                "instrument": "BTC_USDC-PERPETUAL",
+                "mark_price": 63_450,
+                "last_price": 63_448,
+                "index_price": 63_440,
+                "best_bid_price": 63_447.5,
+                "best_ask_price": 63_448.5,
+            },
+            "candles": {
+                label: {
+                    "resolution_minutes": minutes,
+                    "count": 8,
+                    "complete_through": 1_800_000_000_000,
+                    "ts": [1_800_000_000_000 + index * 60_000 for index in range(8)],
+                    "open": [63_400.5 + index for index in range(8)],
+                    "high": [63_460.5 + index for index in range(8)],
+                    "low": [63_390.5 + index for index in range(8)],
+                    "close": [63_450.5 + index for index in range(8)],
+                    "volume": [1.25 + index for index in range(8)],
+                }
+                for label, minutes in (("1m", 1), ("5m", 5), ("15m", 15), ("60m", 60))
+            },
+            "tape": {
+                "count": 240,
+                "buy_amount": 6.2,
+                "sell_amount": 3.1,
+                "imbalance": 0.33,
+                "truncated": False,
+                "windows": {
+                    "1m": {"count": 12, "buy_volume": 0.6, "sell_volume": 0.2, "imbalance": 0.5},
+                    "5m": {"count": 58, "buy_volume": 2.4, "sell_volume": 1.6, "imbalance": 0.2},
+                    "15m": {"count": 240, "buy_volume": 6.2, "sell_volume": 3.1, "imbalance": 0.33},
+                },
+            },
+            "open_interest": {
+                "status": "ok",
+                "current": 440.2,
+                "age_ms": 900,
+                "delta_1m": {"status": "ok", "value": 1.4, "percent": 0.32},
+                "delta_5m": {"status": "ok", "value": -3.6, "percent": -0.81},
+                "delta_15m": {"status": "ok", "value": 6.8, "percent": 1.57},
+            },
+        },
+        "pnl": {
+            "trading_day": {"status": "ok", "net_realized": {"USDC": 2.5}},
+            "decision": {"status": "ok", "net_realized": {"USDC": 1.2}},
+        },
+        "risk": {
+            "aggregate": {"open_notional_usd": 634.5, "open_risk_to_stops_usd": 10.5},
+            "decision": {"status": "ok", "notional_usd": 634.5, "risk_to_stop_usd": 10.5},
+        },
+        "monitoring": {
+            "alerts": [{"id": "price-1", "instrument": "BTC_USDC-PERPETUAL", "condition": "above"}],
+            "timers": [{"id": "timer-1", "fire_at": "2026-07-19T10:00:00+00:00"}],
+            "alerts_total": 1,
+            "timers_total": 1,
+        },
+    }
+
+
+def test_prepare_event_complete_push_carries_state_token_and_clears_refresh_required():
+    raw = _raw_event(message="Reassess after trigger " + "x" * 8_000)
+    raw["payload"]["snapshot"] = _decision_complete_snapshot()
+    raw["payload"]["decision_id"] = "decision-1"
+
+    event = prepare_event(raw)
+    raw_context = event.turn_params["additionalContext"]["deribit_outbox_event"]["value"]
+    decoded = json.loads(raw_context)
+    snapshot = decoded["payload"]["snapshot"]
+
+    assert len(raw_context.encode("utf-8")) <= MAX_CODEX_EVENT_CONTEXT_BYTES
+    assert decoded["refresh_required"] is False
+    assert decoded["payload"]["refresh_required"] is False
+    assert "context_minimal" not in decoded
+    assert snapshot["state_token"] == "b" * 64
+    assert snapshot["market"]["best_bid_price"] == 63_447.5
+    assert snapshot["order_book"]["depth_imbalance"] == pytest.approx(-0.1)
+    signals = snapshot["market_signals"]
+    assert signals["tape"]["windows"]["5m"]["imbalance"] == 0.2
+    assert signals["open_interest"]["delta_5m"]["value"] == -3.6
+    assert snapshot["pnl"]["trading_day"]["net_realized"] == {"USDC": 2.5}
+    assert snapshot["risk"]["aggregate"]["open_notional_usd"] == 634.5
+
+
+def test_prepare_event_minimal_projection_does_not_force_refresh_when_data_survives():
+    snapshot = _decision_complete_snapshot()
+    # Non-decision sources (charts, monitoring, ledgers) fail with huge diagnostics: the
+    # compact projection cannot shed source_issues, so the bridge falls back to the
+    # minimal projection while every decision-relevant section stays intact.
+    snapshot["sources"] = {
+        source_name: {"status": "failed", "truncated": True, "reason": "y" * 2_000}
+        for source_name in (
+            "chart_1m",
+            "chart_5m",
+            "chart_15m",
+            "chart_60m",
+            "alerts",
+            "user_trades",
+            "transaction_log",
+        )
+    }
+    raw = _raw_event(message="Chart sources degraded", snapshot=snapshot)
+    raw["payload"]["decision_id"] = "decision-1"
+
+    event = prepare_event(raw)
+    raw_context = event.turn_params["additionalContext"]["deribit_outbox_event"]["value"]
+    decoded = json.loads(raw_context)
+    snapshot_context = decoded["payload"]["snapshot"]
+
+    assert len(raw_context.encode("utf-8")) <= MAX_CODEX_EVENT_CONTEXT_BYTES
+    assert decoded["context_minimal"] is True
+    assert decoded["refresh_required"] is False
+    assert decoded["payload"]["refresh_required"] is False
+    assert snapshot_context["state_token"] == "b" * 64
+    assert snapshot_context["positions"][0]["instrument"] == "BTC_USDC-PERPETUAL"
+    assert snapshot_context["market"]["mark_price"] == 63_450
+
+
+def test_prepare_event_dropped_decision_section_forces_refresh():
+    snapshot = _decision_complete_snapshot()
+    snapshot["positions"] = [
+        {
+            "instrument": f"BTC_USDC-PERPETUAL-{index}",
+            "direction": "buy",
+            "size_currency": 0.01,
+            "average_price": 63_000,
+            "mark_price": 63_450,
+        }
+        for index in range(8)
+    ]
+    snapshot["positions_total"] = 8
+    raw = _raw_event(message="Too many positions for the transport window", snapshot=snapshot)
+
+    event = prepare_event(raw)
+    decoded = json.loads(event.turn_params["additionalContext"]["deribit_outbox_event"]["value"])
+
+    assert decoded["refresh_required"] is True
+    assert decoded["payload"]["refresh_required"] is True
 
 
 @pytest.mark.asyncio

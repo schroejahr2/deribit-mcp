@@ -134,10 +134,10 @@ async def test_price_update_worker_keeps_enqueue_non_blocking_and_processes_fifo
 
     class BlockingAlertManager:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, float]] = []
+            self.calls: list[tuple[str, dict[str, float]]] = []
 
-        async def process_price_update(self, instrument: str, price: float) -> None:
-            self.calls.append((instrument, price))
+        async def process_price_update(self, instrument: str, prices: dict[str, float]) -> None:
+            self.calls.append((instrument, prices))
             if len(self.calls) == 1:
                 first_started.set()
                 await release_first.wait()
@@ -153,15 +153,15 @@ async def test_price_update_worker_keeps_enqueue_non_blocking_and_processes_fifo
         queue.put_nowait(("ETH-PERPETUAL", {"last_price": 2.0}))
         queue.put_nowait(("BTC-PERPETUAL", {"index_price": 3.0}))
         assert queue.qsize() == 2
-        assert alert_manager.calls == [("BTC-PERPETUAL", 1.0)]
+        assert alert_manager.calls == [("BTC-PERPETUAL", {"mark_price": 1.0})]
 
         release_first.set()
         await asyncio.wait_for(queue.join(), timeout=0.5)
 
         assert alert_manager.calls == [
-            ("BTC-PERPETUAL", 1.0),
-            ("ETH-PERPETUAL", 2.0),
-            ("BTC-PERPETUAL", 3.0),
+            ("BTC-PERPETUAL", {"mark_price": 1.0}),
+            ("ETH-PERPETUAL", {"last_price": 2.0}),
+            ("BTC-PERPETUAL", {"index_price": 3.0}),
         ]
         assert price_cache == {"BTC-PERPETUAL": 3.0, "ETH-PERPETUAL": 2.0}
     finally:

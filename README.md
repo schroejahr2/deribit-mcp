@@ -69,11 +69,12 @@ It is not a Robinhood replacement. ⚠️
    combos), label-based edit/cancel, mass-cancel scoping, position
    close, settlement and trigger-order history.
 
-2. **Pre-trade decision audit.** Mutating tools require a `decision_id`
-   minted by `record_decision`, validated against the database before
-   the Deribit call. Every order writes a row into `order_audit` before
-   *and* after the call. The `decision_id` rides through Deribit as the
-   order `label`, so post-hoc analysis joins trivially.
+2. **Pre-trade decision audit.** Mutating tools require a persisted
+   `decision_id`, validated before the Deribit call. `place_bracket` can mint
+   that row inline from `decision={reasoning, alert_id?, metadata?}` so a live
+   bracket needs one MCP call; other flows can still call `record_decision`.
+   The `decision_id` rides through Deribit as the order `label`, so post-hoc
+   analysis joins trivially.
 
 3. **Durable agent wakeup pipeline (Alpha — see warning).** Alerts
    tagged `notification_channel="outbox"` flow into a SQLite outbox,
@@ -249,7 +250,7 @@ Some MCP gateways prefix tool names — check your gateway's conventions.
 
 | Tool | Purpose |
 |------|---------|
-| `get_trading_state(instrument?, decision_id?, currency?, include_day_pnl=True)` | One bounded, internally consistent capture of positions, decision-grouped orders and protection status, account/margin, top of book, 1m/5m structure, tape imbalance, OI deltas, net PnL, and stop exposure. `currency` enables a currency-only account/PnL snapshot; every source reports status and age and partial data is explicit. |
+| `get_trading_state(instrument?, decision_id?, currency?, include_day_pnl=True)` | One bounded, internally consistent capture of positions, decision-grouped orders/protection, account/margin, active alerts/timers, Last/Mark/Index, 1m/5m/15m tape volume/imbalance, OI deltas, fee-aware PnL and stop exposure. Returns `captured_at`, `data_age_ms`, source status/truncation, and a mutation-safe `state_token`. |
 | `get_account_summary(currency)` | Balance, PnL, margin |
 | `get_account_summaries(extended)` | All currencies in one call |
 | `get_positions(currency, kind)` | Open positions |
@@ -270,8 +271,9 @@ Some MCP gateways prefix tool names — check your gateway's conventions.
 
 | Tool | Purpose |
 |------|---------|
-| `set_price_alert(instrument, condition, threshold, channel, decision_id?)` | `above` / `below` / `crosses_above` / `crosses_below` / `percentage_change`; optionally bind the alert to one decision |
+| `set_price_alert(instrument, condition, threshold, trigger_source="last_price", channel, decision_id?)` | `above` / `below` / `crosses_above` / `crosses_below` / `percentage_change`; source is explicitly `last_price`, `mark_price`, or `index_price` |
 | `set_time_alert(when, message, channel, instrument?, decision_id?)` | Wake itself up at a future timestamp with decision-scoped live state already attached |
+| `upsert_monitor_plan(name, instrument, upper_threshold, lower_threshold, fire_at/delay_seconds, ...)` | Atomically replace one named timer plus upper/lower alerts so stale or duplicate monitors cannot remain |
 | `list_alerts(...)` | All persisted alerts |
 | `remove_alert(alert_id)` | Cancel one |
 
@@ -283,9 +285,10 @@ boot.
 
 | Tool | Purpose |
 |------|---------|
-| `record_decision(...)` | Mint a `decision_id` with reasoning. **Required before any mutating order.** |
-| `update_decision_outcome(decision_id, outcome)` | `filled` / `cancelled` / `rejected` / `expired` / `partial` / `unknown` |
+| `record_decision(...)` | Mint a standalone `decision_id` for non-bracket mutations, observations, and explicit no-trade records. |
+| `update_decision_outcome(decision_id, outcome)` | `submitted` / `failed` / `filled` / `cancelled` / `rejected` / `expired` / `partial` / `unknown` plus final PnL outcomes |
 | `list_decisions(...)` | Query the decision log |
+| `get_decision_state(decision_id)` | One decision plus its coherent position/order/protection/monitoring state |
 
 ### 📓 Free-form notes
 
@@ -308,15 +311,17 @@ Same backing table as the [News Webhook](#news-webhook).
 |------|---------|
 | `buy(instrument, amount, order_type, ...)` | Long entry. Supports `market`, `limit`, `market_limit`, `stop_market`, `stop_limit`, `take_market`, `trailing_stop` |
 | `sell(...)` | Short entry / position exit, same surface as `buy` |
-| `place_bracket(entry, take_profit, stop_loss, ...)` | One-shot entry + TP + SL. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit` — stop-* entries park exchange-side until `entry_trigger_price` is hit (no wake-latency, survives MCP outages). `sl_type` accepts `stop_market`, `stop_limit` (fixed `sl_trigger_price`) or `trailing_stop` (use `sl_trigger_offset` — absolute deviation from peak in quote currency). Protective stop-limit geometry is enforced: sell limit ≤ trigger for a long, buy limit ≥ trigger for a short. Per-leg trigger overrides via `entry_trigger_source` / `sl_trigger_source` / `tp_trigger_source` (common: `last_price` on entry + `mark_price` on SL/TP). Already-past triggers are rejected. |
+| `place_bracket(..., decision? / decision_id?, expected_state_token?)` | One-call decision audit + entry + TP + SL. Pass exactly one of inline `decision={reasoning, alert_id?, metadata?}` or an existing `decision_id`; `action_taken=place_bracket` is derived and order fields stay top-level. Returns decision, client, entry, and SL/TP IDs. Retries by `decision_id` or `client_order_id` reconcile without a second bracket. `entry_type` accepts `market`, `limit`, `stop_market`, `stop_limit`; `sl_type` accepts fixed or trailing stops. Trigger geometry, fresh price, state token, notional, and live-confirmation guards remain enforced. |
 | `edit_order(order_id, ...)` | Modify by Deribit ID, including `trigger_price` / `trigger_offset` for SL/TP repricing |
 | `edit_order_by_label(currency, instrument, label, ...)` | Modify by `decision_id` (preflighted), including `trigger_price` repricing |
 | `verify_protection(decision_id)` | Read-only proof that the full open position is covered by an active reduce-only stop |
 | `move_stop(decision_id, new_trigger, ...)` | Move the single active fixed SL by order ID; rejects every stop deterioration |
+| `tighten_protection_by_label(decision_id, new_trigger_price, require_positive_net_pnl=False, ...)` | Tighten the labelled fixed SL; incremental OTOCO children automatically use create-first full-size SL/TP replacement because Deribit forbids direct edits. New coverage is verified before old protection is cancelled. The optional gate requires positive PnL after actual entry and estimated taker exit fees. |
 | `move_stop_to_breakeven(decision_id, offset=0, ...)` | Move a fixed SL to entry plus a direction-aware offset, never backwards |
 | `trail_stop(decision_id, distance, ...)` | Tighten an existing exchange-side trailing stop; fixed-to-trailing conversion uses `replace_bracket` |
 | `replace_bracket(decision_id, ...)` | Create and verify a new native reduce-only OCO pair before cancelling the old protection. No unprotected gap; incremental fill handling preserves sibling coverage, and delayed exchange visibility is reconciled idempotently without placing a second OCO. The multi-step replacement is not an exchange transaction. |
 | `cancel_pending_setup(decision_id, ...)` | Cancel captured pending-entry IDs and dormant OTO children with fill-race checks |
+| `cancel_decision(decision_id, ...)` | Cancel labelled parent and all OTOCO children, verify flat/no remaining orders, then set outcome `cancelled` |
 | `close_position_and_cancel_protection(decision_id, ...)` | Cancel active decision entries, close once, confirm flat, then remove captured SL/TP orders. Retries reconcile an in-flight close without submitting a duplicate; protection stays live while the close is incomplete. |
 | `cancel_order(order_id, decision_id?)` | Single cancel |
 | `cancel_orders_by_label(currency, label)` | Currency-scoped label cancel |
@@ -340,8 +345,19 @@ and replay without flooding agent sessions.
 - Notional guard for trigger orders uses worst-case execution price
   (max of `trigger_price` and `price`) so a stop above current mark
   cannot under-check the cap.
-- Mutating orders without a valid `decision_id` are rejected before
-  the Deribit call.
+- Mutating orders without a valid `decision_id` are rejected before the
+  Deribit call. `place_bracket` may create that ID in the same guarded call from its inline
+  `decision` object; `decision` and `decision_id` are mutually exclusive.
+- Core mutations accept `expected_state_token`; a stale token rejects the call
+  before exchange mutation. The integrated `place_bracket` flow records that
+  decision as `rejected`; existing standalone mutation flows leave their prior
+  decision outcome unchanged. The token hashes stable exposure-only position,
+  order, protection, account, and
+  stop-risk fields. Market prices, unrealized PnL/margin estimates, trailing
+  references, and alert/timer changes never invalidate it; trigger validity and
+  bracket geometry are checked separately before submission. A pushed snapshot
+  plus one mutating call therefore replaces the extra `get_trading_state`
+  round-trip without accepting stale exposure.
 - `post_only` orders default `reject_post_only=true`: a crossing limit
   is rejected instead of being silently repriced by Deribit to the next
   maker price. Applies to `buy`/`sell` (`reject_post_only`) and
@@ -362,21 +378,23 @@ sell(BTC-PERPETUAL, amount=10, order_type="stop_market",
      confirm_live_trade=true)
 ```
 
-Example — exchange-side breakout bracket with asymmetric trigger feeds.
+Example — one-call exchange-side breakout bracket with asymmetric trigger feeds.
 Entry waits for `last_price` to cross 80100 (clean market touch), then
 SL/TP protect on `mark_price` (wick-resistant). The bracket sits on
 Deribit until the entry fires, so wake-latency and MCP downtime do not
 miss the setup:
 
 ```
-record_decision(
-  instrument="BTC-PERPETUAL",
-  reasoning="80100 break-up + 79200 reclaim long",
-  action_taken="place_bracket",
-) → did
-
 place_bracket(
-  decision_id=did,
+  decision={
+    "reasoning": "80100 break-up + 79200 reclaim long",
+    "alert_id": "optional-alert-id",
+    "metadata": {
+      "setup": "breakout",
+      "confirmation": "last-price touch",
+      "risk_basis": "79200 invalidation"
+    }
+  },
   instrument="BTC-PERPETUAL",
   side="buy",
   amount=10,
@@ -388,9 +406,15 @@ place_bracket(
   tp_trigger_price=82500,
   trigger_source="mark_price",         # default for SL + TP legs
   entry_trigger_source="last_price",   # entry uses real-trade prints
+  expected_state_token="<latest snapshot state_token>",
   confirm_live_trade=true,
 )
 ```
+
+The response contains `decision_id`, `client_order_id`, `entry_order_id`, and
+hydrated SL/TP IDs. The decision outcome becomes `submitted` after exchange
+acceptance, `rejected` for validation or Deribit rejection, and `failed` for a
+transport/runtime failure. Exchange rejection reasons remain on the decision.
 
 A `buy` whose `entry_trigger_price` is already at or below current price
 is rejected before the Deribit call (mirror logic for `sell`). The
@@ -576,9 +600,9 @@ dropped before persisting.
 
 Alert and timer events carry the same strictly allowlisted snapshot returned by
 `get_trading_state`: capture time and source ages, account/margin, positions,
-orders grouped by `decision_id`, entry/SL/TP lifecycle, top-of-book depth and
-spread, completed 1m/5m candles and volume, tape imbalance, OI changes, net
-PnL, and stop/notional exposure. PnL separates entry, exit, and unclassified
+orders grouped by `decision_id`, entry/SL/TP lifecycle, active monitor plans,
+top-of-book depth and spread, completed candles, 1m/5m/15m taker buy/sell tape,
+OI changes, fee-aware PnL, and stop/notional exposure. PnL separates entry, exit, and unclassified
 fees and marks decision-level funding attribution as `exact`, `ambiguous`, or
 `unavailable`. `risk.decision` follows the same attribution rule and never
 assigns a shared instrument-level position to one decision without evidence.
@@ -597,10 +621,10 @@ news metadata: `news_id`, `source`, `instrument`, `headline`,
 Authenticated Deribit trading events use the same wakeup path when
 `DERIBIT_TRADING_EVENT_OUTBOX_ENABLED=true`. A persistent projector converts
 user-order/trade/position batches into semantic events such as
-`entry_opened`, `entry_partially_filled`, `position_opened`, `sl_activated`,
+`entry_armed` (waiting trigger), `entry_opened`, `entry_partially_filled`, `position_opened`, `sl_activated`,
 `tp_activated`, `stop_triggered`, `position_closed`, `order_rejected`, and
 `protection_missing`. Each stored event has a monotonic `event_sequence` plus
-typed `previous_state` / `current_state` and may contain multiple transitions
+typed `previous_state` / `current_state`, explicit `leg_role` values, and may contain multiple transitions
 from the same exchange batch without creating duplicate wakeups. Time alerts
 use `timer_fired`. Payload-level `current_state` follows the coherent snapshot,
 while each transition preserves the sparse exchange-trigger delta. Every

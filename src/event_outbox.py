@@ -35,6 +35,10 @@ ALLOWED_PAYLOAD_KEYS = {
     "condition",
     "threshold",
     "triggered_price",
+    "trigger_source",
+    "leg_role",
+    "source_price",
+    "last_price",
     "fire_at",
     "severity",
     "message",
@@ -147,6 +151,7 @@ TRADE_PAYLOAD_KEYS = (
 SEMANTIC_TRADING_EVENT_TYPES = frozenset(
     {
         "entry_opened",
+        "entry_armed",
         "entry_partially_filled",
         "position_opened",
         "sl_activated",
@@ -167,6 +172,7 @@ SEMANTIC_EVENT_PRIORITY = {
     "sl_activated": 6,
     "tp_activated": 7,
     "entry_opened": 8,
+    "entry_armed": 9,
 }
 PROJECTOR_STATE_KEYS = (
     "entity_key",
@@ -203,6 +209,7 @@ TRANSITION_KEYS = (
     "order_id",
     "previous_status",
     "current_status",
+    "leg_role",
 )
 
 SNAPSHOT_STATUS_KEYS = (
@@ -218,6 +225,7 @@ SNAPSHOT_STATUS_KEYS = (
     "decision_orders",
     "user_trades",
     "transaction_log",
+    "alerts",
     "chart_1m",
     "chart_5m",
     "chart_15m",
@@ -318,6 +326,52 @@ MARKET_TAPE_KEYS = (
     "window_start",
     "window_end",
     "truncated",
+)
+MARKET_TAPE_WINDOW_KEYS = (
+    "count",
+    "buy_volume",
+    "sell_volume",
+    "imbalance",
+    "window_start",
+    "window_end",
+    "truncated",
+)
+MONITORING_ALERT_KEYS = (
+    "id",
+    "instrument",
+    "condition",
+    "threshold",
+    "notification_channel",
+    "status",
+    "fire_at",
+    "decision_id",
+    "trigger_source",
+    "monitor_plan_name",
+    "repeat",
+    "cooldown_seconds",
+)
+FEE_AWARE_KEYS = (
+    "decision_id",
+    "instrument",
+    "status",
+    "reason",
+    "currency",
+    "family",
+    "direction",
+    "amount",
+    "entry_price",
+    "exit_reference_price",
+    "exit_fee_rate",
+    "entry_fee_actual",
+    "estimated_exit_fee",
+    "funding",
+    "gross_unrealized_pnl",
+    "net_pnl_after_fees",
+    "break_even_exit_price",
+    "minimum_profitable_stop",
+    "tick_size",
+    "exit_fee_assumption",
+    "slippage_included",
 )
 MARKET_VOLUME_KEYS = ("status", "latest", "change", "change_percent")
 OPEN_INTEREST_KEYS = ("status", "current", "captured_at")
@@ -765,12 +819,20 @@ def _sanitize_market_data(value: Any) -> dict[str, Any]:
             key.removeprefix("chart_"): config for key, config in SNAPSHOT_CHART_CONFIG.items()
         }.items()
     }
+    tape = _snapshot_fields(value.get("tape"), MARKET_TAPE_KEYS)
+    raw_tape = value.get("tape") if isinstance(value.get("tape"), dict) else {}
+    windows = raw_tape.get("windows") if isinstance(raw_tape.get("windows"), dict) else {}
+    tape["windows"] = {
+        label: _snapshot_fields(windows.get(label), MARKET_TAPE_WINDOW_KEYS)
+        for label in ("1m", "5m", "15m")
+        if _snapshot_fields(windows.get(label), MARKET_TAPE_WINDOW_KEYS)
+    }
     return {
         "ticker": _sanitize_ticker_snapshot(value.get("ticker")),
         "order_book": _sanitize_order_book_snapshot(value.get("order_book")),
         "candles": sanitized_candles,
         "volume": _sanitize_market_volume(value.get("volume")),
-        "tape": _snapshot_fields(value.get("tape"), MARKET_TAPE_KEYS),
+        "tape": tape,
         "open_interest": _sanitize_open_interest(value.get("open_interest")),
     }
 
@@ -1227,6 +1289,7 @@ def sanitize_alert_snapshot(value: Any) -> Optional[dict[str, Any]]:
             "entry_status",
             "sl_status",
             "tp_status",
+            "state_token",
         ),
     )
     captured_at = value.get("captured_at")
@@ -1331,6 +1394,29 @@ def sanitize_alert_snapshot(value: Any) -> Optional[dict[str, Any]]:
         derived_truncated = derived_truncated or bool(result["account"].get("summaries_truncated"))
     if "pnl" in value:
         result["pnl"] = _sanitize_pnl_snapshot(value.get("pnl"))
+    if "fee_aware" in value:
+        result["fee_aware"] = _snapshot_fields(value.get("fee_aware"), FEE_AWARE_KEYS)
+    if "monitoring" in value and isinstance(value.get("monitoring"), dict):
+        monitoring = value["monitoring"]
+        alerts, alerts_total, alerts_truncated = _bounded_sanitized_items(
+            monitoring.get("alerts"),
+            lambda row: _snapshot_fields(row, MONITORING_ALERT_KEYS),
+            max_items=50,
+            max_bytes=50_000,
+        )
+        timers, timers_total, timers_truncated = _bounded_sanitized_items(
+            monitoring.get("timers"),
+            lambda row: _snapshot_fields(row, MONITORING_ALERT_KEYS),
+            max_items=50,
+            max_bytes=50_000,
+        )
+        result["monitoring"] = {
+            "alerts": alerts,
+            "timers": timers,
+            "alerts_total": _bounded_snapshot_total(monitoring.get("alerts_total"), alerts_total),
+            "timers_total": _bounded_snapshot_total(monitoring.get("timers_total"), timers_total),
+            "truncated": bool(monitoring.get("truncated")) or alerts_truncated or timers_truncated,
+        }
     if "risk" in value:
         result["risk"] = _sanitize_risk_snapshot(value.get("risk"))
         derived_truncated = derived_truncated or bool(result["risk"].get("truncated"))
@@ -1651,6 +1737,8 @@ def _transition(
     previous_state: dict[str, Any],
     current_state: dict[str, Any],
 ) -> dict[str, Any]:
+    role = current_state.get("role")
+    leg_role = {"entry": "entry", "sl": "stop_loss", "tp": "take_profit"}.get(role)
     return {
         "event_type": event_type,
         "entity_key": current_state.get("entity_key"),
@@ -1660,6 +1748,7 @@ def _transition(
         "order_id": current_state.get("order_id"),
         "previous_status": previous_state.get("status"),
         "current_status": current_state.get("status"),
+        "leg_role": leg_role,
         "previous_state": previous_state,
         "current_state": current_state,
     }
@@ -1842,27 +1931,26 @@ class EventOutboxRepo:
             )
         if not rows:
             return
-        conn = self.db.require_conn()
-        await conn.executemany(
-            """
-            INSERT INTO trading_event_state (
-              entity_key, entity_type, decision_id, instrument, state_json,
-              last_event_sequence, updated_at, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(entity_key) DO UPDATE SET
-              entity_type=excluded.entity_type,
-              decision_id=excluded.decision_id,
-              instrument=excluded.instrument,
-              state_json=excluded.state_json,
-              last_event_sequence=COALESCE(
-                excluded.last_event_sequence,
-                trading_event_state.last_event_sequence
-              ),
-              updated_at=excluded.updated_at
-            """,
-            rows,
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO trading_event_state (
+                  entity_key, entity_type, decision_id, instrument, state_json,
+                  last_event_sequence, updated_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(entity_key) DO UPDATE SET
+                  entity_type=excluded.entity_type,
+                  decision_id=excluded.decision_id,
+                  instrument=excluded.instrument,
+                  state_json=excluded.state_json,
+                  last_event_sequence=COALESCE(
+                    excluded.last_event_sequence,
+                    trading_event_state.last_event_sequence
+                  ),
+                  updated_at=excluded.updated_at
+                """,
+                rows,
+            )
 
     async def _event_sequence(self, event_id: Optional[str]) -> Optional[int]:
         if not event_id:
@@ -1910,25 +1998,24 @@ class EventOutboxRepo:
                 "delivered_at": created_at_iso,
             }
         )
-        conn = self.db.require_conn()
-        cursor = await conn.execute(
-            """
-            INSERT OR IGNORE INTO event_outbox (
-              event_id, created_at, type, severity, payload_json, dedupe_key,
-              expires_at, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                event_id,
-                to_iso(created_at),
-                event_type,
-                severity,
-                json.dumps(payload, sort_keys=True, default=str),
-                dedupe_key,
-                to_iso(expires_at),
-            ),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT OR IGNORE INTO event_outbox (
+                  event_id, created_at, type, severity, payload_json, dedupe_key,
+                  expires_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    event_id,
+                    to_iso(created_at),
+                    event_type,
+                    severity,
+                    json.dumps(payload, sort_keys=True, default=str),
+                    dedupe_key,
+                    to_iso(expires_at),
+                ),
+            )
         return event_id if cursor.rowcount else None
 
     async def insert_alert_event(
@@ -1936,6 +2023,7 @@ class EventOutboxRepo:
         alert: Any,
         message: str,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[dict[str, Optional[float]]] = None,
         snapshot: Optional[dict[str, Any]] = None,
     ) -> Optional[str]:
         condition = alert.condition.value
@@ -1952,6 +2040,11 @@ class EventOutboxRepo:
             "condition": condition,
             "threshold": alert.threshold,
             "triggered_price": triggered_price,
+            "trigger_source": getattr(alert, "trigger_source", None),
+            "source_price": triggered_price,
+            "last_price": (price_snapshot or {}).get("last_price"),
+            "mark_price": (price_snapshot or {}).get("mark_price"),
+            "index_price": (price_snapshot or {}).get("index_price"),
             "fire_at": to_iso(alert.fire_at),
             "severity": severity,
             "message": message,
@@ -2221,7 +2314,8 @@ class EventOutboxRepo:
                 if is_partial and filled != previous_filled:
                     event_type = "entry_partially_filled"
                 elif current_status == "active" and previous_status != "active":
-                    event_type = "entry_opened"
+                    waiting_trigger = str(current.get("order_state") or "").lower() == "untriggered"
+                    event_type = "entry_armed" if waiting_trigger else "entry_opened"
                 elif current_status == "filled" and previous_status != "filled":
                     filled_entries.append((previous, current))
             elif role == "sl" and current_status == "active" and previous_status != "active":
@@ -2435,6 +2529,7 @@ class EventOutboxRepo:
             "transitions": transitions,
             "previous_state": previous_state,
             "current_state": current_state,
+            "leg_role": primary.get("leg_role"),
         }
         for key in ("position_status", "entry_status", "sl_status", "tp_status"):
             if current_state.get(key) is not None:
@@ -2508,21 +2603,20 @@ class EventOutboxRepo:
         consumer_id = consumer_id or str(uuid.uuid4())
         token = secrets.token_urlsafe(32)
         now = to_iso(utc_now())
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            INSERT INTO event_consumers (
-              consumer_id, display_name, token_hash, created_at, last_seen_at,
-              schema_version
-            ) VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(consumer_id) DO UPDATE SET
-              display_name=excluded.display_name,
-              token_hash=excluded.token_hash,
-              disabled_at=NULL
-            """,
-            (consumer_id, display_name, token_hash(token), now, now),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO event_consumers (
+                  consumer_id, display_name, token_hash, created_at, last_seen_at,
+                  schema_version
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(consumer_id) DO UPDATE SET
+                  display_name=excluded.display_name,
+                  token_hash=excluded.token_hash,
+                  disabled_at=NULL
+                """,
+                (consumer_id, display_name, token_hash(token), now, now),
+            )
         return {"consumer_id": consumer_id, "token": token}
 
     async def authenticate_consumer(self, consumer_id: str, token: str) -> bool:
@@ -2542,41 +2636,38 @@ class EventOutboxRepo:
     async def claim_stream(self, consumer_id: str, ttl_seconds: int) -> bool:
         now = utc_now()
         until = now + timedelta(seconds=ttl_seconds)
-        conn = self.db.require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE event_consumers
-            SET active_stream_until = ?, last_seen_at = ?
-            WHERE consumer_id = ?
-              AND disabled_at IS NULL
-              AND (active_stream_until IS NULL OR active_stream_until <= ?)
-            """,
-            (to_iso(until), to_iso(now), consumer_id, to_iso(now)),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE event_consumers
+                SET active_stream_until = ?, last_seen_at = ?
+                WHERE consumer_id = ?
+                  AND disabled_at IS NULL
+                  AND (active_stream_until IS NULL OR active_stream_until <= ?)
+                """,
+                (to_iso(until), to_iso(now), consumer_id, to_iso(now)),
+            )
         return cursor.rowcount == 1
 
     async def renew_stream(self, consumer_id: str, ttl_seconds: int) -> None:
         now = utc_now()
         until = now + timedelta(seconds=ttl_seconds)
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            UPDATE event_consumers
-            SET active_stream_until = ?, last_seen_at = ?
-            WHERE consumer_id = ?
-            """,
-            (to_iso(until), to_iso(now), consumer_id),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                UPDATE event_consumers
+                SET active_stream_until = ?, last_seen_at = ?
+                WHERE consumer_id = ?
+                """,
+                (to_iso(until), to_iso(now), consumer_id),
+            )
 
     async def release_stream(self, consumer_id: str) -> None:
-        conn = self.db.require_conn()
-        await conn.execute(
-            "UPDATE event_consumers SET active_stream_until = NULL WHERE consumer_id = ?",
-            (consumer_id,),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                "UPDATE event_consumers SET active_stream_until = NULL WHERE consumer_id = ?",
+                (consumer_id,),
+            )
 
     async def pending_events(self, consumer_id: str, limit: int = 50) -> list[dict[str, Any]]:
         conn = self.db.require_conn()
@@ -2622,76 +2713,73 @@ class EventOutboxRepo:
         rows = await cursor.fetchall()
         events: list[dict[str, Any]] = []
         now = to_iso(utc_now())
-        for row in rows:
-            await conn.execute(
-                """
-                INSERT INTO event_deliveries (
-                  consumer_id, event_id, delivered_at, attempts, schema_version
-                ) VALUES (?, ?, ?, 1, 1)
-                ON CONFLICT(consumer_id, event_id) DO UPDATE SET
-                  delivered_at=excluded.delivered_at,
-                  attempts=MIN(event_deliveries.attempts + 1, 1000)
-                """,
-                (consumer_id, row["event_id"], now),
-            )
-            payload = sanitize_payload(json.loads(row["payload_json"]))
-            # Keep the streaming contract explicit. Persistence-only fields such
-            # as dedupe_key, expires_at, and schema_version must never become
-            # prompt context for an outbox consumer.
-            event_type = payload.get("event_type") or row["type"]
-            events.append(
-                {
-                    "event_id": row["event_id"],
-                    "event_sequence": row["event_sequence"],
-                    "created_at": row["created_at"],
-                    "type": row["type"],
-                    "event_type": event_type,
-                    "severity": row["severity"],
-                    "payload": payload,
-                    "triggered_at": payload.get("triggered_at"),
-                    "delivered_at": payload.get("delivered_at"),
-                }
-            )
-        await conn.commit()
+        async with self.db.write_transaction() as write_conn:
+            for row in rows:
+                await write_conn.execute(
+                    """
+                    INSERT INTO event_deliveries (
+                      consumer_id, event_id, delivered_at, attempts, schema_version
+                    ) VALUES (?, ?, ?, 1, 1)
+                    ON CONFLICT(consumer_id, event_id) DO UPDATE SET
+                      delivered_at=excluded.delivered_at,
+                      attempts=MIN(event_deliveries.attempts + 1, 1000)
+                    """,
+                    (consumer_id, row["event_id"], now),
+                )
+                payload = sanitize_payload(json.loads(row["payload_json"]))
+                # Keep the streaming contract explicit. Persistence-only fields such
+                # as dedupe_key, expires_at, and schema_version must never become
+                # prompt context for an outbox consumer.
+                event_type = payload.get("event_type") or row["type"]
+                events.append(
+                    {
+                        "event_id": row["event_id"],
+                        "event_sequence": row["event_sequence"],
+                        "created_at": row["created_at"],
+                        "type": row["type"],
+                        "event_type": event_type,
+                        "severity": row["severity"],
+                        "payload": payload,
+                        "triggered_at": payload.get("triggered_at"),
+                        "delivered_at": payload.get("delivered_at"),
+                    }
+                )
         return events
 
     async def ack(self, consumer_id: str, event_id: str) -> None:
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            INSERT INTO event_deliveries (
-              consumer_id, event_id, delivered_at, acked_at, attempts, schema_version
-            ) VALUES (?, ?, ?, ?, 1, 1)
-            ON CONFLICT(consumer_id, event_id) DO UPDATE SET
-              acked_at=excluded.acked_at
-            """,
-            (consumer_id, event_id, to_iso(utc_now()), to_iso(utc_now())),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO event_deliveries (
+                  consumer_id, event_id, delivered_at, acked_at, attempts, schema_version
+                ) VALUES (?, ?, ?, ?, 1, 1)
+                ON CONFLICT(consumer_id, event_id) DO UPDATE SET
+                  acked_at=excluded.acked_at
+                """,
+                (consumer_id, event_id, to_iso(utc_now()), to_iso(utc_now())),
+            )
 
     async def heartbeat(self, consumer_id: str) -> None:
-        conn = self.db.require_conn()
-        await conn.execute(
-            "UPDATE event_consumers SET last_seen_at = ? WHERE consumer_id = ?",
-            (to_iso(utc_now()), consumer_id),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                "UPDATE event_consumers SET last_seen_at = ? WHERE consumer_id = ?",
+                (to_iso(utc_now()), consumer_id),
+            )
 
     async def reap_expired(self) -> None:
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            DELETE FROM event_outbox
-            WHERE expires_at <= ?
-              AND NOT EXISTS (
-                SELECT 1 FROM event_deliveries
-                WHERE event_deliveries.event_id = event_outbox.event_id
-                  AND event_deliveries.acked_at IS NULL
-              )
-            """,
-            (to_iso(utc_now()),),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                DELETE FROM event_outbox
+                WHERE expires_at <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM event_deliveries
+                    WHERE event_deliveries.event_id = event_outbox.event_id
+                      AND event_deliveries.acked_at IS NULL
+                  )
+                """,
+                (to_iso(utc_now()),),
+            )
 
     async def reap_stale_consumers(self, ttl_seconds: int) -> int:
         # Only reap consumers that never received a delivery (registered but
@@ -2700,19 +2788,18 @@ class EventOutboxRepo:
         # reconnect it would re-register fresh and replay the entire unexpired
         # backlog as live wakeups. Its delivery rows are still bounded by event
         # retention (``reap_expired`` cascades them when events expire).
-        conn = self.db.require_conn()
         cutoff = to_iso(utc_now() - timedelta(seconds=ttl_seconds))
-        cursor = await conn.execute(
-            """
-            DELETE FROM event_consumers
-            WHERE COALESCE(last_seen_at, created_at) < ?
-              AND (active_stream_until IS NULL OR active_stream_until < ?)
-              AND NOT EXISTS (
-                SELECT 1 FROM event_deliveries d
-                WHERE d.consumer_id = event_consumers.consumer_id
-              )
-            """,
-            (cutoff, to_iso(utc_now())),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM event_consumers
+                WHERE COALESCE(last_seen_at, created_at) < ?
+                  AND (active_stream_until IS NULL OR active_stream_until < ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM event_deliveries d
+                    WHERE d.consumer_id = event_consumers.consumer_id
+                  )
+                """,
+                (cutoff, to_iso(utc_now())),
+            )
         return cursor.rowcount or 0

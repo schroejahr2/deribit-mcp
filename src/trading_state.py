@@ -9,6 +9,8 @@ The returned shape is suitable both for an MCP read tool and for durable alert e
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import time
 import uuid
@@ -26,8 +28,9 @@ SOURCE_WARMING_UP = "warming_up"
 
 MAX_POSITIONS = 100
 MAX_ORDERS = 100
+MAX_ALERTS = 100
 BOOK_DEPTH = 10
-TAPE_COUNT = 100
+TAPE_COUNT = 1000
 OI_RETENTION_MS = 60 * 60 * 1000
 OI_WINDOWS_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000}
 OI_CURRENT_MAX_AGE_MS = 60_000
@@ -122,6 +125,32 @@ ACCOUNT_FIELDS = (
     "estimated_liquidation_ratio",
     "total_equity_usd",
     "total_margin_balance_usd",
+)
+
+# The state token is an optimistic-concurrency guard for exchange/account
+# mutations, not a market-data fingerprint. Keep these allowlists deliberately
+# narrower than the public snapshot fields: marks, unrealized PnL, margin
+# estimates, liquidation prices, trailing references, and timestamps can all
+# move without a position/order mutation.
+TOKEN_POSITION_FIELDS = (
+    "instrument",
+    "kind",
+    "direction",
+    "size",
+    "size_currency",
+    "average_price",
+    "average_price_usd",
+)
+TOKEN_ORDER_FIELDS = tuple(
+    field
+    for field in ORDER_FIELDS
+    if field not in {"trigger_reference_price", "creation_timestamp", "last_update_timestamp"}
+)
+TOKEN_ACCOUNT_FIELDS = (
+    "currency",
+    "balance",
+    "session_rpl",
+    "futures_session_rpl",
 )
 
 STOP_TYPES = frozenset({"stop_market", "stop_limit", "trailing_stop"})
@@ -233,6 +262,24 @@ def _account_rows(value: Any) -> Optional[list[dict[str, Any]]]:
     return _as_list(value)
 
 
+def _alert_rows(value: Any) -> Optional[list[dict[str, Any]]]:
+    if not isinstance(value, list):
+        return None
+    rows: list[dict[str, Any]] = []
+    for alert in value:
+        if isinstance(alert, dict):
+            row = alert
+        else:
+            to_dict = getattr(alert, "to_dict", None)
+            if not callable(to_dict):
+                return None
+            row = to_dict()
+        if not isinstance(row, dict):
+            return None
+        rows.append(row)
+    return rows
+
+
 def _latest_timestamp(value: Any) -> Optional[int]:
     timestamps: list[int] = []
 
@@ -288,6 +335,7 @@ class TradingStateBuilder:
         self,
         rest_client: Any,
         decision_repo: Any = None,
+        alert_repo: Any = None,
         timeout_seconds: float = 2,
         max_concurrency: int = 6,
     ) -> None:
@@ -297,6 +345,7 @@ class TradingStateBuilder:
             raise ValueError("max_concurrency must be >= 1")
         self.rest_client = rest_client
         self.decision_repo = decision_repo
+        self.alert_repo = alert_repo
         self.timeout_seconds = float(timeout_seconds)
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._oi_samples: dict[str, deque[tuple[int, float]]] = defaultdict(deque)
@@ -537,6 +586,15 @@ class TradingStateBuilder:
             ),
             "account": self._fetch("account", lambda: self._account(currency), _account_rows),
         }
+        list_alerts = getattr(self.alert_repo, "list_all", None)
+        if callable(list_alerts):
+            calls["alerts"] = self._fetch(
+                "alerts",
+                lambda: list_alerts(status="active"),
+                _alert_rows,
+            )
+        else:
+            sources["alerts"] = _skipped("alerts", "not_supported")
         if instrument:
             calls.update(
                 {
@@ -699,7 +757,10 @@ class TradingStateBuilder:
             )
             for label in CHART_CONFIG
         }
-        tape = _tape_summary(sources.get("tape").value if sources.get("tape") else None)
+        tape = _tape_summary(
+            sources.get("tape").value if sources.get("tape") else None,
+            now_ms=started_ms,
+        )
         oi_value = _number(ticker.get("open_interest"))
         raw_book = sources.get("order_book").value if sources.get("order_book") else None
         if oi_value is None and isinstance(raw_book, dict):
@@ -776,6 +837,17 @@ class TradingStateBuilder:
             started_ms,
             include_day_pnl,
         )
+        fee_aware = _build_fee_aware(
+            positions=positions,
+            metadata=metadata,
+            market=market_alias,
+            pnl=pnl,
+            decision_id=decision_id,
+            instrument=instrument,
+            family=family,
+            currency=currency,
+            attribution=(requested_order_group or {}).get("position_attribution", "unavailable"),
+        )
         risk = _build_risk(
             positions,
             orders_by_decision,
@@ -830,11 +902,20 @@ class TradingStateBuilder:
         account_rows = [
             _compact_fields(summary, ACCOUNT_FIELDS) for summary in (sources["account"].value or [])
         ]
+        raw_alerts = sources["alerts"].value or []
+        if len(raw_alerts) > MAX_ALERTS:
+            sources["alerts"].truncated = True
+            sources["alerts"].status = SOURCE_PARTIAL
+        monitoring_rows = raw_alerts[:MAX_ALERTS]
+        active_alerts = [row for row in monitoring_rows if row.get("condition") != "time"]
+        active_timers = [row for row in monitoring_rows if row.get("condition") == "time"]
 
         finished_ms = _now_ms()
         source_meta = {name: result.metadata(finished_ms) for name, result in sources.items()}
         attempted = [result for result in sources.values() if result.status != SOURCE_SKIPPED]
         required_sources = {"positions", "open_orders", "account"}
+        if callable(list_alerts):
+            required_sources.add("alerts")
         if instrument:
             required_sources.update({"ticker", "order_book", "tape", "chart_1m", "chart_5m"})
         if decision_id:
@@ -877,7 +958,7 @@ class TradingStateBuilder:
             else:
                 market_status = ticker_status
 
-        return {
+        state = {
             "schema_version": 1,
             "capture_id": capture_id,
             "capture_started_at": _iso_ms(started_ms),
@@ -904,6 +985,13 @@ class TradingStateBuilder:
             "sources": source_meta,
             "status": {"market": market_status, **statuses},
             "account": {"summaries": account_rows},
+            "monitoring": {
+                "alerts": active_alerts,
+                "timers": active_timers,
+                "alerts_total": len(active_alerts),
+                "timers_total": len(active_timers),
+                "truncated": len(raw_alerts) > len(monitoring_rows),
+            },
             "positions": positions,
             "positions_total": len(raw_positions),
             "positions_truncated": len(raw_positions) > len(positions),
@@ -926,6 +1014,7 @@ class TradingStateBuilder:
                 "open_interest": oi,
             },
             "pnl": pnl,
+            "fee_aware": fee_aware,
             "risk": risk,
             # Stable aliases consumed by the current event bridge/sanitizer.
             "market": market_alias,
@@ -935,6 +1024,8 @@ class TradingStateBuilder:
             "chart_15m": charts["15m"],
             "chart_60m": charts["60m"],
         }
+        state["state_token"] = _state_token(state)
+        return state
 
     def _record_oi(self, instrument: str, timestamp_ms: int, value: float) -> None:
         samples = self._oi_samples[instrument]
@@ -1073,7 +1164,7 @@ def _compact_order_book(value: Any, instrument: Optional[str]) -> dict[str, Any]
     return result
 
 
-def _tape_summary(value: Any) -> dict[str, Any]:
+def _tape_summary(value: Any, *, now_ms: Optional[int] = None) -> dict[str, Any]:
     trades = value.get("trades", []) if isinstance(value, dict) else []
     buy_amount = sell_amount = 0.0
     timestamps: list[int] = []
@@ -1090,7 +1181,7 @@ def _tape_summary(value: Any) -> dict[str, Any]:
         if ts is not None:
             timestamps.append(int(ts))
     total = buy_amount + sell_amount
-    return {
+    result = {
         "count": len(trades),
         "buy_amount": buy_amount,
         "sell_amount": sell_amount,
@@ -1101,6 +1192,75 @@ def _tape_summary(value: Any) -> dict[str, Any]:
         "bounded": bool(isinstance(value, dict) and value.get("bounded")),
         "truncated": bool(isinstance(value, dict) and value.get("truncated")),
     }
+    if now_ms is None:
+        now_ms = max(timestamps) if timestamps else _now_ms()
+    windows: dict[str, dict[str, Any]] = {}
+    for label, window_ms in OI_WINDOWS_MS.items():
+        start_ms = now_ms - window_ms
+        rows = [trade for trade in trades if (_number(trade.get("timestamp")) or 0) >= start_ms]
+        window_buy = sum(
+            _number(trade.get("amount")) or 0
+            for trade in rows
+            if str(trade.get("direction") or "").lower() == "buy"
+        )
+        window_sell = sum(
+            _number(trade.get("amount")) or 0
+            for trade in rows
+            if str(trade.get("direction") or "").lower() == "sell"
+        )
+        window_total = window_buy + window_sell
+        windows[label] = {
+            "count": len(rows),
+            "buy_volume": window_buy,
+            "sell_volume": window_sell,
+            "imbalance": ((window_buy - window_sell) / window_total if window_total else None),
+            "window_start": start_ms,
+            "window_end": now_ms,
+            "truncated": result["truncated"],
+        }
+    result["windows"] = windows
+    return result
+
+
+def _state_token(state: dict[str, Any]) -> str:
+    """Hash exposure state without volatile market-derived values.
+
+    Market prices are revalidated at the mutating tool boundary. The token only
+    protects position/order/protection/account-risk state, so ordinary ticks do
+    not make an otherwise atomic mutation impossible.
+    """
+
+    def rows(value: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
+        normalized = [
+            {field: row[field] for field in fields if row.get(field) is not None}
+            for row in value or []
+            if isinstance(row, dict)
+        ]
+        return sorted(
+            normalized,
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"), default=str),
+        )
+
+    open_orders = rows(state.get("open_orders"), TOKEN_ORDER_FIELDS)
+    protection_orders = [
+        order
+        for order in open_orders
+        if order.get("reduce_only") is True
+        and str(order.get("order_type") or "").lower() in STOP_TYPES | TAKE_TYPES
+    ]
+    risk = state.get("risk")
+    risk = risk if isinstance(risk, dict) else {}
+    aggregate = risk.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, dict) else {}
+    payload = {
+        "positions": rows(state.get("positions"), TOKEN_POSITION_FIELDS),
+        "open_orders": open_orders,
+        "protection_orders": protection_orders,
+        "account": rows((state.get("account") or {}).get("summaries"), TOKEN_ACCOUNT_FIELDS),
+        "risk": {"daily_risk_limit_usd": aggregate.get("daily_risk_limit_usd")},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _volume_summary(charts: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -1763,6 +1923,123 @@ def _build_pnl(
     )
     decision["net_realized_complete"] = funding_attribution == "exact"
     return {"decision": decision, "trading_day": day}
+
+
+def _build_fee_aware(
+    *,
+    positions: list[dict[str, Any]],
+    metadata: Any,
+    market: dict[str, Any],
+    pnl: dict[str, Any],
+    decision_id: Optional[str],
+    instrument: Optional[str],
+    family: str,
+    currency: Optional[str],
+    attribution: str,
+) -> dict[str, Any]:
+    """Estimate decision PnL and break-even using actual entry plus taker exit fees."""
+    base: dict[str, Any] = {
+        "decision_id": decision_id,
+        "instrument": instrument,
+        "status": "unavailable",
+        "net_pnl_after_fees": None,
+        "break_even_exit_price": None,
+        "minimum_profitable_stop": None,
+    }
+    if not decision_id:
+        return {**base, "reason": "decision_id_not_requested"}
+    if attribution != "exact":
+        return {**base, "reason": "position_attribution_not_exact"}
+    position = next((row for row in positions if row.get("instrument") == instrument), None)
+    if position is None or not (_position_amount(position, family) or 0):
+        return {**base, "status": "flat", "reason": "no_open_position"}
+    if family not in {"linear", "inverse"}:
+        return {**base, "reason": "unsupported_instrument_family"}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    fee_rate = _number(metadata.get("taker_commission"))
+    tick_size = _number(metadata.get("tick_size"))
+    if fee_rate is None or fee_rate < 0:
+        return {**base, "reason": "taker_commission_unavailable"}
+    if tick_size is None or tick_size <= 0:
+        return {**base, "reason": "tick_size_unavailable"}
+
+    direction = _direction(position.get("direction"))
+    amount = _position_amount(position, family)
+    entry_price = _number(position.get("average_price")) or _number(
+        position.get("average_price_usd")
+    )
+    if direction not in {"long", "short"} or not amount or not entry_price:
+        return {**base, "reason": "position_basis_unavailable"}
+    exit_price = (
+        _number(market.get("best_bid_price"))
+        if direction == "long"
+        else _number(market.get("best_ask_price"))
+    )
+    exit_price = exit_price or _number(market.get("mark_price"))
+    if exit_price is None or exit_price <= 0:
+        return {**base, "reason": "exit_reference_price_unavailable"}
+
+    decision_pnl = pnl.get("decision") if isinstance(pnl.get("decision"), dict) else {}
+    entry_fees = (
+        decision_pnl.get("entry_fees") if isinstance(decision_pnl.get("entry_fees"), dict) else {}
+    )
+    funding = decision_pnl.get("funding") if isinstance(decision_pnl.get("funding"), dict) else {}
+    pnl_currency = currency or _settlement_currency(instrument, metadata)
+    if not pnl_currency or pnl_currency not in entry_fees:
+        return {**base, "reason": "actual_entry_fee_unavailable"}
+    entry_fee = _number(entry_fees.get(pnl_currency))
+    funding_value = _number(funding.get(pnl_currency)) or 0.0
+    unrealized = _number(position.get("floating_profit_loss"))
+    if unrealized is None:
+        unrealized = _number(position.get("floating_profit_loss_usd"))
+    if entry_fee is None or unrealized is None:
+        return {**base, "reason": "pnl_basis_unavailable"}
+
+    if family == "linear":
+        estimated_exit_fee = amount * exit_price * fee_rate
+        if direction == "long":
+            denominator = amount * (1 - fee_rate)
+            break_even = (amount * entry_price + entry_fee - funding_value) / denominator
+            minimum_profitable = break_even + tick_size
+        else:
+            denominator = amount * (1 + fee_rate)
+            break_even = (amount * entry_price - entry_fee + funding_value) / denominator
+            minimum_profitable = break_even - tick_size
+    else:
+        estimated_exit_fee = amount * fee_rate / exit_price
+        if direction == "long":
+            denominator = amount / entry_price - entry_fee + funding_value
+            break_even = amount * (1 + fee_rate) / denominator if denominator > 0 else None
+            minimum_profitable = break_even + tick_size if break_even is not None else None
+        else:
+            denominator = amount / entry_price + entry_fee - funding_value
+            break_even = amount * (1 - fee_rate) / denominator if denominator > 0 else None
+            minimum_profitable = break_even - tick_size if break_even is not None else None
+    if break_even is None or minimum_profitable is None or minimum_profitable <= 0:
+        return {**base, "reason": "break_even_not_computable"}
+
+    net_pnl = unrealized + funding_value - entry_fee - estimated_exit_fee
+    return {
+        **base,
+        "status": SOURCE_OK,
+        "currency": pnl_currency,
+        "family": family,
+        "direction": direction,
+        "amount": amount,
+        "entry_price": entry_price,
+        "exit_reference_price": exit_price,
+        "exit_fee_rate": fee_rate,
+        "entry_fee_actual": entry_fee,
+        "estimated_exit_fee": estimated_exit_fee,
+        "funding": funding_value,
+        "gross_unrealized_pnl": unrealized,
+        "net_pnl_after_fees": net_pnl,
+        "break_even_exit_price": break_even,
+        "minimum_profitable_stop": minimum_profitable,
+        "tick_size": tick_size,
+        "exit_fee_assumption": "taker_commission_at_current_executable_side",
+        "slippage_included": False,
+    }
 
 
 def _decision_risk_unattributed(

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import time
 
 import pytest
@@ -15,6 +16,29 @@ class FakeDecisionRepo:
 
     async def get(self, decision_id: str):
         return {"id": decision_id, "instrument": self.instrument}
+
+
+class FakeAlertRepo:
+    async def list_all(self, instrument=None, status=None):
+        assert instrument is None
+        assert status == "active"
+        return [
+            {
+                "id": "price-1",
+                "instrument": "BTC_USDC-PERPETUAL",
+                "condition": "crosses_above",
+                "threshold": 120,
+                "trigger_source": "last_price",
+                "status": "active",
+            },
+            {
+                "id": "timer-1",
+                "instrument": "BTC_USDC-PERPETUAL",
+                "condition": "time",
+                "fire_at": "2026-07-18T12:00:00+00:00",
+                "status": "active",
+            },
+        ]
 
 
 class CompleteRest:
@@ -63,6 +87,8 @@ class CompleteRest:
             "kind": "future",
             "instrument_type": "inverse" if self.inverse else "linear",
             "settlement_currency": "BTC" if self.inverse else "USDC",
+            "taker_commission": 0.001,
+            "tick_size": 0.5,
         }
 
     async def get_ticker(self, instrument: str):
@@ -90,7 +116,7 @@ class CompleteRest:
 
     async def get_last_trades_by_instrument(self, instrument: str, count: int, sorting: str):
         assert instrument == self.instrument
-        assert count == 100
+        assert count == 1000
         assert sorting == "desc"
         return {
             "trades": [
@@ -275,6 +301,14 @@ async def test_capture_builds_compact_linear_state_with_pnl_and_protection():
     assert state["pnl"]["decision"]["entry_fees"]["USDC"] == pytest.approx(1)
     assert state["pnl"]["decision"]["exit_fees"] == {}
 
+    fee_aware = state["fee_aware"]
+    assert fee_aware["status"] == "ok"
+    assert fee_aware["net_pnl_after_fees"] == pytest.approx(0.49891)
+    expected_break_even = (0.01 * 100 + 1 - (-0.5)) / (0.01 * (1 - 0.001))
+    assert fee_aware["break_even_exit_price"] == pytest.approx(expected_break_even)
+    assert fee_aware["minimum_profitable_stop"] == pytest.approx(expected_break_even + 0.5)
+    assert fee_aware["slippage_included"] is False
+
     position_risk = state["risk"]["by_position"][0]
     assert position_risk["family"] == "linear"
     assert position_risk["notional_usd"] == pytest.approx(1.1)
@@ -294,6 +328,130 @@ async def test_capture_builds_compact_linear_state_with_pnl_and_protection():
     assert state["chart_5m"] == state["market_data"]["candles"]["5m"]
     assert state["chart_15m"] == state["market_data"]["candles"]["15m"]
     assert state["chart_60m"] == state["market_data"]["candles"]["60m"]
+
+
+async def test_capture_includes_active_monitoring_and_stable_state_token():
+    rest = CompleteRest()
+    builder = TradingStateBuilder(rest, alert_repo=FakeAlertRepo())
+
+    first = await builder.capture(instrument=rest.instrument, include_day_pnl=False)
+    second = await builder.capture(instrument=rest.instrument, include_day_pnl=False)
+
+    assert first["monitoring"]["alerts"][0]["id"] == "price-1"
+    assert first["monitoring"]["timers"][0]["id"] == "timer-1"
+    assert first["monitoring"]["alerts_total"] == 1
+    assert first["monitoring"]["timers_total"] == 1
+    assert len(first["state_token"]) == 64
+    assert first["state_token"] == second["state_token"]
+    assert set(first["market_data"]["tape"]["windows"]) == {"1m", "5m", "15m"}
+    assert first["market_data"]["tape"]["windows"]["1m"]["buy_volume"] == 3
+    assert first["market_data"]["tape"]["windows"]["1m"]["sell_volume"] == 1
+
+
+class ChangedAlertRepo:
+    async def list_all(self, instrument=None, status=None):
+        return [
+            {
+                "id": "price-2",
+                "instrument": "BTC_USDC-PERPETUAL",
+                "condition": "crosses_below",
+                "threshold": 90,
+                "trigger_source": "mark_price",
+                "status": "active",
+            }
+        ]
+
+
+async def test_state_token_ignores_alert_and_timer_changes():
+    rest = CompleteRest()
+
+    with_alerts = await TradingStateBuilder(rest, alert_repo=FakeAlertRepo()).capture(
+        instrument=rest.instrument, include_day_pnl=False
+    )
+    changed_alerts = await TradingStateBuilder(rest, alert_repo=ChangedAlertRepo()).capture(
+        instrument=rest.instrument, include_day_pnl=False
+    )
+
+    assert with_alerts["monitoring"] != changed_alerts["monitoring"]
+    assert with_alerts["state_token"] == changed_alerts["state_token"]
+
+    mutated = dict(with_alerts)
+    mutated["open_orders"] = []
+    assert trading_state._state_token(mutated) != with_alerts["state_token"]
+
+
+async def test_state_token_ignores_market_derived_fields_but_tracks_exposure_changes():
+    state = await TradingStateBuilder(CompleteRest()).capture(
+        instrument="BTC_USDC-PERPETUAL",
+        decision_id="decision-1",
+        include_day_pnl=False,
+    )
+    token = state["state_token"]
+
+    market_tick = copy.deepcopy(state)
+    market_tick["positions"][0].update(
+        {
+            "mark_price": 111,
+            "index_price": 111,
+            "floating_profit_loss": 3,
+            "floating_profit_loss_usd": 3,
+            "initial_margin": 0.2,
+            "maintenance_margin": 0.1,
+            "estimated_liquidation_price": 51,
+        }
+    )
+    market_tick["account"]["summaries"][0].update(
+        {
+            "equity": 103,
+            "margin_balance": 103,
+            "available_funds": 91,
+            "maintenance_margin": 0.1,
+            "session_upl": 3,
+        }
+    )
+    market_tick["open_orders"][0].update(
+        {"trigger_reference_price": 111, "last_update_timestamp": state["captured_at"]}
+    )
+    market_tick["risk"]["by_position"][0]["notional_usd"] = 1.11
+    market_tick["risk"]["aggregate"]["open_notional_usd"] = 1.11
+    market_tick["market"]["mark_price"] = 111
+
+    assert trading_state._state_token(market_tick) == token
+
+    changed_position = copy.deepcopy(state)
+    changed_position["positions"][0]["size_currency"] = 0.02
+    assert trading_state._state_token(changed_position) != token
+
+    changed_order = copy.deepcopy(state)
+    changed_order["open_orders"][0]["trigger_price"] = 96
+    assert trading_state._state_token(changed_order) != token
+
+    changed_balance = copy.deepcopy(state)
+    changed_balance["account"]["summaries"][0]["balance"] = 99
+    assert trading_state._state_token(changed_balance) != token
+
+    changed_protection = copy.deepcopy(state)
+    changed_protection["open_orders"][0]["reduce_only"] = False
+    assert trading_state._state_token(changed_protection) != token
+
+
+async def test_state_token_does_not_change_for_a_new_empty_decision_scope():
+    class NoDecisionHistoryRest(CompleteRest):
+        async def get_order_state_by_label(self, label: str, currency: str):
+            return []
+
+    rest = NoDecisionHistoryRest()
+    builder = TradingStateBuilder(rest)
+
+    unscoped = await builder.capture(instrument=rest.instrument, include_day_pnl=False)
+    scoped = await builder.capture(
+        instrument=rest.instrument,
+        decision_id="new-decision-with-no-orders",
+        include_day_pnl=False,
+    )
+
+    assert scoped["orders_by_decision"] != unscoped["orders_by_decision"]
+    assert scoped["state_token"] == unscoped["state_token"]
 
 
 async def test_observe_ticker_warms_oi_ring_for_capture(monkeypatch):

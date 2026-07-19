@@ -366,6 +366,42 @@ async def test_close_position_missing_size_fields_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("side", "entry", "stop", "take"),
+    [
+        ("buy", 100, 95, 110),
+        ("sell", 100, 105, 90),
+        ("buy", 100, None, 110),
+    ],
+)
+def test_validate_bracket_price_geometry_accepts_protective_layout(side, entry, stop, take):
+    trading.validate_bracket_price_geometry(
+        side=side,
+        entry_price=entry,
+        sl_trigger_price=stop,
+        tp_trigger_price=take,
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "stop", "take", "message"),
+    [
+        ("buy", 101, 110, "stop-loss.*below"),
+        ("buy", 95, 99, "take-profit.*above"),
+        ("sell", 99, 90, "stop-loss.*above"),
+        ("sell", 105, 101, "take-profit.*below"),
+    ],
+)
+def test_validate_bracket_price_geometry_rejects_inverted_layout(side, stop, take, message):
+    with pytest.raises(trading.TradingValidationError, match=message):
+        trading.validate_bracket_price_geometry(
+            side=side,
+            entry_price=100,
+            sl_trigger_price=stop,
+            tp_trigger_price=take,
+        )
+
+
 def test_position_order_amount_uses_family_specific_units_and_absolute_value():
     position = {"size": -3031.0, "size_currency": -0.04}
 

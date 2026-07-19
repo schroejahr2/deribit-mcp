@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+PRICE_TRIGGER_SOURCES = ("last_price", "mark_price", "index_price")
+
 
 class AlertCondition(str, Enum):
     """Alert condition types."""
@@ -51,6 +53,8 @@ class PriceAlert:
     last_trigger_time: Optional[datetime] = None
     fire_at: Optional[datetime] = None
     decision_id: Optional[str] = None
+    trigger_source: str = "last_price"
+    monitor_plan_name: Optional[str] = None
 
     # Internal state for tracking
     _last_price: Optional[float] = None
@@ -69,6 +73,8 @@ class PriceAlert:
             "triggered_at": self.triggered_at.isoformat() if self.triggered_at else None,
             "fire_at": self.fire_at.isoformat() if self.fire_at else None,
             "decision_id": self.decision_id,
+            "trigger_source": self.trigger_source,
+            "monitor_plan_name": self.monitor_plan_name,
             "message": self.message,
             "repeat": self.repeat,
             "cooldown_seconds": self.cooldown_seconds,
@@ -101,6 +107,7 @@ class AlertManager:
         repeat: bool = False,
         cooldown_seconds: int = 300,
         decision_id: Optional[str] = None,
+        trigger_source: str = "last_price",
     ) -> PriceAlert:
         """Add a new price alert."""
         async with self._lock:
@@ -113,6 +120,12 @@ class AlertManager:
                 )
             if condition_enum == AlertCondition.TIME:
                 raise ValueError("Use add_time_alert for time alerts")
+            trigger_source = trigger_source.lower()
+            if trigger_source not in PRICE_TRIGGER_SOURCES:
+                raise ValueError(
+                    f"Invalid trigger_source: {trigger_source}. Must be one of: "
+                    f"{', '.join(PRICE_TRIGGER_SOURCES)}"
+                )
 
             alert = PriceAlert(
                 instrument=instrument.upper(),
@@ -123,6 +136,7 @@ class AlertManager:
                 repeat=repeat,
                 cooldown_seconds=cooldown_seconds,
                 decision_id=decision_id,
+                trigger_source=trigger_source,
             )
 
             self.alerts[alert.id] = alert
@@ -163,6 +177,88 @@ class AlertManager:
                 await self.repo.save(alert)
             logger.info(f"Added time alert {alert.id}: {fire_at.isoformat()}")
             return alert
+
+    async def upsert_monitor_plan(
+        self,
+        *,
+        name: str,
+        instrument: str,
+        upper_threshold: float,
+        lower_threshold: float,
+        fire_at: datetime,
+        trigger_source: str = "last_price",
+        notification_channel: str = "outbox",
+        decision_id: Optional[str] = None,
+        cooldown_seconds: int = 300,
+    ) -> List[PriceAlert]:
+        """Atomically replace one named timer plus upper/lower price alerts."""
+        name = name.strip()
+        if not name:
+            raise ValueError("name must not be empty")
+        if lower_threshold >= upper_threshold:
+            raise ValueError("lower_threshold must be below upper_threshold")
+        trigger_source = trigger_source.lower()
+        if trigger_source not in PRICE_TRIGGER_SOURCES:
+            raise ValueError(
+                f"Invalid trigger_source: {trigger_source}. Must be one of: "
+                f"{', '.join(PRICE_TRIGGER_SOURCES)}"
+            )
+        if fire_at.tzinfo is None:
+            fire_at = fire_at.replace(tzinfo=timezone.utc)
+        fire_at = fire_at.astimezone(timezone.utc)
+        normalized_instrument = instrument.upper()
+        alerts = [
+            PriceAlert(
+                instrument=normalized_instrument,
+                condition=AlertCondition.CROSSES_ABOVE,
+                threshold=upper_threshold,
+                notification_channel=notification_channel,
+                cooldown_seconds=cooldown_seconds,
+                decision_id=decision_id,
+                trigger_source=trigger_source,
+                monitor_plan_name=name,
+            ),
+            PriceAlert(
+                instrument=normalized_instrument,
+                condition=AlertCondition.CROSSES_BELOW,
+                threshold=lower_threshold,
+                notification_channel=notification_channel,
+                cooldown_seconds=cooldown_seconds,
+                decision_id=decision_id,
+                trigger_source=trigger_source,
+                monitor_plan_name=name,
+            ),
+            PriceAlert(
+                instrument=normalized_instrument,
+                condition=AlertCondition.TIME,
+                threshold=None,
+                notification_channel=notification_channel,
+                message=f"Monitor plan {name} review",
+                cooldown_seconds=cooldown_seconds,
+                fire_at=fire_at,
+                decision_id=decision_id,
+                monitor_plan_name=name,
+            ),
+        ]
+        async with self._lock:
+            if self.repo:
+                await self.repo.replace_monitor_plan(
+                    name=name,
+                    instrument=normalized_instrument,
+                    decision_id=decision_id,
+                    alerts=alerts,
+                )
+            self.alerts = {
+                alert_id: alert
+                for alert_id, alert in self.alerts.items()
+                if not (
+                    alert.monitor_plan_name == name
+                    and alert.instrument == normalized_instrument
+                    and alert.decision_id == decision_id
+                )
+            }
+            self.alerts.update({alert.id: alert for alert in alerts})
+        return alerts
 
     async def remove_alert(self, alert_id: str) -> bool:
         """Remove an alert by ID."""
@@ -247,11 +343,24 @@ class AlertManager:
 
         return triggered
 
-    async def process_price_update(self, instrument: str, price: float) -> None:
+    async def process_price_update(
+        self,
+        instrument: str,
+        prices: float | Dict[str, Any],
+    ) -> None:
         """Process a price update and check all relevant alerts."""
         instrument = instrument.upper()
 
-        logger.debug(f"Processing price update for {instrument}: ${price}")
+        if isinstance(prices, dict):
+            price_snapshot = {
+                source: float(prices[source]) if prices.get(source) is not None else None
+                for source in PRICE_TRIGGER_SOURCES
+            }
+        else:
+            numeric_price = float(prices)
+            price_snapshot = {source: numeric_price for source in PRICE_TRIGGER_SOURCES}
+
+        logger.debug("Processing price update for %s: %s", instrument, price_snapshot)
 
         # Get all active alerts for this instrument
         alerts_to_check = [
@@ -264,15 +373,28 @@ class AlertManager:
 
         for alert in alerts_to_check:
             try:
-                should_trigger = await self.check_alert(alert, price)
+                source_price = price_snapshot.get(alert.trigger_source)
+                if source_price is None:
+                    logger.debug(
+                        "Skipping alert %s: ticker has no %s",
+                        alert.id,
+                        alert.trigger_source,
+                    )
+                    continue
+                should_trigger = await self.check_alert(alert, source_price)
 
                 if should_trigger:
                     logger.info(f"Alert {alert.id} triggered for {instrument}")
-                    await self._trigger_alert(alert, price)
+                    await self._trigger_alert(alert, source_price, price_snapshot)
             except Exception as e:
                 logger.error(f"Error checking alert {alert.id}: {e}", exc_info=True)
 
-    async def _trigger_alert(self, alert: PriceAlert, current_price: float) -> None:
+    async def _trigger_alert(
+        self,
+        alert: PriceAlert,
+        current_price: float,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> None:
         """Trigger an alert and send notification."""
         logger.info(f"Triggering alert {alert.id} at price ${current_price}")
 
@@ -297,6 +419,7 @@ class AlertManager:
                 message=message,
                 alert=alert,
                 triggered_price=current_price,
+                price_snapshot=price_snapshot,
             )
         except Exception as e:
             logger.error(f"Failed to send notification for alert {alert.id}: {e}")
@@ -421,15 +544,10 @@ class AlertManager:
         for instrument in sorted(instruments):
             try:
                 ticker = await rest_client.get_ticker(instrument)
-                price = (
-                    ticker.get("mark_price")
-                    or ticker.get("last_price")
-                    or ticker.get("index_price")
-                )
-                if price is None:
+                if not any(ticker.get(source) is not None for source in PRICE_TRIGGER_SOURCES):
                     logger.warning("REST refresh for %s returned no usable price", instrument)
                     continue
-                await self.process_price_update(instrument, float(price))
+                await self.process_price_update(instrument, ticker)
                 refreshed += 1
             except Exception as exc:
                 logger.error(

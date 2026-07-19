@@ -1032,14 +1032,13 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
 ### 18.A Bracket happy-path (market entry + SL + TP)
 
 ```
-18.A.1 mark = derebit-get_current_price(BTC-PERPETUAL).mark_price
-18.A.2 decision_id_br = derebit-record_decision(
-         instrument="BTC-PERPETUAL",
-         reasoning="Phase 18A bracket market long with SL/TP",
-         action_taken="place_bracket"
-       )
-18.A.3 br = derebit-place_bracket(
-         decision_id=decision_id_br,
+18.A.1 state = derebit-get_trading_state(instrument="BTC-PERPETUAL")
+       mark = state.market.mark_price
+18.A.2 br = derebit-place_bracket(
+         decision={
+           "reasoning": "Phase 18A one-call bracket market long with SL/TP",
+           "metadata": {"setup": "smoke", "risk_basis": "3% fixed stop"}
+         },
          instrument="BTC-PERPETUAL",
          side="buy",
          amount=10,
@@ -1049,18 +1048,30 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
          tp_type="take_market",
          tp_trigger_price=mark*1.03,
          trigger_source="mark_price",
+         expected_state_token=state.state_token,
          confirm_live_trade=true
        )
+       decision_id_br = br.decision_id
+       → assert br.decision_id is a non-empty string
+       → assert br.client_order_id is a non-empty string
        → assert br.entry_order_id is a non-empty string
        → assert br.child_order_ids has keys {"sl", "tp"}
        → assert br.child_order_ids_resolved is True
-         (False = trigger_history hydration timed out → see 18.A.4 fallback)
+         (False = trigger_history hydration timed out → see 18.A.3 fallback)
        → assert br.deribit_order_ids ==
                 [br.entry_order_id, br.child_order_ids.sl, br.child_order_ids.tp]
        → NOTE: br.result.order.oto_order_ids contains OTO-... slot refs.
          These are NOT cancelable; do NOT pass them to get_order_state /
          cancel_order. Use br.child_order_ids.{sl,tp} instead.
-18.A.4 # verify operative children via the hydrated ids
+       retry = derebit-place_bracket(
+         decision_id=br.decision_id,
+         instrument="BTC-PERPETUAL", side="buy", amount=10,
+         entry_type="market", sl_type="stop_market", sl_trigger_price=mark*0.97,
+         tp_type="take_market", tp_trigger_price=mark*1.03,
+         trigger_source="mark_price", confirm_live_trade=true
+       )
+       → assert retry.entry_order_id == br.entry_order_id (no duplicate submit)
+18.A.3 # verify operative children via the hydrated ids
        sl_id = br.child_order_ids.sl
        tp_id = br.child_order_ids.tp
        if br.child_order_ids_resolved:
@@ -1077,7 +1088,7 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
          hist = derebit-get_trigger_order_history(currency="BTC", count=10)
          → assert any(e.label == decision_id_br for e in hist.entries)
          note "hydration timeout — children visible in trigger history"
-18.A.5 # cleanup: cancel SL+TP, close position
+18.A.4 # cleanup: cancel SL+TP, close position
        for cid in (sl_id, tp_id):
          if cid:
            try:

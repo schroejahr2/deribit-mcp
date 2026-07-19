@@ -63,6 +63,7 @@ class NotificationChannel(ABC):
         alert: Optional[Any] = None,
         news: Optional[Dict[str, Any]] = None,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
     ) -> bool:
         """Send a notification message."""
         ...
@@ -83,6 +84,7 @@ class TelegramChannel(NotificationChannel):
         alert: Optional[Any] = None,
         news: Optional[Dict[str, Any]] = None,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
     ) -> bool:
         """Send a message via Telegram."""
         try:
@@ -110,6 +112,7 @@ class ConsoleChannel(NotificationChannel):
         alert: Optional[Any] = None,
         news: Optional[Dict[str, Any]] = None,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
     ) -> bool:
         """Log message instead of printing (MCP servers can't use stdout)."""
         # Log to stderr, never stdout (MCP uses stdout for JSON-RPC)
@@ -311,6 +314,7 @@ class OutboxNotificationChannel(NotificationChannel):
         alert: Optional[Any] = None,
         news: Optional[Dict[str, Any]] = None,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
     ) -> bool:
         """Write an alert or news event to the durable outbox."""
         if news:
@@ -329,6 +333,7 @@ class OutboxNotificationChannel(NotificationChannel):
             alert,
             message,
             triggered_price=triggered_price,
+            price_snapshot=price_snapshot,
             snapshot=snapshot,
         )
         if event_id:
@@ -385,6 +390,7 @@ class NotificationManager:
         alert: Optional[Any] = None,
         news: Optional[Dict[str, Any]] = None,
         triggered_price: Optional[float] = None,
+        price_snapshot: Optional[Dict[str, Optional[float]]] = None,
     ) -> bool:
         """Send a notification through specified channel."""
         if channel not in self.channels:
@@ -399,6 +405,7 @@ class NotificationManager:
                 alert=alert,
                 news=news,
                 triggered_price=triggered_price,
+                price_snapshot=price_snapshot,
             )
         except Exception as e:
             logger.error(f"Error sending notification via {channel}: {e}")

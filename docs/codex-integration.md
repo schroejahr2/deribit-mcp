@@ -215,13 +215,20 @@ exchange-trigger delta that caused the wakeup.
 The task uses the attached bounded trading-state snapshot as its first state view. Price alerts,
 `timer_fired`, and semantic order/position events all use the same capture shape as
 `get_trading_state`: account and available margin, current positions, decision-grouped orders and
-entry/SL/TP state, ticker and top-of-book depth, completed 1m/5m market structure, volume and tape
-imbalance, OI changes, net daily/decision PnL, and current stop/notional exposure. Decision PnL
+entry/SL/TP state, active alerts/timers, ticker and top-of-book depth, completed market structure,
+1m/5m/15m taker buy/sell volume and imbalance, OI changes, net daily/decision PnL, and current
+stop/notional exposure. The snapshot also returns a stable mutation-oriented `state_token` plus
+fee-aware `net_pnl_after_fees`, `break_even_exit_price`, and `minimum_profitable_stop`. Decision PnL
 splits entry/exit/unclassified fees and exposes funding attribution; `risk.decision` only reports
 exact exposure when the instrument position can be attributed to that decision. Each source has a
 status and age; the event lifts `snapshot_complete`, `data_age_ms`, `position_status`,
 `entry_status`, `sl_status`, and `tp_status` into typed top-level fields. The task re-reads only when
-a relevant section is stale, failed, missing, or truncated, or immediately before a mutating trade.
+a relevant section is stale, failed, missing, or truncated. Core mutations can instead pass the
+snapshot's `expected_state_token`; the server rejects a stale token before touching Deribit.
+
+Price-alert events include the configured `trigger_source`, its `source_price`, and Last/Mark/Index
+prices. Waiting trigger entries emit `entry_armed`; ordinary open entries emit `entry_opened`.
+Semantic transitions include `leg_role=entry|stop_loss|take_profit`.
 
 Sources are fetched concurrently with bounded timeouts, so a partial REST failure is represented
 explicitly and never prevents delivery. Position, order, candle, tape, and nested decision blocks
@@ -233,17 +240,44 @@ Before dispatch, the bridge compacts oversized application context to at most 3,
 the managed app-server cannot clip the JSON in the middle. `context_compacted=true` describes only
 that transport representation: account data is scoped to the requested currency, order rows are
 bounded, and chart blocks become explicit bounded-window summaries. It does **not** mean the
-exchange source was truncated. Source truth remains in `snapshot.truncated`, `status`, and
-`source_issues`; refresh a relevant section with `get_trading_state` only when those fields or age
-require it.
+exchange source was truncated. The compact projection prioritizes decision-fresh data — positions,
+orders, protection, bid/ask/mark/last/index and spread, top-of-book depth and imbalance, OI with
+1m/5m/15m deltas, 1m/5m/15m tape volume/imbalance windows, day/decision PnL, risk, and the
+snapshot's `state_token` — and sheds charts and monitoring rows first, because historical
+structure can be reused from an earlier full read. To make room, the projection rounds floats
+to eight significant digits, omits all-ok source statuses (only partial/failed/unavailable/
+skipped deviations are listed), skips empty `skipped` PnL/risk decision scaffolding, and never
+repeats values already lifted to the event level (captured_at, data age, leg statuses, trigger
+prices, instrument). Under pressure it degrades sections to their decision essence — window
+imbalances, OI deltas, core account figures — before dropping any of them.
+
+Every delivered event carries an explicit `refresh_required` flag computed from data content, not
+from the transport representation: it is `false` whenever all decision-relevant sections survived
+the projection with healthy source statuses, and `true` only when decision-relevant data is
+missing, truncated, or a decision-critical source failed. `context_minimal=true` therefore does
+**not** imply `refresh_required=true`. With `refresh_required=false` the target thread decides
+directly from the push — a no-trade decision needs zero MCP calls, and a mutation needs exactly
+one call that passes the pushed `state_token` as `expected_state_token` so the server revalidates
+positions, orders, and price atomically before touching Deribit. The `state_token` hashes
+stable exposure-only position, order, protection, account, and stop-risk fields. Market prices,
+unrealized PnL/margin estimates, trailing references, and alert/timer changes never invalidate it;
+fresh trigger validity and bracket geometry are checked separately before submission.
+
+For a new bracket, that one mutation can include
+`decision={reasoning, alert_id?, metadata?}` directly in `place_bracket`; the server derives
+`action_taken=place_bracket`, persists the decision, submits with its ID as the Deribit label,
+and returns decision plus order IDs. Use an existing `decision_id` instead when the decision was
+already recorded. The two fields are mutually exclusive, and retries by the returned
+`decision_id` or `client_order_id` do not submit a second bracket.
 
 If the rich compact projection still exceeds 3,800 bytes, the bridge falls back to a deterministic
-minimal projection instead of blocking the FIFO stream. It keeps trigger identifiers, typed status,
-market, position, order, protection, and bounded chart summaries where they fit, sets
-`context_minimal=true` and `refresh_required=true`, and progressively drops optional account/PnL
-detail. A final essential projection is always available, so one oversized event can never prevent
-later timer, order, or position events from being delivered. The target thread must call
-`get_trading_state` when `refresh_required=true`.
+minimal projection instead of blocking the FIFO stream. It keeps trigger identifiers, typed
+status, market, position, order, protection, and the `state_token` where they fit, sets
+`context_minimal=true`, and progressively drops optional account/PnL detail — recomputing
+`refresh_required` after every drop. A final essential projection is always available, so one
+oversized event can never prevent later timer, order, or position events from being delivered. The
+target thread must call `get_trading_state` only when `refresh_required=true` or the snapshot age
+exceeds 60 seconds.
 
 The bridge ACKs an event only after app-server validates and accepts the RPC request:
 

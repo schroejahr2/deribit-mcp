@@ -169,6 +169,26 @@ async def test_decision_repo_accepts_pnl_outcomes():
 
 
 @pytest.mark.asyncio
+async def test_decision_repo_accepts_bracket_submission_outcomes():
+    db = Database(":memory:")
+    await db.connect()
+    repo = DecisionRepo(db)
+
+    for idx, outcome in enumerate(("submitted", "failed"), start=1):
+        decision_id = f"decision-submit-{idx}"
+        await repo.create(
+            decision_id=decision_id,
+            instrument="BTC-PERPETUAL",
+            reasoning="one-call bracket submission",
+            action_taken="place_bracket",
+        )
+        await repo.update_outcome(decision_id, outcome, outcome_note=f"submission {outcome}")
+        assert (await repo.get(decision_id))["outcome"] == outcome
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_decision_repo_accepts_atomic_bracket_management_actions():
     db = Database(":memory:")
     await db.connect()
@@ -234,6 +254,33 @@ async def test_order_audit_records_and_finds_client_order_id():
     assert row["client_order_id"] == "cid-1"
     assert row["request"]["instrument"] == "BTC-PERPETUAL"
     assert row["response"]["order"]["order_id"] == "order-1"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_order_audit_recovers_successful_bracket_by_decision_id():
+    db = Database(":memory:")
+    await db.connect()
+    repo = OrderAuditRepo(db)
+
+    await repo.record(
+        tool_name="place_bracket",
+        request={
+            "client_order_id": "bracket-client-1",
+            "decision_id": "decision-bracket-1",
+            "_idempotency_scope": {"version": 1, "tool": "place_bracket", "params": {}},
+        },
+        response={"order": {"order_id": "entry-1"}},
+        deribit_order_ids=["entry-1", "sl-1", "tp-1"],
+        decision_id="decision-bracket-1",
+    )
+
+    row = await repo.find_successful_place_bracket_by_decision_id("decision-bracket-1")
+
+    assert row is not None
+    assert row["client_order_id"] == "bracket-client-1"
+    assert row["deribit_order_ids"] == ["entry-1", "sl-1", "tp-1"]
+    assert row["request"]["_idempotency_scope"]["tool"] == "place_bracket"
     await db.close()
 
 

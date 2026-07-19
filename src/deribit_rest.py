@@ -33,6 +33,14 @@ class DeribitAuthError(RuntimeError):
     """Raised when a private endpoint is invoked without a valid access token."""
 
 
+class DeribitAPIError(RuntimeError):
+    """Raised when Deribit accepts an RPC request but rejects the operation."""
+
+    def __init__(self, message: str, *, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+
 class DeribitRestClient:
     """REST API client for Deribit exchange."""
 
@@ -183,7 +191,7 @@ class DeribitRestClient:
                             f"API error on {method}: {detail} "
                             f"(code={code}, HTTP {response.status})"
                         )
-                        raise Exception(f"Deribit API error: {detail}")
+                        raise DeribitAPIError(f"Deribit API error: {detail}", code=code)
 
                     if response.status == 429 and attempt <= MAX_RETRIES:
                         wait = float(response.headers.get("Retry-After", "") or backoff)
@@ -577,11 +585,11 @@ class DeribitRestClient:
     ) -> Dict[str, Any]:
         """Place a native reduce-only OCO protection pair in one request.
 
-        The primary order is submitted through ``private/buy`` or
-        ``private/sell`` and the secondary order is carried in
-        ``otoco_config`` with ``linked_order_type=one_cancels_other``. Both
-        legs use the same direction and label and are reduce-only. Incremental
-        fill handling keeps the sibling amount aligned after a partial exit.
+        Deribit requires exactly two entries in ``otoco_config`` for
+        ``linked_order_type=one_cancels_other``. The entries are the full-size
+        SL and TP legs; both use the same direction and label and are
+        reduce-only. Incremental fill handling keeps sibling amounts aligned
+        after a partial exit.
         """
         from .trading import validate_trigger_params
 
@@ -601,6 +609,17 @@ class DeribitRestClient:
             trigger_offset=secondary_trigger_offset,
             price=secondary_price,
         )
+        primary = {
+            "amount": amount,
+            "direction": side,
+            "type": primary_type,
+            "label": label,
+            "price": primary_price,
+            "reduce_only": True,
+            "trigger": trigger_source,
+            "trigger_price": primary_trigger_price,
+            "trigger_offset": primary_trigger_offset,
+        }
         secondary = {
             "amount": amount,
             "direction": side,
@@ -624,7 +643,7 @@ class DeribitRestClient:
             "trigger_offset": primary_trigger_offset,
             "linked_order_type": "one_cancels_other",
             "trigger_fill_condition": "incremental",
-            "otoco_config": [secondary],
+            "otoco_config": [primary, secondary],
         }
         return await self._rpc(f"private/{side}", params)
 

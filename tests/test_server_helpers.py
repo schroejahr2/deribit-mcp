@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any, Optional
 
 import pytest
 
@@ -47,12 +48,40 @@ class AuditRepo:
     async def record(self, **kwargs):
         self.records.append(kwargs)
 
+    async def find_by_client_order_id(self, client_order_id):
+        for row in reversed(self.records):
+            if row.get("client_order_id") == client_order_id:
+                return row
+        return None
+
+    async def find_successful_place_bracket_by_decision_id(self, decision_id):
+        for row in reversed(self.records):
+            if (
+                row.get("tool_name") == "place_bracket"
+                and row.get("decision_id") == decision_id
+                and row.get("response") is not None
+                and row.get("error") is None
+            ):
+                return row
+        return None
+
 
 class FakeDecisionRepo:
     def __init__(self, known_ids, instruments=None):
         self.known_ids = set(known_ids)
         self.instruments = instruments or {}
+        self.created: list[dict[str, Any]] = []
+        self.current_outcomes: dict[str, Optional[str]] = {}
         self.outcomes: list[tuple[str, str, str]] = []
+
+    async def create(self, **kwargs):
+        decision_id = kwargs["decision_id"]
+        if decision_id in self.known_ids:
+            raise ValueError(f"Decision already exists: {decision_id}")
+        self.known_ids.add(decision_id)
+        self.instruments[decision_id] = kwargs["instrument"]
+        self.created.append(kwargs)
+        return decision_id
 
     async def exists(self, decision_id):
         return decision_id in self.known_ids
@@ -60,6 +89,7 @@ class FakeDecisionRepo:
     async def update_outcome(self, decision_id, outcome, outcome_note=None):
         if decision_id not in self.known_ids:
             raise ValueError(f"Unknown decision_id: {decision_id}")
+        self.current_outcomes[decision_id] = outcome
         self.outcomes.append((decision_id, outcome, outcome_note))
 
     async def get(self, decision_id):
@@ -68,6 +98,7 @@ class FakeDecisionRepo:
         return {
             "id": decision_id,
             "instrument": self.instruments.get(decision_id, "BTC-PERPETUAL"),
+            "outcome": self.current_outcomes.get(decision_id),
         }
 
 
@@ -1803,8 +1834,9 @@ async def test_place_bracket_happy_path_audits_entry_and_children(monkeypatch):
 
     rest = FakeBracketRest()
     audit = AuditRepo()
+    decisions = FakeDecisionRepo(known_ids={"decision-1"})
     app_ctx = SimpleNamespace(
-        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        decision_repo=decisions,
         idempotency_repo=FakeIdempotencyRepo(),
         order_audit_repo=audit,
         rest_client=rest,
@@ -1827,6 +1859,7 @@ async def test_place_bracket_happy_path_audits_entry_and_children(monkeypatch):
         client_order_id="bracket-cid",
     )
 
+    assert response["decision_id"] == "decision-1"
     assert response["client_order_id"] == "bracket-cid"
     # Hydrated operative ids — entry from response, SL/TP from trigger_history.
     assert response["entry_order_id"] == "entry-1"
@@ -1854,6 +1887,222 @@ async def test_place_bracket_happy_path_audits_entry_and_children(monkeypatch):
     # Hydration queried trigger_order_history with the right currency + instrument.
     assert rest.trigger_history_calls[0]["currency"] == "BTC"
     assert rest.trigger_history_calls[0]["instrument_name"] == "BTC-PERPETUAL"
+    assert decisions.current_outcomes["decision-1"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_inline_decision_is_created_and_retry_safe_by_both_ids(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+
+    decisions = FakeDecisionRepo(known_ids=set())
+    rest = FakeBracketRest()
+    app_ctx = SimpleNamespace(
+        decision_repo=decisions,
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+    order = {
+        "instrument": "BTC-PERPETUAL",
+        "side": "buy",
+        "amount": 10,
+        "entry_type": "market",
+        "sl_type": "stop_market",
+        "sl_trigger_price": 75_000,
+        "tp_type": "take_market",
+        "tp_trigger_price": 85_000,
+        "trigger_source": "mark_price",
+        "confirm_live_trade": False,
+    }
+
+    first = await _place_bracket_impl(
+        app_ctx,
+        decision={
+            "reasoning": "Breakout confirmed",
+            "alert_id": "alert-1",
+            "metadata": {"setup": "breakout", "risk_basis": "fixed stop"},
+        },
+        client_order_id="bracket-inline-1",
+        **order,
+    )
+    by_client_id = await _place_bracket_impl(
+        app_ctx,
+        decision={"reasoning": "retry payload is not persisted twice"},
+        client_order_id="bracket-inline-1",
+        **order,
+    )
+    by_decision_id = await _place_bracket_impl(
+        app_ctx,
+        decision_id=first["decision_id"],
+        **order,
+    )
+    app_ctx.idempotency_repo.cache.clear()
+    after_cache_expiry = await _place_bracket_impl(
+        app_ctx,
+        decision_id=first["decision_id"],
+        **order,
+    )
+
+    assert first == by_client_id == by_decision_id == after_cache_expiry
+    assert first["client_order_id"] == "bracket-inline-1"
+    assert len(first["decision_id"]) <= 64
+    assert decisions.created == [
+        {
+            "decision_id": first["decision_id"],
+            "instrument": "BTC-PERPETUAL",
+            "reasoning": "Breakout confirmed",
+            "action_taken": "place_bracket",
+            "alert_id": "alert-1",
+            "metadata": {"setup": "breakout", "risk_basis": "fixed stop"},
+        }
+    ]
+    assert decisions.current_outcomes[first["decision_id"]] == "submitted"
+    assert len(rest.place_otoco_calls) == 1
+    assert rest.place_otoco_calls[0]["label"] == first["decision_id"]
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_inline_decision_rejects_order_fields_and_dual_source(monkeypatch):
+    decisions = FakeDecisionRepo(known_ids={"decision-1"})
+    app_ctx = SimpleNamespace(decision_repo=decisions)
+    order = {
+        "instrument": "BTC-PERPETUAL",
+        "side": "buy",
+        "amount": 10,
+        "entry_type": "market",
+        "sl_type": "stop_market",
+        "tp_type": "take_market",
+        "tp_trigger_price": 85_000,
+        "trigger_source": "mark_price",
+        "confirm_live_trade": False,
+    }
+
+    with pytest.raises(ValueError, match="unexpected fields: amount"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision={"reasoning": "x", "amount": 10},
+            **order,
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision_id="decision-1",
+            decision={"reasoning": "x"},
+            **order,
+        )
+
+    assert decisions.created == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_tool_schema_exposes_optional_inline_decision():
+    tool = (await server_module.build_mcp(lifespan=None).get_tools())["place_bracket"]
+    schema = tool.parameters
+
+    assert "decision" not in schema["required"]
+    assert "decision_id" not in schema["required"]
+    decision_schema = schema["$defs"]["PlaceBracketDecision"]
+    assert decision_schema["required"] == ["reasoning"]
+    assert set(decision_schema["properties"]) == {"reasoning", "alert_id", "metadata"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_outcome"),
+    [
+        (server_module.DeribitAPIError("Deribit API error: not_enough_funds"), "rejected"),
+        (RuntimeError("transport disconnected"), "failed"),
+    ],
+)
+async def test_place_bracket_inline_decision_preserves_submit_failure(
+    monkeypatch,
+    error,
+    expected_outcome,
+):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+
+    decisions = FakeDecisionRepo(known_ids=set())
+    rest = FakeBracketRest()
+
+    async def reject(**kwargs):
+        rest.place_otoco_calls.append(kwargs)
+        raise error
+
+    rest.place_otoco = reject
+    app_ctx = SimpleNamespace(
+        decision_repo=decisions,
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(type(error), match=str(error)):
+        await _place_bracket_impl(
+            app_ctx,
+            decision={"reasoning": "submit once"},
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="stop_market",
+            sl_trigger_price=75_000,
+            tp_type="take_market",
+            tp_trigger_price=85_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+        )
+
+    decision_id = decisions.created[0]["decision_id"]
+    assert decisions.current_outcomes[decision_id] == expected_outcome
+    assert decisions.outcomes[-1][2] == str(error)
+    assert len(rest.place_otoco_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_market_entry_validates_exits_against_fresh_price(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+    monkeypatch.setattr(trading.settings, "deribit_max_amount_inverse", 100_000)
+    monkeypatch.setattr(trading.settings, "deribit_max_notional_usd", 1_000_000)
+
+    decisions = FakeDecisionRepo(known_ids=set())
+    rest = FakeBracketRest(ticker={"last_price": 80_000, "mark_price": 80_000})
+    app_ctx = SimpleNamespace(
+        decision_repo=decisions,
+        idempotency_repo=FakeIdempotencyRepo(),
+        order_audit_repo=AuditRepo(),
+        rest_client=rest,
+        instrument_cache={},
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="take-profit.*above"):
+        await _place_bracket_impl(
+            app_ctx,
+            decision={"reasoning": "invalid market geometry"},
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="market",
+            sl_type="stop_market",
+            sl_trigger_price=75_000,
+            tp_type="take_market",
+            tp_trigger_price=79_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+        )
+
+    decision_id = decisions.created[0]["decision_id"]
+    assert decisions.current_outcomes[decision_id] == "rejected"
+    assert rest.ticker_calls == 1
+    assert rest.place_otoco_calls == []
 
 
 @pytest.mark.asyncio
@@ -2130,6 +2379,37 @@ async def test_place_bracket_rejects_already_triggered_sell(monkeypatch):
             trigger_source="mark_price",
             confirm_live_trade=False,
             client_order_id="bracket-cid-sell-instant",
+        )
+
+    assert rest.place_otoco_calls == []
+    assert decision_repo.outcomes[0][1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_rejects_invalid_exit_geometry_before_submit(monkeypatch):
+    monkeypatch.setattr(trading.settings, "deribit_trading_enabled", True)
+    monkeypatch.setattr(trading.settings, "deribit_test_mode", True)
+
+    decision_repo = FakeDecisionRepo(known_ids={"decision-1"})
+    rest = FakeBracketRest()
+    ctx = _bracket_ctx_with_price(current_price=79_000.0, rest=rest, decision_repo=decision_repo)
+
+    with pytest.raises(trading.TradingValidationError, match="stop-loss.*below"):
+        await _place_bracket_impl(
+            ctx,
+            decision_id="decision-1",
+            instrument="BTC-PERPETUAL",
+            side="buy",
+            amount=10,
+            entry_type="stop_market",
+            entry_trigger_price=80_100,
+            sl_type="stop_market",
+            sl_trigger_price=80_500,
+            tp_type="take_market",
+            tp_trigger_price=82_000,
+            trigger_source="mark_price",
+            confirm_live_trade=False,
+            client_order_id="bracket-cid-invalid-geometry",
         )
 
     assert rest.place_otoco_calls == []
@@ -2776,6 +3056,7 @@ def _management_order(
     reduce_only=True,
     order_state="untriggered",
     is_secondary_oto=False,
+    trigger_fill_condition=None,
     oco_ref=None,
     primary_order_id=None,
 ):
@@ -2794,6 +3075,7 @@ def _management_order(
         "trigger_offset": trigger_offset,
         "price": price,
         "is_secondary_oto": is_secondary_oto,
+        "trigger_fill_condition": trigger_fill_condition,
         "oco_ref": oco_ref,
         "primary_order_id": primary_order_id,
     }
@@ -3196,6 +3478,132 @@ async def test_verify_protection_and_move_stop_select_sl_not_tp(monkeypatch):
     assert rest.edit_calls == [
         ("sl-1", {"amount": 100.0, "trigger_price": 79_500.0, "reduce_only": True})
     ]
+
+
+@pytest.mark.asyncio
+async def test_tighten_protection_positive_net_pnl_gate_allows_edit(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[_management_order("sl-1", "stop_market", trigger_price=79_000)],
+    )
+    app_ctx = _management_context(rest)
+
+    async def capture(**kwargs):
+        return {"fee_aware": {"status": "ok", "net_pnl_after_fees": 0.01}}
+
+    app_ctx.trading_state_builder = SimpleNamespace(capture=capture)
+
+    response = await server_module._tighten_protection_by_label_impl(
+        app_ctx,
+        decision_id="decision-1",
+        new_trigger_price=79_500,
+        require_positive_net_pnl=True,
+        client_order_id="tighten-positive",
+    )
+
+    assert response["changed"] is True
+    assert response["positive_net_pnl_required"] is True
+    assert response["fee_aware_preflight"]["net_pnl_after_fees"] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_tighten_protection_positive_net_pnl_gate_rejects_before_edit(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[_management_order("sl-1", "stop_market", trigger_price=79_000)],
+    )
+    app_ctx = _management_context(rest)
+
+    async def capture(**kwargs):
+        return {"fee_aware": {"status": "ok", "net_pnl_after_fees": -0.001}}
+
+    app_ctx.trading_state_builder = SimpleNamespace(capture=capture)
+
+    with pytest.raises(trading.TradingValidationError, match="not positive"):
+        await server_module._tighten_protection_by_label_impl(
+            app_ctx,
+            decision_id="decision-1",
+            new_trigger_price=79_500,
+            require_positive_net_pnl=True,
+            client_order_id="tighten-negative",
+        )
+
+    assert rest.edit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_fill_tighten_uses_create_first_for_incremental_otoco(
+    monkeypatch,
+):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[
+            _management_order(
+                "entry-sl",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+                trigger_fill_condition="incremental",
+                primary_order_id="filled-entry",
+            ),
+            _management_order(
+                "entry-tp",
+                "take_market",
+                trigger_price=86_000,
+                is_secondary_oto=True,
+                trigger_fill_condition="incremental",
+                primary_order_id="filled-entry",
+            ),
+        ],
+    )
+    app_ctx = _management_context(rest)
+    state_token = "a" * 64
+
+    async def capture(**kwargs):
+        return {
+            "state_token": state_token,
+            "fee_aware": {"status": "ok", "net_pnl_after_fees": 0.02},
+        }
+
+    app_ctx.trading_state_builder = SimpleNamespace(capture=capture)
+
+    first = await server_module._tighten_protection_by_label_impl(
+        app_ctx,
+        decision_id="decision-1",
+        new_trigger_price=79_500,
+        require_positive_net_pnl=True,
+        client_order_id="tighten-incremental",
+        expected_state_token=state_token,
+    )
+    retry = await server_module._tighten_protection_by_label_impl(
+        app_ctx,
+        decision_id="decision-1",
+        new_trigger_price=79_500,
+        require_positive_net_pnl=True,
+        client_order_id="tighten-incremental",
+        expected_state_token=state_token,
+    )
+
+    assert first["status"] == "replaced"
+    assert first["strategy"] == "create_first_replacement"
+    assert first["positive_net_pnl_required"] is True
+    assert first["fee_aware_preflight"]["net_pnl_after_fees"] == 0.02
+    assert retry == first
+    assert rest.edit_calls == []
+    assert len(rest.place_oco_calls) == 1
+    replacement = rest.place_oco_calls[0]
+    assert replacement["amount"] == 100.0
+    assert replacement["primary_type"] == "stop_market"
+    assert replacement["primary_trigger_price"] == 79_500
+    assert replacement["secondary_type"] == "take_market"
+    assert replacement["secondary_trigger_price"] == 86_000
+    place_index = rest.events.index(("place_oco", "decision-1"))
+    cancel_indexes = [index for index, event in enumerate(rest.events) if event[0] == "cancel"]
+    assert cancel_indexes
+    assert place_index < min(cancel_indexes)
 
 
 @pytest.mark.asyncio
@@ -4378,10 +4786,21 @@ class FakeTradingStateBuilder:
         self.observations.append((instrument, ticker))
 
 
+class FakeTokenBuilder:
+    def __init__(self, token):
+        self.token = token
+        self.capture_calls = []
+
+    async def capture(self, **kwargs):
+        self.capture_calls.append(kwargs)
+        return {"state_token": self.token}
+
+
 class FakeAlertToolManager:
     def __init__(self):
         self.time_calls = []
         self.price_calls = []
+        self.monitor_calls = []
 
     async def add_time_alert(self, **kwargs):
         self.time_calls.append(kwargs)
@@ -4399,6 +4818,18 @@ class FakeAlertToolManager:
 
     async def process_price_update(self, instrument, price):
         return None
+
+    async def upsert_monitor_plan(self, **kwargs):
+        self.monitor_calls.append(kwargs)
+        return [
+            SimpleNamespace(
+                to_dict=lambda condition=condition: {
+                    "condition": condition,
+                    "monitor_plan_name": kwargs["name"],
+                }
+            )
+            for condition in ("crosses_above", "crosses_below", "time")
+        ]
 
 
 class FakeAlertWs:
@@ -4445,6 +4876,147 @@ async def test_get_trading_state_tool_delegates_one_bounded_capture():
 
 
 @pytest.mark.asyncio
+async def test_prepare_mutation_accepts_matching_expected_state_token(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    token = "a" * 64
+    builder = FakeTokenBuilder(token)
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        trading_state_builder=builder,
+    )
+
+    await _prepare_mutating_tool(
+        app_ctx,
+        confirm_live_trade=False,
+        decision_id="decision-1",
+        decision_required=True,
+        instrument="BTC-PERPETUAL",
+        expected_state_token=token,
+    )
+
+    assert builder.capture_calls == [
+        {
+            "instrument": "BTC-PERPETUAL",
+            "decision_id": "decision-1",
+            "currency": None,
+            "include_day_pnl": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_mutation_rejects_stale_expected_state_token(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    current_token = "b" * 64
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(known_ids={"decision-1"}),
+        trading_state_builder=FakeTokenBuilder(current_token),
+    )
+
+    with pytest.raises(trading.TradingValidationError, match="state_token mismatch"):
+        await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=False,
+            decision_id="decision-1",
+            decision_required=True,
+            instrument="BTC-PERPETUAL",
+            expected_state_token="a" * 64,
+        )
+
+    assert app_ctx.decision_repo.outcomes == []
+
+
+@pytest.mark.asyncio
+async def test_get_decision_state_returns_decision_and_one_coherent_capture():
+    builder = FakeTradingStateBuilder()
+    decisions = FakeDecisionRepo(known_ids={"decision-1"})
+    app_ctx = SimpleNamespace(decision_repo=decisions, trading_state_builder=builder)
+    tools = await server_module.build_mcp(lifespan=None).get_tools()
+
+    response = json.loads(
+        await tools["get_decision_state"].fn(
+            decision_id="decision-1",
+            ctx=_tool_context(app_ctx),
+        )
+    )
+
+    assert response["decision"]["id"] == "decision-1"
+    assert response["state"]["scope"]["decision_id"] == "decision-1"
+    assert builder.capture_calls == [{"decision_id": "decision-1"}]
+
+
+@pytest.mark.asyncio
+async def test_cancel_decision_removes_parent_children_then_updates_outcome(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(size=0),
+        orders=[
+            _management_order(
+                "entry-1",
+                "limit",
+                direction="buy",
+                reduce_only=False,
+                order_state="open",
+            ),
+            _management_order(
+                "sl-1",
+                "stop_market",
+                trigger_price=79_000,
+                is_secondary_oto=True,
+                primary_order_id="entry-1",
+            ),
+            _management_order(
+                "tp-1",
+                "take_market",
+                trigger_price=85_000,
+                is_secondary_oto=True,
+                primary_order_id="entry-1",
+            ),
+        ],
+    )
+    app_ctx = _management_context(rest)
+
+    response = await server_module._cancel_decision_impl(
+        app_ctx,
+        decision_id="decision-1",
+        client_order_id="cancel-decision-1",
+    )
+
+    assert response["status"] == "cancelled"
+    assert response["flat_verified"] is True
+    assert response["remaining_order_ids"] == []
+    assert set(response["cancelled_order_ids"]) == {"entry-1", "sl-1", "tp-1"}
+    assert rest.orders == []
+    assert app_ctx.decision_repo.outcomes == [
+        (
+            "decision-1",
+            "cancelled",
+            "All labelled parent/OTOCO legs removed and flat state verified.",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_decision_rejects_open_position_without_cancelling(monkeypatch):
+    _enable_management_trading(monkeypatch)
+    rest = FakeManagementRest(
+        position=_management_position(),
+        orders=[_management_order("sl-1", "stop_market", trigger_price=79_000)],
+    )
+    app_ctx = _management_context(rest)
+
+    with pytest.raises(trading.TradingValidationError, match="position is open"):
+        await server_module._cancel_decision_impl(
+            app_ctx,
+            decision_id="decision-1",
+            client_order_id="cancel-decision-open",
+        )
+
+    assert rest.cancel_calls == []
+    assert app_ctx.decision_repo.outcomes == []
+
+
+@pytest.mark.asyncio
 async def test_time_alert_infers_decision_instrument_and_starts_ticker_sampling():
     builder = FakeTradingStateBuilder()
     alerts = FakeAlertToolManager()
@@ -4477,6 +5049,48 @@ async def test_time_alert_infers_decision_instrument_and_starts_ticker_sampling(
     assert response["alert"]["instrument"] == "BTC-PERPETUAL"
     assert ws.subscriptions[0][0] == "BTC-PERPETUAL"
     assert builder.observations[0][0] == "BTC-PERPETUAL"
+
+
+@pytest.mark.asyncio
+async def test_upsert_monitor_plan_delegates_one_named_replacement():
+    builder = FakeTradingStateBuilder()
+    alerts = FakeAlertToolManager()
+    ws = FakeAlertWs()
+    wake_calls = []
+    app_ctx = SimpleNamespace(
+        decision_repo=FakeDecisionRepo(
+            known_ids={"decision-1"},
+            instruments={"decision-1": "BTC-PERPETUAL"},
+        ),
+        alert_manager=alerts,
+        ws_client=ws,
+        trading_state_builder=builder,
+        scheduler=SimpleNamespace(wake=lambda: wake_calls.append(True)),
+        price_cache={},
+    )
+    tools = await server_module.build_mcp(lifespan=None).get_tools()
+
+    response = json.loads(
+        await tools["upsert_monitor_plan"].fn(
+            name="breakout",
+            instrument="BTC-PERPETUAL",
+            upper_threshold=81_000,
+            lower_threshold=79_000,
+            delay_seconds=600,
+            decision_id="decision-1",
+            ctx=_tool_context(app_ctx),
+        )
+    )
+
+    assert response["replaced_atomically"] is True
+    assert [row["condition"] for row in response["alerts"]] == [
+        "crosses_above",
+        "crosses_below",
+        "time",
+    ]
+    assert alerts.monitor_calls[0]["name"] == "breakout"
+    assert alerts.monitor_calls[0]["trigger_source"] == "last_price"
+    assert wake_calls == [True]
 
 
 @pytest.mark.asyncio
