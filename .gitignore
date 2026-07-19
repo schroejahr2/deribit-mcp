@@ -68,6 +68,8 @@ AGENTS.md
 .agents/
 CLAUDE.md
 CALIBER_LEARNINGS.md
+.agent_context/
+.multica/
 
 # Local planning notes
 todo.md
