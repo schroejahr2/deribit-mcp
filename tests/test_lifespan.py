@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 import pytest
 
 from src.config import Settings
+from src.lifespan import _price_update_worker, _trading_event_scope, _trading_event_worker
 
 
 def _settings(**overrides) -> Settings:
@@ -119,3 +123,124 @@ def test_trading_event_outbox_can_be_disabled_without_channels():
         deribit_trading_event_channels="",
     )
     s.validate_startup()
+
+
+@pytest.mark.asyncio
+async def test_price_update_worker_keeps_enqueue_non_blocking_and_processes_fifo():
+    queue: asyncio.Queue[tuple[str, dict[str, float]]] = asyncio.Queue()
+    price_cache: dict[str, float] = {}
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class BlockingAlertManager:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, float]]] = []
+
+        async def process_price_update(self, instrument: str, prices: dict[str, float]) -> None:
+            self.calls.append((instrument, prices))
+            if len(self.calls) == 1:
+                first_started.set()
+                await release_first.wait()
+
+    alert_manager = BlockingAlertManager()
+    worker = asyncio.create_task(_price_update_worker(queue, price_cache, alert_manager))
+    try:
+        queue.put_nowait(("BTC-PERPETUAL", {"mark_price": 1.0}))
+        await asyncio.wait_for(first_started.wait(), timeout=0.5)
+
+        # The callback-facing enqueue path remains synchronous while the first
+        # alert is still awaiting its potentially slow snapshot notification.
+        queue.put_nowait(("ETH-PERPETUAL", {"last_price": 2.0}))
+        queue.put_nowait(("BTC-PERPETUAL", {"index_price": 3.0}))
+        assert queue.qsize() == 2
+        assert alert_manager.calls == [("BTC-PERPETUAL", {"mark_price": 1.0})]
+
+        release_first.set()
+        await asyncio.wait_for(queue.join(), timeout=0.5)
+
+        assert alert_manager.calls == [
+            ("BTC-PERPETUAL", {"mark_price": 1.0}),
+            ("ETH-PERPETUAL", {"last_price": 2.0}),
+            ("BTC-PERPETUAL", {"index_price": 3.0}),
+        ]
+        assert price_cache == {"BTC-PERPETUAL": 3.0, "ETH-PERPETUAL": 2.0}
+    finally:
+        release_first.set()
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+
+def test_trading_event_scope_only_selects_unambiguous_instrument_and_decision():
+    assert _trading_event_scope(
+        {
+            "orders": [
+                {"instrument_name": "BTC-PERPETUAL", "label": "decision-1"},
+                {"instrument_name": "BTC-PERPETUAL", "label": "decision-1"},
+            ]
+        }
+    ) == ("BTC-PERPETUAL", "decision-1")
+    assert _trading_event_scope(
+        {
+            "orders": [
+                {"instrument_name": "BTC-PERPETUAL", "label": "decision-1"},
+                {"instrument_name": "ETH-PERPETUAL", "label": "decision-2"},
+            ]
+        }
+    ) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_trading_event_worker_attaches_one_fresh_snapshot_to_batch():
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+    class Builder:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def capture(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"captured_at": "2026-07-17T14:00:00+00:00"}
+
+    class Outbox:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def insert_deribit_subscription_events(self, channel, data, snapshot=None):
+            self.calls.append((channel, data, snapshot))
+            return ["event-1"]
+
+    builder = Builder()
+    outbox = Outbox()
+    worker = asyncio.create_task(_trading_event_worker(queue, outbox, builder))
+    data = {
+        "orders": [
+            {
+                "instrument_name": "BTC-PERPETUAL",
+                "label": "decision-1",
+                "order_id": "entry-1",
+            }
+        ]
+    }
+    try:
+        queue.put_nowait(("user.changes.future.any.100ms", data))
+        await asyncio.wait_for(queue.join(), timeout=0.5)
+
+        assert builder.calls == [
+            {
+                "instrument": "BTC-PERPETUAL",
+                "decision_id": "decision-1",
+                "include_day_pnl": True,
+            }
+        ]
+        assert outbox.calls == [
+            (
+                "user.changes.future.any.100ms",
+                data,
+                {"captured_at": "2026-07-17T14:00:00+00:00"},
+            )
+        ]
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker

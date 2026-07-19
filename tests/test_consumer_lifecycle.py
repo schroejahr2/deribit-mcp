@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 
 from src.event_outbox import EventOutboxRepo
-from src.persistence import Database
+from src.persistence import Database, to_iso, utc_now
 
 
 @pytest.mark.asyncio
@@ -96,4 +97,54 @@ async def test_heartbeat_updates_last_seen():
     )
     after = (await cursor.fetchone())["last_seen_at"]
     assert after > before
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reap_stale_consumers_removes_idle_without_deliveries():
+    db = Database(":memory:")
+    await db.connect()
+    repo = EventOutboxRepo(db)
+    await repo.register_consumer("c1", "never-streamed")
+
+    conn = db.require_conn()
+    await conn.execute(
+        "UPDATE event_consumers SET last_seen_at = ? WHERE consumer_id = ?",
+        (to_iso(utc_now() - timedelta(hours=2)), "c1"),
+    )
+    await conn.commit()
+
+    reaped = await repo.reap_stale_consumers(ttl_seconds=3600)
+    assert reaped == 1
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS n FROM event_consumers WHERE consumer_id=?", ("c1",)
+    )
+    assert (await cursor.fetchone())["n"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reap_stale_consumers_keeps_consumer_with_delivery_history():
+    db = Database(":memory:")
+    await db.connect()
+    repo = EventOutboxRepo(db)
+    out = await repo.register_consumer("c1", "real-laptop")
+
+    # The consumer streamed and acked an event → it has delivery history.
+    eid = await repo.insert_event("price_alert_triggered", {"message": "hi"})
+    await repo.pending_events("c1")
+    await repo.ack("c1", eid)
+
+    # Idle far beyond the TTL (e.g. laptop off overnight / for weeks).
+    conn = db.require_conn()
+    await conn.execute(
+        "UPDATE event_consumers SET last_seen_at = ? WHERE consumer_id = ?",
+        (to_iso(utc_now() - timedelta(days=30)), "c1"),
+    )
+    await conn.commit()
+
+    reaped = await repo.reap_stale_consumers(ttl_seconds=3600)
+    assert reaped == 0, "a consumer with ACK history must survive reaping"
+    # Token still valid → no 401 → no re-register → no full-backlog replay.
+    assert await repo.authenticate_consumer("c1", out["token"]) is True
     await db.close()

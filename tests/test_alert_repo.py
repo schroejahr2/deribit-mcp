@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,6 +24,7 @@ async def test_save_and_load_active_roundtrip_preserves_cross_state():
         notification_channel="outbox",
         repeat=True,
         cooldown_seconds=600,
+        trigger_source="index_price",
     )
     alert._last_price = 79500.0
     await repo.save(alert)
@@ -36,6 +38,104 @@ async def test_save_and_load_active_roundtrip_preserves_cross_state():
     assert rehydrated._last_price == 79500.0, "cross-state must survive restart"
     assert rehydrated.repeat is True
     assert rehydrated.status == AlertStatus.ACTIVE
+    assert rehydrated.trigger_source == "index_price"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_replace_monitor_plan_is_atomic_and_cancels_prior_members():
+    db = Database(":memory:")
+    await db.connect()
+    repo = AlertRepo(db)
+    old = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.CROSSES_ABOVE,
+        threshold=101,
+        decision_id="decision-1",
+        monitor_plan_name="breakout",
+    )
+    await repo.save(old)
+    replacements = [
+        PriceAlert(
+            instrument="BTC-PERPETUAL",
+            condition=condition,
+            threshold=None if condition == AlertCondition.TIME else threshold,
+            fire_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+                if condition == AlertCondition.TIME
+                else None
+            ),
+            decision_id="decision-1",
+            monitor_plan_name="breakout",
+        )
+        for condition, threshold in (
+            (AlertCondition.CROSSES_ABOVE, 110),
+            (AlertCondition.CROSSES_BELOW, 90),
+            (AlertCondition.TIME, 0),
+        )
+    ]
+
+    await repo.replace_monitor_plan(
+        name="breakout",
+        instrument="BTC-PERPETUAL",
+        decision_id="decision-1",
+        alerts=replacements,
+    )
+
+    active = await repo.load_active()
+    assert {alert.id for alert in active} == {alert.id for alert in replacements}
+    assert all(alert.monitor_plan_name == "breakout" for alert in active)
+    all_alerts = await repo.list_all()
+    assert next(alert for alert in all_alerts if alert.id == old.id).status == AlertStatus.CANCELLED
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_replace_monitor_plan_serializes_with_concurrent_alert_save(monkeypatch):
+    db = Database(":memory:")
+    await db.connect()
+    repo = AlertRepo(db)
+    slow_alert = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.CROSSES_ABOVE,
+        threshold=105,
+        decision_id="decision-1",
+        monitor_plan_name="other-plan",
+    )
+    replacement = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.CROSSES_BELOW,
+        threshold=95,
+        decision_id="decision-1",
+        monitor_plan_name="breakout",
+    )
+    slow_write_started = asyncio.Event()
+    release_slow_write = asyncio.Event()
+    original_save_one = repo._save_one
+
+    async def slow_save_one(conn, alert):
+        await original_save_one(conn, alert)
+        if alert.id == slow_alert.id:
+            slow_write_started.set()
+            await release_slow_write.wait()
+
+    monkeypatch.setattr(repo, "_save_one", slow_save_one)
+    save_task = asyncio.create_task(repo.save(slow_alert))
+    await slow_write_started.wait()
+    replace_task = asyncio.create_task(
+        repo.replace_monitor_plan(
+            name="breakout",
+            instrument="BTC-PERPETUAL",
+            decision_id="decision-1",
+            alerts=[replacement],
+        )
+    )
+    await asyncio.sleep(0)
+    release_slow_write.set()
+    await asyncio.gather(save_task, replace_task)
+
+    active = await repo.load_active()
+    assert {alert.id for alert in active} == {slow_alert.id, replacement.id}
     await db.close()
 
 

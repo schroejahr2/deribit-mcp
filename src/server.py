@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+from typing_extensions import NotRequired, TypedDict
 
 try:
     from fastmcp import FastMCP
@@ -18,12 +21,15 @@ except ImportError:
     _fastmcp_get_context = None  # type: ignore[assignment]
 
 from .alerts import AlertStatus
+from .deribit_rest import DeribitAPIError
 from .news import compact_news_row, push_news
 from .config import settings
 from .lifespan import deribit_lifespan
 from .trading import (
     TradingValidationError,
+    breakeven_trigger,
     calculate_notional_usd,
+    classify_order_role_status,
     compute_effective_price,
     enforce_close_position_limit,
     enforce_notional_limit,
@@ -32,6 +38,10 @@ from .trading import (
     ensure_trading_enabled,
     get_instrument_meta,
     instrument_family,
+    position_order_amount,
+    validate_bracket_price_geometry,
+    validate_stop_improvement,
+    validate_trailing_distance,
     validate_trigger_params,
 )
 
@@ -629,6 +639,58 @@ async def _try_mark_decision_rejected(app_ctx: Any, decision_id: str, reason: st
         logger.warning("Failed to auto-reject decision %s: %s", decision_id, exc)
 
 
+async def _try_mark_decision_failed(app_ctx: Any, decision_id: str, reason: str) -> None:
+    """Best-effort persistence for failures that are not exchange rejections."""
+    try:
+        await app_ctx.decision_repo.update_outcome(decision_id, "failed", reason[:500])
+    except Exception as exc:
+        logger.warning("Failed to mark decision %s failed: %s", decision_id, exc)
+
+
+async def _mark_decision_submitted(app_ctx: Any, decision_id: str) -> None:
+    """Persist exchange acceptance without regressing a later terminal outcome."""
+    decision = await app_ctx.decision_repo.get(decision_id)
+    if decision is None:
+        raise ValueError(f"Unknown decision_id: {decision_id}")
+    if decision.get("outcome") not in {None, "rejected", "failed"}:
+        return
+    await app_ctx.decision_repo.update_outcome(
+        decision_id,
+        "submitted",
+        "Deribit accepted the native OTOCO bracket.",
+    )
+
+
+async def _assert_expected_state_token(
+    app_ctx: Any,
+    expected_state_token: Optional[str],
+    *,
+    decision_id: Optional[str] = None,
+    instrument: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> None:
+    """Reject a mutation when its coherent snapshot token is no longer current."""
+    if expected_state_token is None:
+        return
+    if not expected_state_token or len(expected_state_token) != 64:
+        raise TradingValidationError("expected_state_token must be a 64-character state token")
+    builder = getattr(app_ctx, "trading_state_builder", None)
+    if builder is None:
+        raise TradingValidationError("state-token verification is unavailable")
+    current = await builder.capture(
+        instrument=instrument,
+        decision_id=decision_id,
+        currency=currency,
+        include_day_pnl=False,
+    )
+    current_token = current.get("state_token")
+    if current_token != expected_state_token:
+        raise TradingValidationError(
+            "state_token mismatch; trading state changed since the supplied snapshot "
+            f"(current_state_token={current_token})"
+        )
+
+
 async def _prepare_mutating_tool(
     app_ctx: Any,
     *,
@@ -642,6 +704,9 @@ async def _prepare_mutating_tool(
     close_position: bool = False,
     global_cancel_all: bool = False,
     confirm_cancel_all: bool = False,
+    idempotency_scope: Optional[dict[str, Any]] = None,
+    expected_state_token: Optional[str] = None,
+    currency: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     ensure_trading_enabled()
     ensure_live_trade_confirmed(confirm_live_trade)
@@ -651,9 +716,40 @@ async def _prepare_mutating_tool(
         actual_client_order_id = client_order_id or str(uuid.uuid4())
         cached = await app_ctx.idempotency_repo.get(actual_client_order_id)
         if cached is not None:
+            if idempotency_scope is not None:
+                cached_scope = cached.get("_idempotency_scope")
+                if cached_scope != idempotency_scope:
+                    raise ValueError(
+                        f"client_order_id {actual_client_order_id!r} is already bound to a "
+                        "different or legacy unscoped request"
+                    )
+                cached = {
+                    key: value for key, value in cached.items() if key != "_idempotency_scope"
+                }
             return actual_client_order_id, cached
+        if idempotency_scope is not None:
+            request_scopes = getattr(app_ctx, "_idempotency_request_scopes", None)
+            if request_scopes is None:
+                request_scopes = {}
+                setattr(app_ctx, "_idempotency_request_scopes", request_scopes)
+            registered_scope = request_scopes.get(actual_client_order_id)
+            if registered_scope is not None and registered_scope != idempotency_scope:
+                raise ValueError(
+                    f"client_order_id {actual_client_order_id!r} is already bound to a "
+                    "different management request"
+                )
+            if len(request_scopes) >= 4096 and actual_client_order_id not in request_scopes:
+                request_scopes.pop(next(iter(request_scopes)))
+            request_scopes.setdefault(actual_client_order_id, idempotency_scope)
 
     await _ensure_decision(app_ctx, decision_id, decision_required)
+    await _assert_expected_state_token(
+        app_ctx,
+        expected_state_token,
+        decision_id=decision_id,
+        instrument=instrument,
+        currency=currency,
+    )
 
     try:
         if global_cancel_all and not confirm_cancel_all:
@@ -734,12 +830,46 @@ async def _store_idempotent_response(
         await app_ctx.idempotency_repo.set(client_order_id, response)
 
 
+def _management_idempotency_scope(
+    tool_name: str,
+    decision_id: str,
+    **semantic_params: Any,
+) -> dict[str, Any]:
+    """Build the persisted identity of one management mutation request."""
+
+    return {
+        "version": 1,
+        "tool": tool_name,
+        "decision_id": decision_id,
+        "params": semantic_params,
+    }
+
+
+async def _store_management_idempotent_response(
+    app_ctx: Any,
+    client_order_id: str,
+    response: dict[str, Any],
+    idempotency_scope: dict[str, Any],
+) -> None:
+    """Persist a scoped response without exposing private scope metadata."""
+
+    await _store_idempotent_response(
+        app_ctx,
+        client_order_id,
+        {**response, "_idempotency_scope": idempotency_scope},
+    )
+    request_scopes = getattr(app_ctx, "_idempotency_request_scopes", None)
+    if request_scopes is not None:
+        request_scopes.pop(client_order_id, None)
+
+
 async def _reject_already_triggered_entry(
     app_ctx: Any,
     *,
     instrument: str,
     side: str,
     entry_trigger_price: Optional[float],
+    current_price: Optional[float] = None,
 ) -> None:
     """Reject stop-* bracket entries whose trigger is already past current price.
 
@@ -753,15 +883,9 @@ async def _reject_already_triggered_entry(
     """
     if entry_trigger_price is None:
         return
-    snapshot = await _get_current_price_impl(
-        app_ctx,
-        instrument=instrument,
-        skip_cache=True,
-    )
-    current = snapshot.get("last_price") or snapshot.get("mark_price")
-    if current is None:
-        return
-    current_float = float(current)
+    current_float = current_price
+    if current_float is None:
+        current_float = await _get_fresh_bracket_price(app_ctx, instrument)
     if side == "buy" and current_float >= entry_trigger_price:
         raise TradingValidationError(
             f"buy stop-entry trigger {entry_trigger_price} is already at or below "
@@ -772,6 +896,32 @@ async def _reject_already_triggered_entry(
             f"sell stop-entry trigger {entry_trigger_price} is already at or above "
             f"current price {current_float}; trigger would fire immediately"
         )
+
+
+async def _get_fresh_bracket_price(app_ctx: Any, instrument: str) -> float:
+    """Fetch a non-cached Last/Mark/Index reference for bracket validation."""
+    if getattr(app_ctx, "ws_client", None) is not None and hasattr(app_ctx, "price_cache"):
+        snapshot = await _get_current_price_impl(
+            app_ctx,
+            instrument=instrument,
+            skip_cache=True,
+        )
+    else:
+        snapshot = await app_ctx.rest_client.get_ticker(instrument)
+    current = (
+        snapshot.get("last_price") or snapshot.get("mark_price") or snapshot.get("index_price")
+    )
+    try:
+        current_float = float(current)
+    except (TypeError, ValueError) as exc:
+        raise TradingValidationError(
+            f"Fresh price unavailable for bracket validation on {instrument}"
+        ) from exc
+    if not math.isfinite(current_float) or current_float <= 0:
+        raise TradingValidationError(
+            f"Fresh price unavailable for bracket validation on {instrument}"
+        )
+    return current_float
 
 
 async def _get_current_price_impl(
@@ -832,6 +982,7 @@ async def _place_order_impl(
     trigger_offset: Optional[float],
     client_order_id: Optional[str],
     confirm_live_trade: bool,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared buy/sell implementation. Top-level so tests can import it.
 
@@ -863,6 +1014,12 @@ async def _place_order_impl(
     await _ensure_decision(app_ctx, decision_id, required=True)
     if decision_id is None:
         raise RuntimeError("decision_id missing after _ensure_decision")
+    await _assert_expected_state_token(
+        app_ctx,
+        expected_state_token,
+        decision_id=decision_id,
+        instrument=instrument,
+    )
 
     # 5: trigger-param validation, mit decision-reject
     try:
@@ -1012,6 +1169,7 @@ async def _create_combo_impl(
     decision_id: Optional[str],
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1020,6 +1178,7 @@ async def _create_combo_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        expected_state_token=expected_state_token,
     )
     if cached is not None:
         return cached
@@ -1072,6 +1231,39 @@ def _resolve_bracket_trigger_sources(
         "sl": sl_trigger_source or trigger_source,
         "tp": tp_trigger_source or trigger_source,
     }
+
+
+def _validate_protective_stop_limit_price(
+    *,
+    exit_side: str,
+    trigger_price: Optional[float],
+    limit_price: Optional[float],
+) -> None:
+    """Ensure a protective stop-limit remains executable after triggering."""
+
+    try:
+        trigger = float(trigger_price)  # type: ignore[arg-type]
+        limit = float(limit_price)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise TradingValidationError(
+            "stop_limit protection requires finite positive trigger and limit prices"
+        ) from exc
+    if not math.isfinite(trigger) or not math.isfinite(limit) or trigger <= 0 or limit <= 0:
+        raise TradingValidationError(
+            "stop_limit protection requires finite positive trigger and limit prices"
+        )
+    if exit_side == "sell" and limit > trigger:
+        raise TradingValidationError(
+            f"sell stop_limit protection requires limit price {limit:g} to be at or below "
+            f"trigger price {trigger:g}"
+        )
+    if exit_side == "buy" and limit < trigger:
+        raise TradingValidationError(
+            f"buy stop_limit protection requires limit price {limit:g} to be at or above "
+            f"trigger price {trigger:g}"
+        )
+    if exit_side not in {"buy", "sell"}:
+        raise TradingValidationError("exit_side must be buy or sell")
 
 
 def _validate_bracket_params(
@@ -1173,6 +1365,12 @@ def _validate_bracket_params(
         trigger_offset=sl_trigger_offset,
         price=sl_limit_price,
     )
+    if sl_type == "stop_limit":
+        _validate_protective_stop_limit_price(
+            exit_side="sell" if side == "buy" else "buy",
+            trigger_price=sl_trigger_price,
+            limit_price=sl_limit_price,
+        )
     validate_trigger_params(
         tp_type,
         trigger=sources["tp"],
@@ -1180,12 +1378,155 @@ def _validate_bracket_params(
         trigger_offset=None,
         price=None,
     )
+    planned_entry_price = entry_trigger_price or entry_price
+    if planned_entry_price is not None:
+        validate_bracket_price_geometry(
+            side=side,
+            entry_price=planned_entry_price,
+            sl_trigger_price=sl_trigger_price,
+            tp_trigger_price=tp_trigger_price,
+        )
+
+
+class PlaceBracketDecision(TypedDict):
+    reasoning: str
+    alert_id: NotRequired[str]
+    metadata: NotRequired[Dict[str, Any]]
+
+
+_PLACE_BRACKET_DECISION_FIELDS = frozenset(PlaceBracketDecision.__annotations__)
+
+
+def _normalize_place_bracket_decision(decision: PlaceBracketDecision) -> dict[str, Any]:
+    """Validate the inline audit payload without accepting duplicate order data."""
+    if not isinstance(decision, dict):
+        raise ValueError("decision must be an object")
+    unexpected = sorted(set(decision) - _PLACE_BRACKET_DECISION_FIELDS)
+    if unexpected:
+        raise ValueError(
+            "decision accepts only reasoning, alert_id, and metadata; "
+            f"unexpected fields: {', '.join(unexpected)}"
+        )
+    reasoning = decision.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        raise ValueError("decision.reasoning must be a non-empty string")
+    alert_id = decision.get("alert_id")
+    if alert_id is not None and (not isinstance(alert_id, str) or not alert_id.strip()):
+        raise ValueError("decision.alert_id must be a non-empty string when provided")
+    metadata = decision.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("decision.metadata must be an object when provided")
+    return {
+        "reasoning": reasoning.strip(),
+        "alert_id": alert_id.strip() if isinstance(alert_id, str) else None,
+        "metadata": metadata,
+    }
+
+
+def _place_bracket_idempotency_scope(**params: Any) -> dict[str, Any]:
+    """Bind one retry key to the exchange-relevant bracket request."""
+    return {"version": 1, "tool": "place_bracket", "params": params}
+
+
+async def _load_scoped_place_bracket_response(
+    app_ctx: Any,
+    keys: list[Optional[str]],
+    scope: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    for key in dict.fromkeys(value for value in keys if value):
+        cached = await app_ctx.idempotency_repo.get(key)
+        if cached is None:
+            continue
+        if cached.get("_idempotency_scope") != scope:
+            raise ValueError(
+                f"idempotency key {key!r} is already bound to a different "
+                "or legacy unscoped place_bracket request"
+            )
+        return {name: value for name, value in cached.items() if name != "_idempotency_scope"}
+    return None
+
+
+def _place_bracket_response_from_audit(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Rebuild the compact response from a durable successful audit row."""
+    if row.get("tool_name") != "place_bracket" or row.get("error"):
+        return None
+    request = row.get("request")
+    response = row.get("response")
+    if not isinstance(request, dict) or not isinstance(response, dict):
+        return None
+    decision_id = row.get("decision_id") or request.get("decision_id")
+    client_order_id = row.get("client_order_id") or request.get("client_order_id")
+    if not decision_id or not client_order_id:
+        return None
+
+    order = response.get("order")
+    entry_order_id = (
+        str(order["order_id"]) if isinstance(order, dict) and order.get("order_id") else None
+    )
+    order_ids = [str(value) for value in row.get("deribit_order_ids") or [] if value]
+    child_ids = [value for value in order_ids if value != entry_order_id]
+    resolved_children = {
+        "sl": child_ids[0] if child_ids else None,
+        "tp": child_ids[1] if len(child_ids) > 1 else None,
+    }
+    children_resolved = bool(resolved_children["sl"] and resolved_children["tp"])
+    return {
+        "decision_id": str(decision_id),
+        "client_order_id": str(client_order_id),
+        "result": _compact_deribit_order_result(response),
+        "deribit_order_ids": order_ids or _extract_bracket_order_ids(response) or None,
+        "entry_order_id": entry_order_id,
+        "child_order_ids": resolved_children,
+        "child_order_ids_resolved": children_resolved,
+        "child_order_resolution": "resolved" if children_resolved else "pending",
+    }
+
+
+async def _load_audited_place_bracket_response(
+    app_ctx: Any,
+    *,
+    client_order_id: str,
+    decision_id: str,
+    scope: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Recover accepted brackets after cache expiry without resubmitting."""
+    audit_repo = app_ctx.order_audit_repo
+    rows: list[Optional[dict[str, Any]]] = []
+    find_client = getattr(audit_repo, "find_by_client_order_id", None)
+    if find_client is not None:
+        rows.append(await find_client(client_order_id))
+    find_decision = getattr(audit_repo, "find_successful_place_bracket_by_decision_id", None)
+    if find_decision is not None:
+        rows.append(await find_decision(decision_id))
+
+    for row in rows:
+        if not row:
+            continue
+        request = row.get("request")
+        if not isinstance(request, dict) or request.get("_idempotency_scope") != scope:
+            raise ValueError(
+                "Retry key is bound to a different or legacy unscoped audited "
+                "place_bracket request"
+            )
+        envelope = _place_bracket_response_from_audit(row)
+        if envelope is None:
+            continue
+        for key in dict.fromkeys((client_order_id, envelope["decision_id"])):
+            await _store_management_idempotent_response(
+                app_ctx,
+                key,
+                envelope,
+                scope,
+            )
+        return envelope
+    return None
 
 
 async def _place_bracket_impl(
     app_ctx: Any,
     *,
-    decision_id: Optional[str],
+    decision_id: Optional[str] = None,
+    decision: Optional[PlaceBracketDecision] = None,
     instrument: str,
     side: str,
     amount: float,
@@ -1207,6 +1548,141 @@ async def _place_bracket_impl(
     sl_trigger_source: Optional[str] = None,
     tp_trigger_source: Optional[str] = None,
     client_order_id: Optional[str] = None,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve/create one decision and place its bracket exactly once per retry key."""
+    if (decision_id is None) == (decision is None):
+        raise ValueError("Provide exactly one of decision or decision_id")
+    normalized_decision = (
+        _normalize_place_bracket_decision(decision) if decision is not None else None
+    )
+    resolved_decision_id = decision_id or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"deribit-mcp:place_bracket:{client_order_id}")
+        if client_order_id
+        else uuid.uuid4()
+    )
+    actual_client_order_id = client_order_id or resolved_decision_id
+    scope = _place_bracket_idempotency_scope(
+        instrument=instrument,
+        side=side,
+        amount=amount,
+        entry_type=entry_type,
+        sl_type=sl_type,
+        tp_type=tp_type,
+        tp_trigger_price=tp_trigger_price,
+        trigger_source=trigger_source,
+        sl_trigger_price=sl_trigger_price,
+        sl_trigger_offset=sl_trigger_offset,
+        entry_price=entry_price,
+        entry_trigger_price=entry_trigger_price,
+        entry_post_only=entry_post_only,
+        entry_reject_post_only=entry_reject_post_only,
+        sl_limit_price=sl_limit_price,
+        trigger_fill_condition=trigger_fill_condition,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+    )
+    lock_key = decision_id or actual_client_order_id
+    async with _decision_mutation_lock(app_ctx, f"place_bracket:{lock_key}"):
+        cached = await _load_scoped_place_bracket_response(
+            app_ctx,
+            [actual_client_order_id, decision_id],
+            scope,
+        )
+        if cached is not None:
+            cached_decision_id = cached.get("decision_id") or decision_id
+            if not cached_decision_id:
+                raise ValueError("Cached place_bracket response is missing decision_id")
+            await _mark_decision_submitted(app_ctx, str(cached_decision_id))
+            return {**cached, "decision_id": str(cached_decision_id)}
+
+        audited = await _load_audited_place_bracket_response(
+            app_ctx,
+            client_order_id=actual_client_order_id,
+            decision_id=resolved_decision_id,
+            scope=scope,
+        )
+        if audited is not None:
+            await _mark_decision_submitted(app_ctx, audited["decision_id"])
+            return audited
+
+        if normalized_decision is not None:
+            await app_ctx.decision_repo.create(
+                decision_id=resolved_decision_id,
+                instrument=instrument,
+                reasoning=normalized_decision["reasoning"],
+                action_taken="place_bracket",
+                alert_id=normalized_decision["alert_id"],
+                metadata=normalized_decision["metadata"],
+            )
+
+        try:
+            response = await _place_bracket_order_impl(
+                app_ctx,
+                decision_id=resolved_decision_id,
+                instrument=instrument,
+                side=side,
+                amount=amount,
+                entry_type=entry_type,
+                sl_type=sl_type,
+                tp_type=tp_type,
+                tp_trigger_price=tp_trigger_price,
+                trigger_source=trigger_source,
+                confirm_live_trade=confirm_live_trade,
+                sl_trigger_price=sl_trigger_price,
+                sl_trigger_offset=sl_trigger_offset,
+                entry_price=entry_price,
+                entry_trigger_price=entry_trigger_price,
+                entry_post_only=entry_post_only,
+                entry_reject_post_only=entry_reject_post_only,
+                sl_limit_price=sl_limit_price,
+                trigger_fill_condition=trigger_fill_condition,
+                entry_trigger_source=entry_trigger_source,
+                sl_trigger_source=sl_trigger_source,
+                tp_trigger_source=tp_trigger_source,
+                client_order_id=actual_client_order_id,
+                expected_state_token=expected_state_token,
+                idempotency_scope=scope,
+            )
+        except (DeribitAPIError, TradingValidationError, ValueError) as exc:
+            await _try_mark_decision_rejected(app_ctx, resolved_decision_id, str(exc))
+            raise
+        except Exception as exc:
+            await _try_mark_decision_failed(app_ctx, resolved_decision_id, str(exc))
+            raise
+
+        await _mark_decision_submitted(app_ctx, resolved_decision_id)
+        return response
+
+
+async def _place_bracket_order_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    instrument: str,
+    side: str,
+    amount: float,
+    entry_type: str,
+    sl_type: str,
+    tp_type: str,
+    tp_trigger_price: float,
+    trigger_source: str,
+    confirm_live_trade: bool,
+    sl_trigger_price: Optional[float] = None,
+    sl_trigger_offset: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    entry_trigger_price: Optional[float] = None,
+    entry_post_only: bool = False,
+    entry_reject_post_only: Optional[bool] = None,
+    sl_limit_price: Optional[float] = None,
+    trigger_fill_condition: str = "incremental",
+    entry_trigger_source: Optional[str] = None,
+    sl_trigger_source: Optional[str] = None,
+    tp_trigger_source: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    expected_state_token: Optional[str] = None,
+    idempotency_scope: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1215,67 +1691,73 @@ async def _place_bracket_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        idempotency_scope=idempotency_scope,
+        instrument=instrument,
+        expected_state_token=expected_state_token,
     )
     if cached is not None:
-        return cached
-    if decision_id is None:
-        raise RuntimeError("decision_id missing after _prepare_mutating_tool")
+        return {**cached, "decision_id": decision_id}
 
-    try:
-        _validate_bracket_params(
+    _validate_bracket_params(
+        side=side,
+        entry_type=entry_type,
+        entry_price=entry_price,
+        entry_trigger_price=entry_trigger_price,
+        sl_type=sl_type,
+        sl_trigger_price=sl_trigger_price,
+        sl_trigger_offset=sl_trigger_offset,
+        sl_limit_price=sl_limit_price,
+        tp_type=tp_type,
+        tp_trigger_price=tp_trigger_price,
+        trigger_source=trigger_source,
+        entry_trigger_source=entry_trigger_source,
+        sl_trigger_source=sl_trigger_source,
+        tp_trigger_source=tp_trigger_source,
+        trigger_fill_condition=trigger_fill_condition,
+    )
+    fresh_price = await _get_fresh_bracket_price(app_ctx, instrument)
+    if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
+        await _reject_already_triggered_entry(
+            app_ctx,
+            instrument=instrument,
             side=side,
-            entry_type=entry_type,
-            entry_price=entry_price,
             entry_trigger_price=entry_trigger_price,
-            sl_type=sl_type,
+            current_price=fresh_price,
+        )
+    elif entry_type == "market":
+        validate_bracket_price_geometry(
+            side=side,
+            entry_price=fresh_price,
             sl_trigger_price=sl_trigger_price,
-            sl_trigger_offset=sl_trigger_offset,
-            sl_limit_price=sl_limit_price,
-            tp_type=tp_type,
             tp_trigger_price=tp_trigger_price,
-            trigger_source=trigger_source,
-            entry_trigger_source=entry_trigger_source,
-            sl_trigger_source=sl_trigger_source,
-            tp_trigger_source=tp_trigger_source,
-            trigger_fill_condition=trigger_fill_condition,
         )
-        if entry_type in BRACKET_TRIGGER_ENTRY_TYPES:
-            await _reject_already_triggered_entry(
-                app_ctx,
-                instrument=instrument,
-                side=side,
-                entry_trigger_price=entry_trigger_price,
-            )
-        entry_effective_price = compute_effective_price(
-            entry_type,
-            entry_trigger_price,
-            entry_price,
-        )
-        if entry_effective_price is None and entry_type == "limit":
-            entry_effective_price = entry_price
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=entry_effective_price,
-        )
-        # Trailing-stop SL has no fixed trigger price at submit time, so the
-        # notional guard falls back to current mark (effective_price=None).
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=sl_trigger_price,
-        )
-        await _validate_order_amount(
-            app_ctx,
-            instrument,
-            amount,
-            effective_price=tp_trigger_price,
-        )
-    except (TradingValidationError, ValueError) as exc:
-        await _try_mark_decision_rejected(app_ctx, decision_id, str(exc))
-        raise
+    entry_effective_price = compute_effective_price(
+        entry_type,
+        entry_trigger_price,
+        entry_price,
+    )
+    if entry_effective_price is None and entry_type == "limit":
+        entry_effective_price = entry_price
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=entry_effective_price,
+    )
+    # Trailing-stop SL has no fixed trigger price at submit time, so the
+    # notional guard falls back to current mark (effective_price=None).
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=sl_trigger_price,
+    )
+    await _validate_order_amount(
+        app_ctx,
+        instrument,
+        amount,
+        effective_price=tp_trigger_price,
+    )
 
     # Hardening: a crossing post_only entry is silently repriced by Deribit to
     # the next maker price unless reject_post_only is set. Default post_only
@@ -1337,6 +1819,7 @@ async def _place_bracket_impl(
         "tp_trigger_source": resolved_sources["tp"],
         "trigger_fill_condition": trigger_fill_condition,
         "otoco_config": otoco_config,
+        "_idempotency_scope": idempotency_scope,
     }
     hydration_holder: dict[str, Optional[str]] = {"sl": None, "tp": None}
 
@@ -1401,6 +1884,7 @@ async def _place_bracket_impl(
         operative_ids.append(hydration_holder["tp"])
     fallback_ids = _extract_bracket_order_ids(result) or None
     envelope = {
+        "decision_id": decision_id,
         "client_order_id": actual_id,
         "result": _compact_deribit_order_result(result),
         "deribit_order_ids": operative_ids or fallback_ids,
@@ -1411,7 +1895,27 @@ async def _place_bracket_impl(
             "resolved" if hydration_holder.get("sl") and hydration_holder.get("tp") else "pending"
         ),
     }
-    await _store_idempotent_response(app_ctx, actual_id, envelope)
+    if idempotency_scope is None:
+        idempotency_scope = _place_bracket_idempotency_scope(
+            **{
+                key: value
+                for key, value in request.items()
+                if key not in {"decision_id", "client_order_id", "otoco_config"}
+            }
+        )
+    await _store_management_idempotent_response(
+        app_ctx,
+        actual_id,
+        envelope,
+        idempotency_scope,
+    )
+    if actual_id != decision_id:
+        await _store_management_idempotent_response(
+            app_ctx,
+            decision_id,
+            envelope,
+            idempotency_scope,
+        )
     return envelope
 
 
@@ -1422,6 +1926,7 @@ async def _cancel_orders_by_label_impl(
     decision_id: Optional[str],
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     actual_id, cached = await _prepare_mutating_tool(
         app_ctx,
@@ -1430,6 +1935,8 @@ async def _cancel_orders_by_label_impl(
         decision_required=True,
         client_order_id=client_order_id,
         use_idempotency=True,
+        expected_state_token=expected_state_token,
+        currency=currency,
     )
     if cached is not None:
         return cached
@@ -1480,12 +1987,14 @@ async def _edit_order_by_label_impl(
     decision_id: Optional[str],
     amount: Optional[float] = None,
     price: Optional[float] = None,
+    trigger_price: Optional[float] = None,
     post_only: Optional[bool] = None,
     reject_post_only: Optional[bool] = None,
     reduce_only: Optional[bool] = None,
     advanced: Optional[str] = None,
     client_order_id: Optional[str] = None,
     confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
 ) -> dict[str, Any]:
     # Pre-validation runs before _prepare_mutating_tool, so its failures need
     # the same auto-reject contract as the preflight checks below — otherwise a
@@ -1495,8 +2004,8 @@ async def _edit_order_by_label_impl(
             raise ValueError("instrument is required for edit_order_by_label")
         if not currency:
             raise ValueError("currency is required for edit_order_by_label")
-        if amount is None and price is None:
-            raise ValueError("amount or price is required for edit_order_by_label")
+        if amount is None and price is None and trigger_price is None:
+            raise ValueError("amount, price or trigger_price is required for edit_order_by_label")
     except ValueError as exc:
         if decision_id:
             await _try_mark_decision_rejected(app_ctx, decision_id, str(exc))
@@ -1513,6 +2022,8 @@ async def _edit_order_by_label_impl(
         use_idempotency=True,
         instrument=instrument,
         amount=amount,
+        expected_state_token=expected_state_token,
+        currency=currency,
     )
     if cached is not None:
         return cached
@@ -1544,13 +2055,13 @@ async def _edit_order_by_label_impl(
         raise
 
     # Deribit's edit_by_label requires `amount` (or `contracts`) even for
-    # price-only edits — unlike the single-order `edit` endpoint which lets
-    # you omit amount. Backfill from the preflight order so callers can keep
-    # the natural "edit price, keep size" pattern; the audit row records both
-    # the caller's intent (`amount`) and what was actually sent
+    # price-only or trigger-only edits — unlike the single-order `edit`
+    # endpoint. Backfill from the preflight order so callers can keep the
+    # natural "edit price/trigger, keep size" pattern; the audit row records
+    # both the caller's intent (`amount`) and what was actually sent
     # (`effective_amount`).
     effective_amount = amount
-    if effective_amount is None and price is not None:
+    if effective_amount is None and (price is not None or trigger_price is not None):
         preflight_amount = scoped[0].get("amount")
         if preflight_amount is None:
             try:
@@ -1569,6 +2080,7 @@ async def _edit_order_by_label_impl(
         "amount": amount,
         "effective_amount": effective_amount,
         "price": price,
+        "trigger_price": trigger_price,
         "decision_id": decision_id,
         "client_order_id": actual_id,
         "preflight_order_id": scoped[0].get("order_id"),
@@ -1587,6 +2099,7 @@ async def _edit_order_by_label_impl(
             decision_id,
             amount=effective_amount,
             price=price,
+            trigger_price=trigger_price,
             post_only=post_only,
             reject_post_only=reject_post_only,
             reduce_only=reduce_only,
@@ -1596,6 +2109,1925 @@ async def _edit_order_by_label_impl(
     envelope = {"client_order_id": actual_id, "result": _compact_deribit_order_result(result)}
     await _store_idempotent_response(app_ctx, actual_id, envelope)
     return envelope
+
+
+def _decision_mutation_lock(app_ctx: Any, decision_id: str) -> asyncio.Lock:
+    """Return the process-local lock serialising one decision's mutations."""
+
+    locks = getattr(app_ctx, "trading_locks", None)
+    if locks is None:
+        locks = {}
+        setattr(app_ctx, "trading_locks", locks)
+    return locks.setdefault(decision_id, asyncio.Lock())
+
+
+async def _decision_instrument(app_ctx: Any, decision_id: str) -> str:
+    if not decision_id:
+        raise ValueError("decision_id is required")
+    decision = await app_ctx.decision_repo.get(decision_id)
+    if not decision:
+        raise ValueError(f"Unknown decision_id: {decision_id}")
+    instrument = decision.get("instrument")
+    if not instrument:
+        raise ValueError(f"Decision {decision_id} has no instrument")
+    return str(instrument).upper()
+
+
+def _remaining_order_amount(order: dict[str, Any]) -> float:
+    amount = _as_float(order.get("amount")) or 0.0
+    filled = _as_float(order.get("filled_amount")) or 0.0
+    return max(0.0, amount - filled)
+
+
+def _opposite_direction(position_direction: str) -> str:
+    if position_direction == "buy":
+        return "sell"
+    if position_direction == "sell":
+        return "buy"
+    raise TradingValidationError("An open position must have direction buy or sell")
+
+
+async def _verify_protection_impl(app_ctx: Any, *, decision_id: str) -> dict[str, Any]:
+    """Return a compact, read-only protection assessment for one decision."""
+
+    instrument = await _decision_instrument(app_ctx, decision_id)
+    meta = await get_instrument_meta(app_ctx, instrument)
+    currency = _currency_from_instrument(instrument)
+    position, raw_orders = await asyncio.gather(
+        app_ctx.rest_client.get_position(instrument),
+        app_ctx.rest_client.get_open_orders_by_label(currency=currency, label=decision_id),
+    )
+    position = position or {}
+    required_amount = position_order_amount(meta, position) if position else 0.0
+    position_direction = str(position.get("direction") or "zero").lower()
+    position_open = required_amount > 0
+    expected_exit_direction = _opposite_direction(position_direction) if position_open else None
+
+    scoped_orders = [
+        order
+        for order in raw_orders or []
+        if isinstance(order, dict)
+        and order.get("instrument_name") == instrument
+        and (not order.get("label") or order.get("label") == decision_id)
+    ]
+    primary_states = {
+        str(order.get("order_id")): str(order.get("order_state") or "").lower()
+        for order in scoped_orders
+        if order.get("order_id") and order.get("reduce_only") is not True
+    }
+    fallback_primary_state = next(iter(primary_states.values()), None)
+
+    orders: list[dict[str, Any]] = []
+    active_stop_coverage = 0.0
+    active_tp_coverage = 0.0
+    issues: list[str] = []
+    for order in scoped_orders:
+        primary_id = order.get("primary_order_id")
+        classification = classify_order_role_status(
+            order,
+            position_open=position_open,
+            primary_order_state=(
+                primary_states.get(str(primary_id)) if primary_id else fallback_primary_state
+            ),
+        )
+        remaining = _remaining_order_amount(order)
+        direction_ok = not position_open or order.get("direction") == expected_exit_direction
+        stop_limit_price_ok = True
+        if (
+            position_open
+            and classification["role"] == "sl"
+            and (order.get("order_type") or order.get("type")) == "stop_limit"
+        ):
+            try:
+                _validate_protective_stop_limit_price(
+                    exit_side=str(expected_exit_direction),
+                    trigger_price=order.get("trigger_price"),
+                    limit_price=order.get("price"),
+                )
+            except TradingValidationError as exc:
+                stop_limit_price_ok = False
+                issues.append(f"order {order.get('order_id')}: {exc}")
+        valid_protection = bool(
+            classification["role"] in {"sl", "tp"}
+            and classification["status"] == "active"
+            and order.get("reduce_only") is True
+            and direction_ok
+            and stop_limit_price_ok
+        )
+        compact = {
+            "order_id": order.get("order_id"),
+            "role": classification["role"],
+            "status": classification["status"],
+            "order_type": order.get("order_type") or order.get("type"),
+            "order_state": order.get("order_state") or order.get("state"),
+            "direction": order.get("direction"),
+            "amount": order.get("amount"),
+            "filled_amount": order.get("filled_amount"),
+            "remaining_amount": remaining,
+            "reduce_only": order.get("reduce_only") is True,
+            "trigger": order.get("trigger"),
+            "trigger_price": order.get("trigger_price"),
+            "trigger_offset": order.get("trigger_offset"),
+            "price": order.get("price"),
+            "trigger_reference_price": order.get("trigger_reference_price"),
+            "oco_ref": order.get("oco_ref"),
+            "primary_order_id": primary_id,
+            "is_secondary_oto": order.get("is_secondary_oto") is True,
+            "is_primary_otoco": order.get("is_primary_otoco") is True,
+            "trigger_fill_condition": order.get("trigger_fill_condition"),
+            "valid_protection": valid_protection,
+        }
+        orders.append(compact)
+        if valid_protection and compact["role"] == "sl":
+            active_stop_coverage += remaining
+        elif valid_protection and compact["role"] == "tp":
+            active_tp_coverage += remaining
+
+    epsilon = max(1e-12, required_amount * 1e-9)
+    protected = not position_open or active_stop_coverage + epsilon >= required_amount
+    if not position_open:
+        status = "flat"
+    elif protected:
+        status = "protected"
+    elif active_stop_coverage > 0:
+        status = "partially_protected"
+        issues.append("active reduce-only stop does not cover the full position")
+    else:
+        status = "unprotected"
+        issues.append("no active reduce-only stop covers the position")
+
+    return {
+        "decision_id": decision_id,
+        "instrument": instrument,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "protected": protected,
+        "position": {
+            "direction": position_direction,
+            "amount": required_amount,
+            "average_price": position.get("average_price"),
+            "mark_price": position.get("mark_price"),
+            "floating_profit_loss": position.get("floating_profit_loss"),
+            "estimated_liquidation_price": position.get("estimated_liquidation_price"),
+        },
+        "required_amount": required_amount,
+        "active_stop_coverage": active_stop_coverage,
+        "active_tp_coverage": active_tp_coverage,
+        "coverage_ratio": (
+            None if not position_open else min(active_stop_coverage / required_amount, 1.0)
+        ),
+        "orders": orders,
+        "issues": issues,
+        "truncated": False,
+    }
+
+
+def _single_active_stop(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if snapshot.get("status") == "flat" or not snapshot.get("required_amount"):
+        raise TradingValidationError("Stop management requires an open position")
+    stops = [
+        order
+        for order in snapshot["orders"]
+        if order["role"] == "sl" and order["status"] == "active" and order["valid_protection"]
+    ]
+    if len(stops) != 1:
+        raise TradingValidationError(
+            f"Expected exactly one active valid stop for {snapshot['decision_id']}, "
+            f"found {len(stops)}"
+        )
+    stop = stops[0]
+    if (
+        stop["remaining_amount"] + max(1e-12, snapshot["required_amount"] * 1e-9)
+        < snapshot["required_amount"]
+    ):
+        raise TradingValidationError("Active stop does not cover the full position")
+    return stop
+
+
+async def _fresh_trigger_price(
+    app_ctx: Any,
+    instrument: str,
+    trigger_source: Optional[str],
+) -> float:
+    ticker = await app_ctx.rest_client.get_ticker(instrument)
+    keys = [trigger_source] if trigger_source in {"mark_price", "last_price", "index_price"} else []
+    keys.extend(key for key in ("mark_price", "last_price", "index_price") if key not in keys)
+    for key in keys:
+        value = _as_float(ticker.get(key))
+        if value is not None and value > 0:
+            return value
+    raise TradingValidationError(f"Could not determine current trigger price for {instrument}")
+
+
+async def _constant_result(value: dict[str, Any]) -> dict[str, Any]:
+    return value
+
+
+async def _edit_fixed_stop_locked(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    actual_id: str,
+    snapshot: dict[str, Any],
+    new_trigger: float,
+    tool_name: str,
+    idempotency_scope: dict[str, Any],
+) -> dict[str, Any]:
+    stop = _single_active_stop(snapshot)
+    if stop["order_type"] not in {"stop_market", "stop_limit"}:
+        raise TradingValidationError(
+            "move_stop only edits fixed stop_market/stop_limit orders; use trail_stop or "
+            "replace_bracket"
+        )
+    current_trigger = _as_float(stop.get("trigger_price"))
+    if current_trigger is None:
+        raise TradingValidationError("Active fixed stop has no trigger_price")
+    changed = float(new_trigger) != current_trigger
+    request = {
+        "decision_id": decision_id,
+        "client_order_id": actual_id,
+        "instrument": snapshot["instrument"],
+        "order_id": stop["order_id"],
+        "old_trigger": current_trigger,
+        "new_trigger": new_trigger,
+        "amount": stop["amount"],
+    }
+    if not changed:
+        result = await _execute_audited(
+            app_ctx,
+            tool_name,
+            request,
+            decision_id,
+            lambda: _constant_result({"changed": False, "reason": "already_at_target"}),
+            deribit_order_ids_override=[str(stop["order_id"])],
+        )
+    else:
+        live_price = await _fresh_trigger_price(
+            app_ctx, snapshot["instrument"], stop.get("trigger")
+        )
+        validate_stop_improvement(
+            snapshot["position"]["direction"],
+            current_trigger,
+            new_trigger,
+            current_price=live_price,
+        )
+        amount = _as_float(stop.get("amount"))
+        if amount is None or amount <= 0:
+            raise TradingValidationError("Active stop has no valid amount")
+        await _validate_order_amount(
+            app_ctx,
+            snapshot["instrument"],
+            amount,
+            effective_price=float(new_trigger),
+        )
+        result = await _execute_audited(
+            app_ctx,
+            tool_name,
+            request,
+            decision_id,
+            lambda: app_ctx.rest_client.edit_order(
+                str(stop["order_id"]),
+                amount=amount,
+                trigger_price=float(new_trigger),
+                reduce_only=True,
+            ),
+        )
+    after = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+    envelope = {
+        "client_order_id": actual_id,
+        "decision_id": decision_id,
+        "instrument": snapshot["instrument"],
+        "changed": changed,
+        "before": {"order_id": stop["order_id"], "trigger_price": current_trigger},
+        "after": {"trigger_price": float(new_trigger)},
+        "result": _compact_deribit_order_result(result),
+        "protection": after,
+    }
+    await _store_management_idempotent_response(app_ctx, actual_id, envelope, idempotency_scope)
+    return envelope
+
+
+async def _move_stop_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    new_trigger: float,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+    _idempotency_scope_override: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _idempotency_scope_override or _management_idempotency_scope(
+            "move_stop",
+            decision_id,
+            new_trigger=float(new_trigger),
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        if cached is not None:
+            return cached
+        assert actual_id is not None
+        snapshot = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        return await _edit_fixed_stop_locked(
+            app_ctx,
+            decision_id=decision_id,
+            actual_id=actual_id,
+            snapshot=snapshot,
+            new_trigger=new_trigger,
+            tool_name="move_stop",
+            idempotency_scope=idempotency_scope,
+        )
+
+
+def _incremental_otoco_replacement_params(
+    snapshot: dict[str, Any],
+    stop: dict[str, Any],
+    *,
+    new_trigger: float,
+) -> dict[str, Any]:
+    """Derive one full-size SL/TP pair from active incremental OTOCO children."""
+
+    take_profits = [
+        order
+        for order in snapshot["orders"]
+        if order["role"] == "tp" and order["status"] == "active" and order["valid_protection"]
+    ]
+    if len(take_profits) != 1:
+        raise TradingValidationError(
+            "Incremental OTOCO tightening requires exactly one active valid take-profit"
+        )
+    take_profit = take_profits[0]
+    required_amount = float(snapshot["required_amount"])
+    epsilon = max(1e-12, required_amount * 1e-9)
+    if float(take_profit["remaining_amount"]) + epsilon < required_amount:
+        raise TradingValidationError(
+            "Incremental OTOCO take-profit does not cover the full position"
+        )
+    tp_type = str(take_profit.get("order_type") or "")
+    if tp_type != "take_market":
+        raise TradingValidationError(
+            "Incremental OTOCO replacement requires an active take_market take-profit"
+        )
+    tp_trigger_price = _as_float(take_profit.get("trigger_price"))
+    if tp_trigger_price is None:
+        raise TradingValidationError("Incremental OTOCO take-profit has no trigger_price")
+    trigger_source = str(stop.get("trigger") or take_profit.get("trigger") or "mark_price")
+    tp_trigger_source = str(take_profit.get("trigger") or trigger_source)
+    if tp_trigger_source != trigger_source:
+        raise TradingValidationError(
+            "Incremental OTOCO replacement requires matching SL/TP trigger sources"
+        )
+    return {
+        "tp_trigger_price": tp_trigger_price,
+        "trigger_source": trigger_source,
+        "sl_type": str(stop["order_type"]),
+        "sl_trigger_price": new_trigger,
+        "sl_limit_price": _as_float(stop.get("price")),
+        "tp_type": tp_type,
+    }
+
+
+async def _tighten_protection_by_label_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    new_trigger_price: float,
+    require_positive_net_pnl: bool = False,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Tighten the labelled fixed SL, optionally gated by exact fee-aware PnL."""
+    fee_aware: Optional[dict[str, Any]] = None
+    if require_positive_net_pnl:
+        state = await app_ctx.trading_state_builder.capture(decision_id=decision_id)
+        fee_aware = state.get("fee_aware") or {}
+        if fee_aware.get("status") != "ok":
+            raise TradingValidationError(
+                "Positive net-PnL gate requires exact fee-aware decision attribution"
+            )
+        net_pnl = _as_float(fee_aware.get("net_pnl_after_fees"))
+        if net_pnl is None or net_pnl <= 0:
+            raise TradingValidationError(
+                "Protection tightening rejected because net_pnl_after_fees is not positive"
+            )
+    idempotency_scope = _management_idempotency_scope(
+        "tighten_protection_by_label",
+        decision_id,
+        new_trigger_price=float(new_trigger_price),
+        require_positive_net_pnl=bool(require_positive_net_pnl),
+    )
+    actual_id, cached = await _prepare_mutating_tool(
+        app_ctx,
+        confirm_live_trade=confirm_live_trade,
+        decision_id=decision_id,
+        decision_required=True,
+        client_order_id=client_order_id,
+        use_idempotency=True,
+        idempotency_scope=idempotency_scope,
+        expected_state_token=expected_state_token,
+    )
+    assert actual_id is not None
+    resumable_replacement = bool(
+        cached
+        and cached.get("status")
+        in {
+            "new_protection_unverified",
+            "protected_cleanup_needed",
+            "position_closed_cleanup_needed",
+        }
+        and cached.get("old_order_ids")
+    )
+    if cached is not None and not resumable_replacement:
+        result = cached
+    elif resumable_replacement:
+        # Cached replacement resumes before any new snapshot-derived inputs are
+        # needed. The replacement path uses the tighten request's idempotency
+        # scope, so a retry cannot place a second OCO pair.
+        result = await _replace_bracket_impl(
+            app_ctx,
+            decision_id=decision_id,
+            tp_trigger_price=0.0,
+            client_order_id=actual_id,
+            confirm_live_trade=confirm_live_trade,
+            expected_state_token=expected_state_token,
+            _idempotency_scope_override=idempotency_scope,
+        )
+    else:
+        snapshot = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        stop = _single_active_stop(snapshot)
+        incremental_otoco = bool(
+            stop.get("is_secondary_oto")
+            and str(stop.get("trigger_fill_condition") or "").lower() == "incremental"
+        )
+        if incremental_otoco:
+            replacement = _incremental_otoco_replacement_params(
+                snapshot,
+                stop,
+                new_trigger=float(new_trigger_price),
+            )
+            result = await _replace_bracket_impl(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=actual_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+                _idempotency_scope_override=idempotency_scope,
+                **replacement,
+            )
+        else:
+            result = await _move_stop_impl(
+                app_ctx,
+                decision_id=decision_id,
+                new_trigger=new_trigger_price,
+                client_order_id=actual_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+                _idempotency_scope_override=idempotency_scope,
+            )
+    return {
+        **result,
+        "label": decision_id,
+        "strategy": ("create_first_replacement" if result.get("old_order_ids") else "direct_edit"),
+        "positive_net_pnl_required": require_positive_net_pnl,
+        "fee_aware_preflight": fee_aware,
+    }
+
+
+async def _move_stop_to_breakeven_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    offset: float = 0.0,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope(
+            "move_stop_to_breakeven",
+            decision_id,
+            offset=float(offset),
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        if cached is not None:
+            return cached
+        assert actual_id is not None
+        snapshot = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        stop = _single_active_stop(snapshot)
+        average_price = _as_float(snapshot["position"].get("average_price"))
+        if average_price is None:
+            raise TradingValidationError("Open position has no average_price")
+        target = breakeven_trigger(snapshot["position"]["direction"], average_price, offset)
+        current = _as_float(stop.get("trigger_price"))
+        if current is None:
+            raise TradingValidationError("Active fixed stop has no trigger_price")
+        if (snapshot["position"]["direction"] == "buy" and current >= target) or (
+            snapshot["position"]["direction"] == "sell" and current <= target
+        ):
+            target = current
+        return await _edit_fixed_stop_locked(
+            app_ctx,
+            decision_id=decision_id,
+            actual_id=actual_id,
+            snapshot=snapshot,
+            new_trigger=target,
+            tool_name="move_stop_to_breakeven",
+            idempotency_scope=idempotency_scope,
+        )
+
+
+async def _trail_stop_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    distance: float,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope(
+            "trail_stop",
+            decision_id,
+            distance=float(distance),
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        if cached is not None:
+            return cached
+        assert actual_id is not None
+        snapshot = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        stop = _single_active_stop(snapshot)
+        if stop["order_type"] != "trailing_stop":
+            raise TradingValidationError(
+                "Existing stop is fixed and cannot be converted atomically with edit; "
+                "use replace_bracket"
+            )
+        current_distance = _as_float(stop.get("trigger_offset"))
+        if current_distance is None:
+            raise TradingValidationError("Active trailing stop has no trigger_offset")
+        validate_trailing_distance(current_distance, distance)
+        changed = float(distance) != current_distance
+        request = {
+            "decision_id": decision_id,
+            "client_order_id": actual_id,
+            "instrument": snapshot["instrument"],
+            "order_id": stop["order_id"],
+            "old_distance": current_distance,
+            "new_distance": distance,
+            "amount": stop["amount"],
+        }
+        if changed:
+            amount = _as_float(stop.get("amount"))
+            if amount is None or amount <= 0:
+                raise TradingValidationError("Active trailing stop has no valid amount")
+            await _validate_order_amount(app_ctx, snapshot["instrument"], amount)
+            result = await _execute_audited(
+                app_ctx,
+                "trail_stop",
+                request,
+                decision_id,
+                lambda: app_ctx.rest_client.edit_order(
+                    str(stop["order_id"]),
+                    amount=amount,
+                    trigger_offset=float(distance),
+                    reduce_only=True,
+                ),
+            )
+        else:
+            result = await _execute_audited(
+                app_ctx,
+                "trail_stop",
+                request,
+                decision_id,
+                lambda: _constant_result({"changed": False, "reason": "already_at_target"}),
+                deribit_order_ids_override=[str(stop["order_id"])],
+            )
+        after = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        envelope = {
+            "client_order_id": actual_id,
+            "decision_id": decision_id,
+            "instrument": snapshot["instrument"],
+            "changed": changed,
+            "before": {"order_id": stop["order_id"], "trigger_offset": current_distance},
+            "after": {"trigger_offset": float(distance)},
+            "result": _compact_deribit_order_result(result),
+            "protection": after,
+        }
+        await _store_management_idempotent_response(app_ctx, actual_id, envelope, idempotency_scope)
+        return envelope
+
+
+async def _cancel_captured_order(
+    app_ctx: Any,
+    *,
+    tool_name: str,
+    phase: str,
+    decision_id: str,
+    client_order_id: str,
+    order_id: str,
+) -> dict[str, Any]:
+    request = {
+        "decision_id": decision_id,
+        "client_order_id": client_order_id,
+        "phase": phase,
+        "order_id": order_id,
+    }
+    return await _execute_audited(
+        app_ctx,
+        tool_name,
+        request,
+        decision_id,
+        lambda: app_ctx.rest_client.cancel_order(order_id),
+        deribit_order_ids_override=[order_id],
+    )
+
+
+async def _cancel_orders_while_flat(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: str,
+    tool_name: str,
+    phase: str,
+    roles: set[str],
+    initial: Optional[dict[str, Any]] = None,
+) -> tuple[list[str], dict[str, Any], bool]:
+    """Cancel captured labelled orders only while fresh reads remain flat."""
+
+    current = initial or await _verify_protection_impl(app_ctx, decision_id=decision_id)
+    captured_ids = [
+        str(order["order_id"])
+        for order in current["orders"]
+        if order["role"] in roles and order.get("order_id")
+    ]
+    cancelled_ids: list[str] = []
+    cleanup_needed = False
+    for order_id in captured_ids:
+        current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if current["status"] != "flat":
+            cleanup_needed = True
+            break
+        live_ids = {str(order["order_id"]) for order in current["orders"] if order.get("order_id")}
+        if order_id not in live_ids:
+            # One cancelled OCO leg commonly removes its sibling too.
+            cancelled_ids.append(order_id)
+            continue
+        try:
+            await _cancel_captured_order(
+                app_ctx,
+                tool_name=tool_name,
+                phase=phase,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                order_id=order_id,
+            )
+            cancelled_ids.append(order_id)
+        except Exception:
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            current_ids = {
+                str(order["order_id"]) for order in current["orders"] if order.get("order_id")
+            }
+            if order_id not in current_ids:
+                cancelled_ids.append(order_id)
+            else:
+                cleanup_needed = True
+                logger.warning("Failed to cancel flat order %s", order_id, exc_info=True)
+    current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+    return cancelled_ids, current, cleanup_needed
+
+
+async def _cancel_active_entries_before_close(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: str,
+    initial: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Remove captured entries so a completed close cannot reopen unprotected."""
+
+    entry_ids = [
+        str(order["order_id"])
+        for order in initial["orders"]
+        if order["role"] == "entry" and order["status"] == "active" and order.get("order_id")
+    ]
+    cancelled_ids: list[str] = []
+    current = initial
+    for order_id in entry_ids:
+        current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        active_ids = {
+            str(order["order_id"])
+            for order in current["orders"]
+            if order["role"] == "entry" and order["status"] == "active" and order.get("order_id")
+        }
+        if order_id not in active_ids:
+            cancelled_ids.append(order_id)
+            continue
+        try:
+            await _cancel_captured_order(
+                app_ctx,
+                tool_name="close_position_and_cancel_protection",
+                phase="cancel_entry_before_close",
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                order_id=order_id,
+            )
+            cancelled_ids.append(order_id)
+        except Exception:
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            still_active = any(
+                order["role"] == "entry"
+                and order["status"] == "active"
+                and str(order.get("order_id")) == order_id
+                for order in current["orders"]
+            )
+            if still_active:
+                raise
+            cancelled_ids.append(order_id)
+    current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+    remaining = [
+        order["order_id"]
+        for order in current["orders"]
+        if order["role"] == "entry" and order["status"] == "active"
+    ]
+    if remaining:
+        raise TradingValidationError(
+            "Active entry orders remain after close preflight: "
+            + ", ".join(str(order_id) for order_id in remaining)
+        )
+    return cancelled_ids, current
+
+
+async def _cancel_pending_setup_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Cancel captured pending-entry IDs without racing away live protection."""
+
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope(
+            "cancel_pending_setup",
+            decision_id,
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        assert actual_id is not None
+        if cached is not None and cached.get("status") != "new_entry_detected":
+            return cached
+
+        prior_cancelled_ids = list(cached.get("cancelled_order_ids") or []) if cached else []
+        before = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if before["status"] != "flat":
+            if cached is None:
+                raise TradingValidationError(
+                    "Pending setup cannot be cancelled because its position is already open"
+                )
+            envelope = {
+                **cached,
+                "status": "position_opened_during_cancel",
+                "race_detected": True,
+                "cleanup_needed": False,
+                "protection_retained": True,
+                "protection": before,
+            }
+            await _store_management_idempotent_response(
+                app_ctx, actual_id, envelope, idempotency_scope
+            )
+            return envelope
+        entry_ids = [
+            str(order["order_id"])
+            for order in before["orders"]
+            if order["role"] == "entry" and order["status"] == "active" and order.get("order_id")
+        ]
+        cancelled_ids: list[str] = prior_cancelled_ids
+        current = before
+        for order_id in entry_ids:
+            try:
+                await _cancel_captured_order(
+                    app_ctx,
+                    tool_name="cancel_pending_setup",
+                    phase="cancel_entry",
+                    decision_id=decision_id,
+                    client_order_id=actual_id,
+                    order_id=order_id,
+                )
+                cancelled_ids.append(order_id)
+            except Exception:
+                # A fill can win the race and make the captured entry ID
+                # uncancellable. Re-read before deciding whether this is a
+                # real failure or the exact race this helper must contain.
+                current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+                current_ids = {
+                    str(order["order_id"]) for order in current["orders"] if order.get("order_id")
+                }
+                if current["status"] == "flat" and order_id in current_ids:
+                    raise
+                if current["status"] == "flat":
+                    cancelled_ids.append(order_id)
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            if current["status"] != "flat":
+                envelope = {
+                    "client_order_id": actual_id,
+                    "decision_id": decision_id,
+                    "instrument": before["instrument"],
+                    "status": "position_opened_during_cancel",
+                    "race_detected": True,
+                    "cleanup_needed": False,
+                    "cancelled_order_ids": cancelled_ids,
+                    "protection_retained": True,
+                    "protection": current,
+                }
+                await _store_management_idempotent_response(
+                    app_ctx, actual_id, envelope, idempotency_scope
+                )
+                return envelope
+
+        # Only clean up captured dormant children after all entries are gone and
+        # a second flat read confirms there is no newly opened position.
+        current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        remaining_entries = [
+            order
+            for order in current["orders"]
+            if order["role"] == "entry" and order["status"] == "active"
+        ]
+        if current["status"] == "flat" and remaining_entries:
+            envelope = {
+                "client_order_id": actual_id,
+                "decision_id": decision_id,
+                "instrument": before["instrument"],
+                "status": "new_entry_detected",
+                "race_detected": True,
+                "cleanup_needed": True,
+                "new_entry_order_ids": [
+                    str(order["order_id"]) for order in remaining_entries if order.get("order_id")
+                ],
+                "cancelled_order_ids": cancelled_ids,
+                "protection_retained": True,
+                "protection": current,
+            }
+            await _store_management_idempotent_response(
+                app_ctx, actual_id, envelope, idempotency_scope
+            )
+            return envelope
+        if current["status"] == "flat" and not remaining_entries:
+            orphan_ids = [
+                str(order["order_id"])
+                for order in current["orders"]
+                if order["role"] in {"sl", "tp"}
+                and order["status"] == "dormant"
+                and order.get("order_id")
+            ]
+            for order_id in orphan_ids:
+                safety_read = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+                if safety_read["status"] != "flat":
+                    current = safety_read
+                    break
+                if any(
+                    order["role"] == "entry" and order["status"] == "active"
+                    for order in safety_read["orders"]
+                ):
+                    current = safety_read
+                    break
+                live_ids = {
+                    str(order["order_id"])
+                    for order in safety_read["orders"]
+                    if order.get("order_id")
+                }
+                if order_id not in live_ids:
+                    cancelled_ids.append(order_id)
+                    continue
+                await _cancel_captured_order(
+                    app_ctx,
+                    tool_name="cancel_pending_setup",
+                    phase="cancel_dormant_child",
+                    decision_id=decision_id,
+                    client_order_id=actual_id,
+                    order_id=order_id,
+                )
+                cancelled_ids.append(order_id)
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+
+        new_entries = [
+            str(order["order_id"])
+            for order in current["orders"]
+            if order["role"] == "entry" and order["status"] == "active" and order.get("order_id")
+        ]
+        position_opened = current["status"] != "flat"
+        new_entry_detected = current["status"] == "flat" and bool(new_entries)
+        race_detected = position_opened or new_entry_detected
+        envelope = {
+            "client_order_id": actual_id,
+            "decision_id": decision_id,
+            "instrument": before["instrument"],
+            "status": (
+                "position_opened_during_cancel"
+                if position_opened
+                else ("new_entry_detected" if new_entry_detected else "cancelled")
+            ),
+            "race_detected": race_detected,
+            "cleanup_needed": new_entry_detected,
+            "new_entry_order_ids": new_entries,
+            "cancelled_order_ids": cancelled_ids,
+            "protection_retained": race_detected,
+            "protection": current,
+        }
+        await _store_management_idempotent_response(app_ctx, actual_id, envelope, idempotency_scope)
+        return envelope
+
+
+async def _cancel_decision_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Cancel every captured labelled leg only while the decision remains flat."""
+
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope("cancel_decision", decision_id)
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        assert actual_id is not None
+        if cached is not None:
+            return cached
+
+        before = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if before["status"] != "flat":
+            raise TradingValidationError(
+                "Decision cannot be cancelled while its position is open; "
+                "close the position with protected close tooling first"
+            )
+
+        cancelled_ids, after, cleanup_needed = await _cancel_orders_while_flat(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=actual_id,
+            tool_name="cancel_decision",
+            phase="cancel_decision_leg",
+            roles={"entry", "sl", "tp", "other"},
+            initial=before,
+        )
+        remaining_ids = [
+            str(order["order_id"]) for order in after["orders"] if order.get("order_id")
+        ]
+        verified_cancelled = after["status"] == "flat" and not remaining_ids
+        status = (
+            "cancelled"
+            if verified_cancelled
+            else (
+                "position_opened_during_cancel" if after["status"] != "flat" else "cleanup_needed"
+            )
+        )
+        if not cancelled_ids:
+            await _execute_audited(
+                app_ctx,
+                "cancel_decision",
+                {
+                    "decision_id": decision_id,
+                    "client_order_id": actual_id,
+                    "phase": "verified_noop",
+                },
+                decision_id,
+                lambda: _constant_result({"cancelled": 0, "already_flat": True}),
+                deribit_order_ids_override=[],
+            )
+        if verified_cancelled:
+            await app_ctx.decision_repo.update_outcome(
+                decision_id,
+                "cancelled",
+                "All labelled parent/OTOCO legs removed and flat state verified.",
+            )
+
+        envelope = {
+            "client_order_id": actual_id,
+            "decision_id": decision_id,
+            "instrument": before["instrument"],
+            "status": status,
+            "cancelled_order_ids": cancelled_ids,
+            "remaining_order_ids": remaining_ids,
+            "flat_verified": after["status"] == "flat",
+            "outcome_updated": verified_cancelled,
+            "cleanup_needed": cleanup_needed or bool(remaining_ids),
+            "protection": after,
+        }
+        await _store_management_idempotent_response(
+            app_ctx,
+            actual_id,
+            envelope,
+            idempotency_scope,
+        )
+        return envelope
+
+
+def _close_order_state_value(response: Any) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    order = response.get("order")
+    if isinstance(order, dict):
+        response = order
+    state = response.get("order_state") or response.get("state")
+    return str(state).lower() if state else None
+
+
+async def _read_cached_close_order_state(
+    app_ctx: Any,
+    cached: dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    """Read the exact cached close order without ever submitting another close."""
+
+    close_order_id = _extract_order_id_from_response(cached.get("close_result"))
+    if not close_order_id:
+        return "missing", "cached close response has no order_id"
+    getter = getattr(app_ctx.rest_client, "get_order_state", None)
+    if getter is None:
+        return "unknown", "Deribit client does not expose get_order_state"
+    try:
+        response = await getter(close_order_id)
+    except Exception as exc:
+        message = str(exc)
+        normalized = message.lower().replace("-", "_").replace(" ", "_")
+        if "not_found" in normalized or "unknown_order" in normalized:
+            return "missing", message
+        return "unknown", message
+    state = _close_order_state_value(response)
+    if not state:
+        return "unknown", "get_order_state returned no order_state"
+    return state, None
+
+
+async def _close_position_and_cancel_protection_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    order_type: str = "market",
+    price: Optional[float] = None,
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+) -> dict[str, Any]:
+    """Close first; cancel protection only after a fresh read confirms flat."""
+
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _management_idempotency_scope(
+            "close_position_and_cancel_protection",
+            decision_id,
+            order_type=str(order_type),
+            price=None if price is None else float(price),
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        if cached is not None:
+            if cached.get("status") not in {
+                "closing",
+                "close_order_state_unknown",
+                "closed_cleanup_needed",
+                "position_reopened",
+            }:
+                return cached
+            assert actual_id is not None
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            newly_cancelled_entries, current = await _cancel_active_entries_before_close(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=actual_id,
+                initial=current,
+            )
+            cancelled_entry_ids = list(
+                dict.fromkeys(
+                    [
+                        *(cached.get("cancelled_entry_order_ids") or []),
+                        *newly_cancelled_entries,
+                    ]
+                )
+            )
+            if current["status"] != "flat":
+                close_order_state: Optional[str] = None
+                close_order_state_error: Optional[str] = None
+                status = str(cached.get("status"))
+                if status in {"closing", "close_order_state_unknown"}:
+                    close_order_state, close_order_state_error = (
+                        await _read_cached_close_order_state(app_ctx, cached)
+                    )
+                    if close_order_state in {"cancelled", "canceled"}:
+                        status = "close_cancelled"
+                    elif close_order_state == "rejected":
+                        status = "close_rejected"
+                    elif close_order_state == "missing":
+                        status = "close_order_missing"
+                    elif close_order_state == "unknown":
+                        status = "close_order_state_unknown"
+                    elif close_order_state == "filled":
+                        status = "position_reopened"
+                    else:
+                        status = "closing"
+                elif status in {"closed_cleanup_needed", "position_reopened"}:
+                    status = "position_reopened"
+                envelope = {
+                    **cached,
+                    "status": status,
+                    "position_closed": False,
+                    "protection_retained": True,
+                    "cleanup_needed": False,
+                    "cancelled_entry_order_ids": cancelled_entry_ids,
+                    "close_order_state": close_order_state,
+                    "close_order_state_error": close_order_state_error,
+                    "protection": current,
+                }
+                await _store_management_idempotent_response(
+                    app_ctx, actual_id, envelope, idempotency_scope
+                )
+                return envelope
+
+            cancelled_ids, current, cleanup_needed = await _cancel_orders_while_flat(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=actual_id,
+                tool_name="close_position_and_cancel_protection",
+                phase="cancel_protection_after_close_confirmation",
+                roles={"sl", "tp", "exit"},
+                initial=current,
+            )
+            remaining_protection = any(
+                order["role"] in {"sl", "tp", "exit"} for order in current["orders"]
+            )
+            cleanup_needed = cleanup_needed or (
+                current["status"] == "flat" and remaining_protection
+            )
+            envelope = {
+                **cached,
+                "status": (
+                    "closed_cleanup_needed"
+                    if current["status"] == "flat" and cleanup_needed
+                    else ("closed" if current["status"] == "flat" else "position_reopened")
+                ),
+                "position_closed": current["status"] == "flat",
+                "protection_retained": current["status"] != "flat" or remaining_protection,
+                "cleanup_needed": cleanup_needed,
+                "cancelled_order_ids": list(
+                    dict.fromkeys([*(cached.get("cancelled_order_ids") or []), *cancelled_ids])
+                ),
+                "cancelled_entry_order_ids": cancelled_entry_ids,
+                "protection": current,
+            }
+            await _store_management_idempotent_response(
+                app_ctx, actual_id, envelope, idempotency_scope
+            )
+            return envelope
+        assert actual_id is not None
+        if order_type not in {"market", "limit"}:
+            raise TradingValidationError("order_type must be market or limit")
+        if order_type == "limit" and price is None:
+            raise TradingValidationError("price is required for a limit close")
+        if order_type == "market" and price is not None:
+            raise TradingValidationError("price is only valid for a limit close")
+
+        before = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if before["status"] != "flat":
+            # Validate before cancelling entries so a deterministic amount,
+            # notional, metadata, or ticker failure causes zero mutations.
+            await enforce_close_position_limit(app_ctx, before["instrument"])
+        cancelled_entry_ids, before = await _cancel_active_entries_before_close(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=actual_id,
+            initial=before,
+        )
+        close_result: Optional[dict[str, Any]] = None
+        if before["status"] != "flat":
+            # Revalidate after entry-cancel races. A fill can change position
+            # size between the no-mutation preflight and the close request.
+            try:
+                await enforce_close_position_limit(app_ctx, before["instrument"])
+            except (TradingValidationError, ValueError) as exc:
+                envelope = {
+                    "client_order_id": actual_id,
+                    "decision_id": decision_id,
+                    "instrument": before["instrument"],
+                    "status": "close_blocked_after_entry_cancel",
+                    "position_closed": False,
+                    "protection_retained": True,
+                    "cancelled_order_ids": [],
+                    "cancelled_entry_order_ids": cancelled_entry_ids,
+                    "error": str(exc),
+                    "protection": before,
+                }
+                await _store_management_idempotent_response(
+                    app_ctx, actual_id, envelope, idempotency_scope
+                )
+                return envelope
+            close_result = await _execute_audited(
+                app_ctx,
+                "close_position_and_cancel_protection",
+                {
+                    "decision_id": decision_id,
+                    "client_order_id": actual_id,
+                    "phase": "close_position",
+                    "instrument": before["instrument"],
+                    "order_type": order_type,
+                    "price": price,
+                },
+                decision_id,
+                lambda: app_ctx.rest_client.close_position(before["instrument"], order_type, price),
+            )
+
+        current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if current["status"] != "flat":
+            envelope = {
+                "client_order_id": actual_id,
+                "decision_id": decision_id,
+                "instrument": before["instrument"],
+                "status": "closing",
+                "position_closed": False,
+                "protection_retained": True,
+                "cancelled_order_ids": [],
+                "cancelled_entry_order_ids": cancelled_entry_ids,
+                "close_result": (
+                    _compact_deribit_order_result(close_result) if close_result else None
+                ),
+                "protection": current,
+            }
+            await _store_management_idempotent_response(
+                app_ctx, actual_id, envelope, idempotency_scope
+            )
+            return envelope
+
+        cancelled_ids, current, cleanup_needed = await _cancel_orders_while_flat(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=actual_id,
+            tool_name="close_position_and_cancel_protection",
+            phase="cancel_protection",
+            roles={"sl", "tp", "exit"},
+            initial=current,
+        )
+        remaining_protection = any(
+            order["role"] in {"sl", "tp", "exit"} for order in current["orders"]
+        )
+        cleanup_needed = cleanup_needed or (current["status"] == "flat" and remaining_protection)
+        envelope = {
+            "client_order_id": actual_id,
+            "decision_id": decision_id,
+            "instrument": before["instrument"],
+            "status": (
+                "closed_cleanup_needed"
+                if current["status"] == "flat" and cleanup_needed
+                else ("closed" if current["status"] == "flat" else "position_reopened")
+            ),
+            "position_closed": current["status"] == "flat",
+            "protection_retained": current["status"] != "flat" or remaining_protection,
+            "cleanup_needed": cleanup_needed,
+            "cancelled_order_ids": cancelled_ids,
+            "cancelled_entry_order_ids": cancelled_entry_ids,
+            "close_result": (_compact_deribit_order_result(close_result) if close_result else None),
+            "protection": current,
+        }
+        await _store_management_idempotent_response(app_ctx, actual_id, envelope, idempotency_scope)
+        return envelope
+
+
+def _effective_existing_stop_trigger(
+    stop: dict[str, Any],
+    position_direction: str,
+) -> Optional[float]:
+    trigger_price = _as_float(stop.get("trigger_price"))
+    if trigger_price is not None:
+        return trigger_price
+    reference = _as_float(stop.get("trigger_reference_price"))
+    offset = _as_float(stop.get("trigger_offset"))
+    if reference is None or offset is None:
+        return None
+    return reference - offset if position_direction == "buy" else reference + offset
+
+
+def _oco_response_identity_hints(response: Any) -> dict[str, Any]:
+    """Keep the small response subset needed to resolve operative OCO IDs."""
+
+    if not isinstance(response, dict):
+        return {"explicit_order_ids": [], "primary_order_id": None, "oto_refs": []}
+    orders = response.get("orders")
+    if isinstance(orders, list):
+        return {
+            "explicit_order_ids": [
+                str(order["order_id"])
+                for order in orders
+                if isinstance(order, dict) and order.get("order_id")
+            ],
+            "primary_order_id": None,
+            "oto_refs": [],
+        }
+    order = response.get("order")
+    if not isinstance(order, dict):
+        return {"explicit_order_ids": [], "primary_order_id": None, "oto_refs": []}
+    oto_refs = order.get("oto_order_ids")
+    return {
+        "explicit_order_ids": [],
+        "primary_order_id": (str(order["order_id"]) if order.get("order_id") else None),
+        "oto_refs": (
+            [str(order_id) for order_id in oto_refs if order_id]
+            if isinstance(oto_refs, list)
+            else []
+        ),
+    }
+
+
+def _resolve_expected_oco_order_ids(
+    hints: dict[str, Any],
+    snapshot: dict[str, Any],
+    old_ids: set[str],
+) -> tuple[set[str], Optional[str]]:
+    """Resolve exactly two operative IDs, never OTO slot references."""
+
+    explicit = {
+        str(order_id)
+        for order_id in hints.get("explicit_order_ids") or []
+        if order_id and not str(order_id).upper().startswith("OTO-")
+    }
+    if explicit:
+        if len(explicit) == 2:
+            return explicit, None
+        return explicit, (
+            "expected_new_order_ids_missing"
+            if len(explicit) < 2
+            else "expected_new_order_ids_ambiguous"
+        )
+
+    primary_id = hints.get("primary_order_id")
+    if not primary_id or str(primary_id).upper().startswith("OTO-"):
+        return set(), "expected_new_order_ids_missing"
+    primary_id = str(primary_id)
+    if primary_id in old_ids:
+        return set(), "expected_new_order_ids_ambiguous"
+    orders_by_id = {
+        str(order["order_id"]): order
+        for order in snapshot.get("orders") or []
+        if order.get("order_id")
+    }
+    primary = orders_by_id.get(primary_id)
+    if primary is None:
+        return {primary_id}, "expected_new_order_ids_missing"
+
+    direct_refs = {
+        str(order_id)
+        for order_id in hints.get("oto_refs") or []
+        if order_id and not str(order_id).upper().startswith("OTO-")
+    }
+    primary_oco_ref = primary.get("oco_ref")
+    linked_ids: set[str] = set()
+    for candidate_id, candidate in orders_by_id.items():
+        if candidate_id == primary_id or candidate_id in old_ids:
+            continue
+        linked = candidate_id in direct_refs
+        linked = linked or str(candidate.get("primary_order_id") or "") == primary_id
+        if primary_oco_ref:
+            linked = linked or candidate.get("oco_ref") == primary_oco_ref
+        if linked:
+            linked_ids.add(candidate_id)
+
+    if len(linked_ids) == 1:
+        return {primary_id, *linked_ids}, None
+    if not linked_ids:
+        return {primary_id}, "expected_new_order_ids_missing"
+    return {primary_id, *linked_ids}, "expected_new_order_ids_ambiguous"
+
+
+def _expected_new_protection(
+    snapshot: dict[str, Any],
+    expected_new_ids: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        order
+        for order in snapshot["orders"]
+        if order.get("order_id")
+        and str(order["order_id"]) in expected_new_ids
+        and order["status"] == "active"
+        and order["valid_protection"]
+    ]
+
+
+def _replacement_coverage_complete(
+    snapshot: dict[str, Any],
+    expected_new_ids: set[str],
+    required_amount: float,
+) -> tuple[bool, list[dict[str, Any]]]:
+    new_orders = _expected_new_protection(snapshot, expected_new_ids)
+    found_ids = {str(order["order_id"]) for order in new_orders if order.get("order_id")}
+    new_stop_coverage = sum(
+        order["remaining_amount"] for order in new_orders if order["role"] == "sl"
+    )
+    new_tp_coverage = sum(
+        order["remaining_amount"] for order in new_orders if order["role"] == "tp"
+    )
+    epsilon = max(1e-12, required_amount * 1e-9)
+    return (
+        len(expected_new_ids) == 2
+        and found_ids == expected_new_ids
+        and any(order["role"] == "sl" for order in new_orders)
+        and any(order["role"] == "tp" for order in new_orders)
+        and new_stop_coverage + epsilon >= required_amount
+        and new_tp_coverage + epsilon >= required_amount,
+        new_orders,
+    )
+
+
+async def _finalize_replacement(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    client_order_id: str,
+    instrument: str,
+    old_ids: set[str],
+    expected_new_ids: set[str],
+    expected_new_ids_issue: Optional[str],
+    oco_identity_hints: dict[str, Any],
+    placed_result: Any,
+    initial: dict[str, Any],
+    idempotency_scope: dict[str, Any],
+    prior_cancelled_old_ids: Optional[list[str]] = None,
+    prior_cancelled_new_ids: Optional[list[str]] = None,
+    replacement_verified_once: bool = False,
+) -> dict[str, Any]:
+    """Verify the new OCO and retire old protection without a coverage gap."""
+
+    new_verified, new_orders = _replacement_coverage_complete(
+        initial,
+        expected_new_ids,
+        float(initial["required_amount"]),
+    )
+    replacement_verified_once = replacement_verified_once or new_verified
+    if initial["status"] == "flat":
+        # Coverage no longer has meaning once the position is gone. An SL may
+        # execute before its OCO sibling becomes visible, so safely clean every
+        # remaining decision-scoped exit even if the pair never fully verified.
+        new_verified = True
+    if not new_verified:
+        verification_issue = (
+            expected_new_ids_issue or "expected_new_orders_not_visible_or_incomplete"
+        )
+        envelope = {
+            "client_order_id": client_order_id,
+            "decision_id": decision_id,
+            "instrument": instrument,
+            "status": (
+                "protected_cleanup_needed"
+                if replacement_verified_once
+                else "new_protection_unverified"
+            ),
+            "changed": True,
+            "protection_gap": False,
+            "exchange_atomic": False,
+            "cleanup_needed": True,
+            "replacement_verified_once": replacement_verified_once,
+            "old_order_ids": sorted(old_ids),
+            "old_order_ids_cancelled": list(dict.fromkeys(prior_cancelled_old_ids or [])),
+            "expected_new_order_ids": sorted(expected_new_ids),
+            "expected_new_order_ids_issue": expected_new_ids_issue,
+            "oco_response_identity_hints": oco_identity_hints,
+            "verification_issue": verification_issue,
+            "verified_new_order_ids": [str(order["order_id"]) for order in new_orders],
+            "new_order_ids": sorted(expected_new_ids),
+            "new_order_ids_cancelled": list(dict.fromkeys(prior_cancelled_new_ids or [])),
+            "result": placed_result,
+            "protection": initial,
+        }
+        await _store_management_idempotent_response(
+            app_ctx, client_order_id, envelope, idempotency_scope
+        )
+        return envelope
+
+    cancelled_old: list[str] = list(dict.fromkeys(prior_cancelled_old_ids or []))
+    cancelled_new: list[str] = list(dict.fromkeys(prior_cancelled_new_ids or []))
+    cleanup_needed = False
+    position_closed_during_replace = False
+    new_ids = set(expected_new_ids)
+    for order_id in sorted(old_ids):
+        if order_id in cancelled_old:
+            continue
+        safety_read = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if safety_read["status"] == "flat":
+            position_closed_during_replace = True
+            flat_cancelled, safety_read, flat_cleanup = await _cancel_orders_while_flat(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                tool_name="replace_bracket",
+                phase="cancel_after_position_closed",
+                roles={"sl", "tp", "exit"},
+                initial=safety_read,
+            )
+            cancelled_old.extend(
+                candidate
+                for candidate in flat_cancelled
+                if candidate in old_ids and candidate not in cancelled_old
+            )
+            cancelled_new.extend(
+                candidate
+                for candidate in flat_cancelled
+                if candidate in new_ids and candidate not in cancelled_new
+            )
+            cleanup_needed = cleanup_needed or flat_cleanup
+            break
+        live_ids = {
+            str(order["order_id"]) for order in safety_read["orders"] if order.get("order_id")
+        }
+        if order_id not in live_ids:
+            # Cancelling one OCO leg commonly removes its sibling too.
+            cancelled_old.append(order_id)
+            continue
+        coverage_ok, _ = _replacement_coverage_complete(
+            safety_read,
+            expected_new_ids,
+            float(safety_read["required_amount"]),
+        )
+        if not coverage_ok:
+            cleanup_needed = True
+            break
+        try:
+            await _cancel_captured_order(
+                app_ctx,
+                tool_name="replace_bracket",
+                phase="cancel_old_protection",
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                order_id=order_id,
+            )
+            cancelled_old.append(order_id)
+        except Exception:
+            post_error = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            post_error_ids = {
+                str(order["order_id"]) for order in post_error["orders"] if order.get("order_id")
+            }
+            if order_id not in post_error_ids:
+                cancelled_old.append(order_id)
+            else:
+                cleanup_needed = True
+                logger.warning("Failed to cancel old protection %s", order_id, exc_info=True)
+
+    final = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+    if final["status"] == "flat" and not position_closed_during_replace:
+        position_closed_during_replace = True
+        flat_cancelled, final, flat_cleanup = await _cancel_orders_while_flat(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=client_order_id,
+            tool_name="replace_bracket",
+            phase="cancel_after_position_closed",
+            roles={"sl", "tp", "exit"},
+            initial=final,
+        )
+        cancelled_old.extend(
+            candidate
+            for candidate in flat_cancelled
+            if candidate in old_ids and candidate not in cancelled_old
+        )
+        cancelled_new.extend(
+            candidate
+            for candidate in flat_cancelled
+            if candidate in new_ids and candidate not in cancelled_new
+        )
+        cleanup_needed = cleanup_needed or flat_cleanup
+    remaining_protection = any(order["role"] in {"sl", "tp", "exit"} for order in final["orders"])
+    if position_closed_during_replace and final["status"] == "flat":
+        cleanup_needed = cleanup_needed or remaining_protection
+        status = (
+            "position_closed_cleanup_needed" if cleanup_needed else "position_closed_during_replace"
+        )
+    else:
+        final_new_coverage, _ = _replacement_coverage_complete(
+            final,
+            expected_new_ids,
+            float(final["required_amount"]),
+        )
+        cleanup_needed = cleanup_needed or not (final["protected"] and final_new_coverage)
+        status = "replaced" if not cleanup_needed else "protected_cleanup_needed"
+    envelope = {
+        "client_order_id": client_order_id,
+        "decision_id": decision_id,
+        "instrument": instrument,
+        "status": status,
+        "changed": True,
+        "protection_gap": False,
+        "exchange_atomic": False,
+        "cleanup_needed": cleanup_needed,
+        "replacement_verified_once": replacement_verified_once,
+        "old_order_ids": sorted(old_ids),
+        "old_order_ids_cancelled": list(dict.fromkeys(cancelled_old)),
+        "expected_new_order_ids": sorted(expected_new_ids),
+        "expected_new_order_ids_issue": expected_new_ids_issue,
+        "oco_response_identity_hints": oco_identity_hints,
+        "verification_issue": None,
+        "verified_new_order_ids": [str(order["order_id"]) for order in new_orders],
+        "new_order_ids_cancelled": list(dict.fromkeys(cancelled_new)),
+        "new_order_ids": sorted(expected_new_ids),
+        "result": placed_result,
+        "protection": final,
+    }
+    await _store_management_idempotent_response(
+        app_ctx, client_order_id, envelope, idempotency_scope
+    )
+    return envelope
+
+
+async def _replace_bracket_impl(
+    app_ctx: Any,
+    *,
+    decision_id: str,
+    tp_trigger_price: float,
+    trigger_source: str = "mark_price",
+    sl_type: str = "stop_market",
+    sl_trigger_price: Optional[float] = None,
+    sl_trigger_offset: Optional[float] = None,
+    sl_limit_price: Optional[float] = None,
+    tp_type: str = "take_market",
+    client_order_id: Optional[str] = None,
+    confirm_live_trade: bool = False,
+    expected_state_token: Optional[str] = None,
+    _idempotency_scope_override: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Replace live protection create-first, leaving no unprotected gap."""
+
+    async with _decision_mutation_lock(app_ctx, decision_id):
+        idempotency_scope = _idempotency_scope_override or _management_idempotency_scope(
+            "replace_bracket",
+            decision_id,
+            tp_trigger_price=float(tp_trigger_price),
+            trigger_source=str(trigger_source),
+            sl_type=str(sl_type),
+            sl_trigger_price=(None if sl_trigger_price is None else float(sl_trigger_price)),
+            sl_trigger_offset=(None if sl_trigger_offset is None else float(sl_trigger_offset)),
+            sl_limit_price=None if sl_limit_price is None else float(sl_limit_price),
+            tp_type=str(tp_type),
+        )
+        actual_id, cached = await _prepare_mutating_tool(
+            app_ctx,
+            confirm_live_trade=confirm_live_trade,
+            decision_id=decision_id,
+            decision_required=True,
+            client_order_id=client_order_id,
+            use_idempotency=True,
+            idempotency_scope=idempotency_scope,
+            expected_state_token=expected_state_token,
+        )
+        if cached is not None:
+            if cached.get("status") not in {
+                "new_protection_unverified",
+                "protected_cleanup_needed",
+                "position_closed_cleanup_needed",
+            }:
+                return cached
+            old_ids = {str(order_id) for order_id in cached.get("old_order_ids") or []}
+            if not old_ids:
+                # Compatibility with an in-flight response created before
+                # resumable replacement metadata was added.
+                return cached
+            current = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+            oco_identity_hints = cached.get("oco_response_identity_hints") or {
+                "explicit_order_ids": cached.get("expected_new_order_ids") or [],
+                "primary_order_id": None,
+                "oto_refs": [],
+            }
+            expected_new_ids, expected_new_ids_issue = _resolve_expected_oco_order_ids(
+                oco_identity_hints,
+                current,
+                old_ids,
+            )
+            return await _finalize_replacement(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=str(actual_id),
+                instrument=str(cached.get("instrument") or current["instrument"]),
+                old_ids=old_ids,
+                expected_new_ids=expected_new_ids,
+                expected_new_ids_issue=expected_new_ids_issue,
+                oco_identity_hints=oco_identity_hints,
+                placed_result=cached.get("result"),
+                initial=current,
+                idempotency_scope=idempotency_scope,
+                prior_cancelled_old_ids=cached.get("old_order_ids_cancelled") or [],
+                prior_cancelled_new_ids=cached.get("new_order_ids_cancelled") or [],
+                replacement_verified_once=bool(
+                    cached.get("replacement_verified_once")
+                    or cached.get("status")
+                    in {"protected_cleanup_needed", "position_closed_cleanup_needed"}
+                ),
+            )
+        assert actual_id is not None
+        before = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        if before["status"] == "flat":
+            raise TradingValidationError("replace_bracket requires an open position")
+        if not before["protected"]:
+            raise TradingValidationError(
+                "Existing position is not fully protected; refusing replace"
+            )
+        old_protection = [
+            order
+            for order in before["orders"]
+            if order["role"] in {"sl", "tp"}
+            and order["status"] == "active"
+            and order["valid_protection"]
+            and order.get("order_id")
+        ]
+        old_stops = [order for order in old_protection if order["role"] == "sl"]
+        if not old_stops:
+            raise TradingValidationError("No active stop available for safe replacement")
+
+        if tp_type != "take_market":
+            raise TradingValidationError(
+                "tp_type=take_market is the only supported take-profit type"
+            )
+        validate_trigger_params(
+            sl_type,
+            trigger=trigger_source,
+            trigger_price=sl_trigger_price,
+            trigger_offset=sl_trigger_offset,
+            price=sl_limit_price,
+        )
+        validate_trigger_params(
+            tp_type,
+            trigger=trigger_source,
+            trigger_price=tp_trigger_price,
+            trigger_offset=None,
+            price=None,
+        )
+        direction = before["position"]["direction"]
+        exit_side = _opposite_direction(direction)
+        if sl_type == "stop_limit":
+            _validate_protective_stop_limit_price(
+                exit_side=exit_side,
+                trigger_price=sl_trigger_price,
+                limit_price=sl_limit_price,
+            )
+        live_price = await _fresh_trigger_price(app_ctx, before["instrument"], trigger_source)
+        if direction == "buy" and tp_trigger_price <= live_price:
+            raise TradingValidationError(
+                f"long take-profit trigger {tp_trigger_price:g} must stay above "
+                f"current price {live_price:g}"
+            )
+        if direction == "sell" and tp_trigger_price >= live_price:
+            raise TradingValidationError(
+                f"short take-profit trigger {tp_trigger_price:g} must stay below "
+                f"current price {live_price:g}"
+            )
+        existing_triggers = [
+            value
+            for value in (_effective_existing_stop_trigger(stop, direction) for stop in old_stops)
+            if value is not None
+        ]
+        if not existing_triggers:
+            raise TradingValidationError("Could not derive the existing stop trigger")
+        current_stop = max(existing_triggers) if direction == "buy" else min(existing_triggers)
+        if sl_type == "trailing_stop":
+            assert sl_trigger_offset is not None
+            if len(old_stops) == 1 and old_stops[0]["order_type"] == "trailing_stop":
+                current_distance = _as_float(old_stops[0].get("trigger_offset"))
+                if current_distance is None:
+                    raise TradingValidationError("Existing trailing stop has no trigger_offset")
+                validate_trailing_distance(current_distance, sl_trigger_offset)
+            implied_trigger = (
+                live_price - sl_trigger_offset
+                if direction == "buy"
+                else live_price + sl_trigger_offset
+            )
+            validate_stop_improvement(
+                direction,
+                current_stop,
+                implied_trigger,
+                current_price=live_price,
+            )
+        else:
+            assert sl_trigger_price is not None
+            validate_stop_improvement(
+                direction,
+                current_stop,
+                sl_trigger_price,
+                current_price=live_price,
+            )
+
+        amount = float(before["required_amount"])
+        await _validate_order_amount(
+            app_ctx,
+            before["instrument"],
+            amount,
+            effective_price=sl_trigger_price,
+        )
+        await _validate_order_amount(
+            app_ctx,
+            before["instrument"],
+            amount,
+            effective_price=tp_trigger_price,
+        )
+        old_ids = {str(order["order_id"]) for order in old_protection}
+        request = {
+            "decision_id": decision_id,
+            "client_order_id": actual_id,
+            "phase": "place_new_oco",
+            "instrument": before["instrument"],
+            "amount": amount,
+            "sl_type": sl_type,
+            "sl_trigger_price": sl_trigger_price,
+            "sl_trigger_offset": sl_trigger_offset,
+            "sl_limit_price": sl_limit_price,
+            "tp_type": tp_type,
+            "tp_trigger_price": tp_trigger_price,
+            "trigger_source": trigger_source,
+            "old_order_ids": sorted(old_ids),
+        }
+        placed = await _execute_audited(
+            app_ctx,
+            "replace_bracket",
+            request,
+            decision_id,
+            lambda: app_ctx.rest_client.place_oco(
+                side=exit_side,
+                instrument=before["instrument"],
+                amount=amount,
+                primary_type=sl_type,
+                secondary_type=tp_type,
+                label=decision_id,
+                trigger_source=trigger_source,
+                primary_trigger_price=sl_trigger_price,
+                primary_trigger_offset=sl_trigger_offset,
+                primary_price=sl_limit_price,
+                secondary_trigger_price=tp_trigger_price,
+            ),
+        )
+
+        after_place = await _verify_protection_impl(app_ctx, decision_id=decision_id)
+        oco_identity_hints = _oco_response_identity_hints(placed)
+        expected_new_ids, expected_new_ids_issue = _resolve_expected_oco_order_ids(
+            oco_identity_hints,
+            after_place,
+            old_ids,
+        )
+        return await _finalize_replacement(
+            app_ctx,
+            decision_id=decision_id,
+            client_order_id=actual_id,
+            instrument=before["instrument"],
+            old_ids=old_ids,
+            expected_new_ids=expected_new_ids,
+            expected_new_ids_issue=expected_new_ids_issue,
+            oco_identity_hints=oco_identity_hints,
+            placed_result=_compact_deribit_order_result(placed),
+            initial=after_place,
+            idempotency_scope=idempotency_scope,
+        )
 
 
 def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
@@ -1608,15 +4040,24 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         instrument: str,
         condition: str,
         threshold: float,
+        trigger_source: str = "last_price",
         notification_channel: str = "outbox",
         message: Optional[str] = None,
         repeat: bool = False,
         cooldown_seconds: int = 300,
+        decision_id: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
-        """Set a price alert for a Deribit instrument."""
+        """Set a price alert using last_price, mark_price, or index_price."""
         _validate_notification_channel(notification_channel)
         app_ctx = _ctx(ctx)
+        if decision_id:
+            decision_instrument = await _decision_instrument(app_ctx, decision_id)
+            if decision_instrument != instrument.upper():
+                raise ValueError(
+                    f"instrument {instrument.upper()} conflicts with decision "
+                    f"{decision_id} instrument {decision_instrument}"
+                )
         alert = await app_ctx.alert_manager.add_alert(
             instrument=instrument,
             condition=condition,
@@ -1625,21 +4066,24 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             message=message,
             repeat=repeat,
             cooldown_seconds=cooldown_seconds,
+            decision_id=decision_id,
+            trigger_source=trigger_source,
         )
         callback = app_ctx.ws_client.price_update_callback
         if callback is None:
             raise RuntimeError("Price-update callback not configured; lifespan setup did not run")
-        await app_ctx.ws_client.subscribe_ticker(instrument, callback)
+        await app_ctx.ws_client.subscribe_ticker(alert.instrument, callback)
         try:
-            ticker = await app_ctx.ws_client.get_ticker(instrument)
+            ticker = await app_ctx.ws_client.get_ticker(alert.instrument)
+            app_ctx.trading_state_builder.observe_ticker(alert.instrument, ticker)
             current_price = (
                 ticker.get("mark_price") or ticker.get("last_price") or ticker.get("index_price")
             )
             if current_price:
-                app_ctx.price_cache[instrument] = float(current_price)
-                await app_ctx.alert_manager.process_price_update(instrument, float(current_price))
+                app_ctx.price_cache[alert.instrument] = float(current_price)
+                await app_ctx.alert_manager.process_price_update(alert.instrument, ticker)
         except Exception as exc:
-            logger.error("Immediate price check failed for %s: %s", instrument, exc)
+            logger.error("Immediate price check failed for %s: %s", alert.instrument, exc)
         return _json({"alert": alert.to_dict()})
 
     @server.tool()
@@ -1651,11 +4095,20 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         notification_channel: str = "outbox",
         repeat: bool = False,
         cooldown_seconds: int = 300,
+        decision_id: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
-        """Set a time alert using either an ISO-8601 fire_at or delay_seconds."""
+        """Set a time alert with a decision-scoped trading snapshot at fire time."""
         _validate_notification_channel(notification_channel)
         app_ctx = _ctx(ctx)
+        if decision_id:
+            decision_instrument = await _decision_instrument(app_ctx, decision_id)
+            if instrument and decision_instrument != instrument.upper():
+                raise ValueError(
+                    f"instrument {instrument.upper()} conflicts with decision "
+                    f"{decision_id} instrument {decision_instrument}"
+                )
+            instrument = instrument or decision_instrument
         alert = await app_ctx.alert_manager.add_time_alert(
             message=message,
             fire_at=_parse_time_alert_fire_at(fire_at, delay_seconds),
@@ -1663,9 +4116,94 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             notification_channel=notification_channel,
             repeat=repeat,
             cooldown_seconds=cooldown_seconds,
+            decision_id=decision_id,
         )
+        if alert.instrument:
+            callback = app_ctx.ws_client.price_update_callback
+            if callback is None:
+                raise RuntimeError(
+                    "Price-update callback not configured; lifespan setup did not run"
+                )
+            await app_ctx.ws_client.subscribe_ticker(alert.instrument, callback)
+            try:
+                ticker = await app_ctx.ws_client.get_ticker(alert.instrument)
+                app_ctx.trading_state_builder.observe_ticker(alert.instrument, ticker)
+                current_price = (
+                    ticker.get("mark_price")
+                    or ticker.get("last_price")
+                    or ticker.get("index_price")
+                )
+                if current_price:
+                    app_ctx.price_cache[alert.instrument] = float(current_price)
+            except Exception as exc:
+                logger.error(
+                    "Initial timer snapshot price check failed for %s: %s",
+                    alert.instrument,
+                    exc,
+                )
         app_ctx.scheduler.wake()
         return _json({"alert": alert.to_dict()})
+
+    @server.tool()
+    async def upsert_monitor_plan(
+        name: str,
+        instrument: str,
+        upper_threshold: float,
+        lower_threshold: float,
+        fire_at: Optional[str] = None,
+        delay_seconds: Optional[int] = None,
+        trigger_source: str = "last_price",
+        notification_channel: str = "outbox",
+        decision_id: Optional[str] = None,
+        cooldown_seconds: int = 300,
+        ctx: Any = None,
+    ) -> str:
+        """Atomically replace a named timer plus upper/lower price alerts."""
+        _validate_notification_channel(notification_channel)
+        app_ctx = _ctx(ctx)
+        instrument = instrument.upper()
+        if decision_id:
+            decision_instrument = await _decision_instrument(app_ctx, decision_id)
+            if decision_instrument != instrument:
+                raise ValueError(
+                    f"instrument {instrument} conflicts with decision "
+                    f"{decision_id} instrument {decision_instrument}"
+                )
+        callback = app_ctx.ws_client.price_update_callback
+        if callback is None:
+            raise RuntimeError("Price-update callback not configured; lifespan setup did not run")
+        await app_ctx.ws_client.subscribe_ticker(instrument, callback)
+        alerts = await app_ctx.alert_manager.upsert_monitor_plan(
+            name=name,
+            instrument=instrument,
+            upper_threshold=upper_threshold,
+            lower_threshold=lower_threshold,
+            fire_at=_parse_time_alert_fire_at(fire_at, delay_seconds),
+            trigger_source=trigger_source,
+            notification_channel=notification_channel,
+            decision_id=decision_id,
+            cooldown_seconds=cooldown_seconds,
+        )
+        try:
+            ticker = await app_ctx.ws_client.get_ticker(instrument)
+            app_ctx.trading_state_builder.observe_ticker(instrument, ticker)
+            current_price = (
+                ticker.get("mark_price") or ticker.get("last_price") or ticker.get("index_price")
+            )
+            if current_price:
+                app_ctx.price_cache[instrument] = float(current_price)
+                await app_ctx.alert_manager.process_price_update(instrument, ticker)
+        except Exception as exc:
+            logger.error("Initial monitor-plan price check failed for %s: %s", instrument, exc)
+        app_ctx.scheduler.wake()
+        return _json(
+            {
+                "name": name,
+                "instrument": instrument,
+                "alerts": [alert.to_dict() for alert in alerts],
+                "replaced_atomically": True,
+            }
+        )
 
     @server.tool()
     async def remove_alert(alert_id: str, ctx: Any = None) -> str:
@@ -1721,8 +4259,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Valid values fall into two groups:
 
         - **Execution state** (what happened to the order):
-          ``filled``, ``cancelled``, ``rejected``, ``expired``, ``partial``,
-          ``unknown``.
+          ``submitted``, ``failed``, ``filled``, ``cancelled``, ``rejected``,
+          ``expired``, ``partial``, ``unknown``.
         - **PnL state** (what happened to the position once an exit is
           final): ``win``, ``loss``, ``breakeven``. Use these for trade
           journal aggregation so consumers do not have to parse
@@ -1766,6 +4304,16 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         if row is None:
             raise ValueError(f"Unknown decision_id: {decision_id}")
         return _json({"decision": row})
+
+    @server.tool()
+    async def get_decision_state(decision_id: str, ctx: Any = None) -> str:
+        """Get one decision plus its coherent position/order/protection state."""
+        app_ctx = _ctx(ctx)
+        row = await app_ctx.decision_repo.get(decision_id)
+        if row is None:
+            raise ValueError(f"Unknown decision_id: {decision_id}")
+        state = await app_ctx.trading_state_builder.capture(decision_id=decision_id)
+        return _json({"decision": _compact_decision(row, 400), "state": state})
 
     @server.tool()
     async def add_note(
@@ -2282,6 +4830,33 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         return _json(await app_ctx.rest_client.get_position(instrument))
 
     @server.tool()
+    async def get_trading_state(
+        instrument: Optional[str] = None,
+        decision_id: Optional[str] = None,
+        currency: Optional[str] = None,
+        include_day_pnl: bool = True,
+        ctx: Any = None,
+    ) -> str:
+        """Capture coherent live market, account, order, protection, PnL, and risk state.
+
+        Independent Deribit sources are fetched concurrently inside a bounded capture
+        window. The response exposes per-source status and age, truncation, capture
+        skew, decision-grouped entry/SL/TP lifecycle, top-of-book and market structure,
+        OI changes, net PnL after fees/funding, and current stop exposure. ``status.market``
+        is a derived compatibility status for the compact market view; the underlying
+        ``ticker`` and ``order_book`` source statuses remain available separately.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await app_ctx.trading_state_builder.capture(
+                instrument=instrument,
+                decision_id=decision_id,
+                currency=currency,
+                include_day_pnl=include_day_pnl,
+            )
+        )
+
+    @server.tool()
     async def get_open_orders(
         instrument: Optional[str] = None,
         currency: Optional[str] = None,
@@ -2313,6 +4888,17 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         return _json(await app_ctx.rest_client.get_open_orders_by_label(currency, label))
 
     @server.tool()
+    async def verify_protection(decision_id: str, ctx: Any = None) -> str:
+        """Read-only check that the decision's full position has an active reduce-only SL.
+
+        The instrument is derived from the stored decision. The response classifies
+        labelled entry, stop-loss and take-profit orders and reports stop/TP coverage
+        in the instrument's native order-amount units.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(await _verify_protection_impl(app_ctx, decision_id=decision_id))
+
+    @server.tool()
     async def buy(
         instrument: str,
         amount: float,
@@ -2328,6 +4914,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         trigger_offset: Optional[float] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards.
@@ -2369,6 +4956,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 trigger_offset=trigger_offset,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -2388,6 +4976,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         trigger_offset: Optional[float] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. See `buy` for trigger-order semantics."""
@@ -2410,12 +4999,12 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 trigger_offset=trigger_offset,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
     @server.tool()
     async def place_bracket(
-        decision_id: str,
         instrument: str,
         side: str,
         amount: float,
@@ -2425,6 +5014,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         tp_trigger_price: float,
         trigger_source: str,
         confirm_live_trade: bool,
+        decision_id: Optional[str] = None,
+        decision: Optional[PlaceBracketDecision] = None,
         sl_trigger_price: Optional[float] = None,
         sl_trigger_offset: Optional[float] = None,
         entry_price: Optional[float] = None,
@@ -2437,6 +5028,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         sl_trigger_source: Optional[str] = None,
         tp_trigger_source: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Place a native Deribit OTOCO bracket.
@@ -2444,6 +5036,15 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Creates entry + stop-loss + take-profit in one Deribit call using
         ``linked_order_type=one_triggers_one_cancels_other``. Take-profit is
         intentionally limited to ``take_market``.
+
+        Pass exactly one decision source. ``decision`` creates the audit row
+        from ``reasoning``, optional ``alert_id``, and optional ``metadata``;
+        the server derives ``action_taken=place_bracket``. ``decision_id``
+        reuses an existing row. Order fields are rejected inside ``decision``
+        so the audit payload cannot diverge from the actual bracket request.
+        The decision ID is also the default idempotency key and Deribit label.
+        An explicit ``client_order_id`` is aliased to the same response, so
+        retries by either ID do not submit a second bracket.
 
         Entry-type matrix:
 
@@ -2459,7 +5060,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         OTOCO children become live SL/TP. This removes wake-latency and
         survives MCP outages for setups like "buy on $80100 break".
         Already-past triggers are rejected: a buy stop-entry must price
-        below current; a sell stop-entry must price above. The current
+        *above* current (enter on a break up); a sell stop-entry must
+        price *below* current (enter on a break down). The current
         price is read with cache bypassed so a stale WS feed cannot mask
         the divergence.
 
@@ -2494,6 +5096,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
           ``mark_price`` for SL/TP (wick-resistant).
 
         Response shape:
+          - ``decision_id`` / ``client_order_id``: retry-safe audit and call IDs.
           - ``entry_order_id``: cancelable id of the entry order.
           - ``child_order_ids``: ``{sl, tp}`` — cancelable trigger-order
             ids, hydrated from ``private/get_trigger_order_history``
@@ -2512,6 +5115,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             await _place_bracket_impl(
                 app_ctx,
                 decision_id=decision_id,
+                decision=decision,
                 instrument=instrument,
                 side=side,
                 amount=amount,
@@ -2533,6 +5137,240 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 sl_trigger_source=sl_trigger_source,
                 tp_trigger_source=tp_trigger_source,
                 client_order_id=client_order_id,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def move_stop(
+        decision_id: str,
+        new_trigger: float,
+        confirm_live_trade: bool,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Tighten an existing fixed stop for one decision.
+
+        The active stop is selected by semantic role, never by list position. A long
+        stop may only move up and a short stop only down; the new trigger must remain
+        on the protective side of a fresh market price. Replaying the current trigger
+        is an audited idempotent no-op.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _move_stop_impl(
+                app_ctx,
+                decision_id=decision_id,
+                new_trigger=new_trigger,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def tighten_protection_by_label(
+        decision_id: str,
+        new_trigger_price: float,
+        confirm_live_trade: bool,
+        require_positive_net_pnl: bool = False,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Tighten the labelled fixed stop-loss safely.
+
+        Set ``require_positive_net_pnl=True`` to require exact positive PnL after
+        actual entry fees and an estimated taker exit fee before mutation. Fixed
+        stops that are editable are changed directly. Incremental OTOCO children,
+        which Deribit does not permit editing, use a create-first full-size OCO
+        replacement; new SL/TP coverage is verified before old protection is
+        cancelled. The stop-improvement guard never permits widening protection.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _tighten_protection_by_label_impl(
+                app_ctx,
+                decision_id=decision_id,
+                new_trigger_price=new_trigger_price,
+                require_positive_net_pnl=require_positive_net_pnl,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def move_stop_to_breakeven(
+        decision_id: str,
+        confirm_live_trade: bool,
+        offset: float = 0.0,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Tighten a fixed stop to entry plus directional offset.
+
+        For longs the offset is added to the average entry; for shorts it is
+        subtracted. If the live stop already protects a better price, this is an
+        audited no-op and the stop is never worsened.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _move_stop_to_breakeven_impl(
+                app_ctx,
+                decision_id=decision_id,
+                offset=offset,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def trail_stop(
+        decision_id: str,
+        distance: float,
+        confirm_live_trade: bool,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Tighten an existing Deribit trailing stop.
+
+        Only a currently active ``trailing_stop`` can be edited atomically, and its
+        absolute distance may never be widened. Converting a fixed stop is rejected;
+        use ``replace_bracket`` for a create-first protected replacement.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _trail_stop_impl(
+                app_ctx,
+                decision_id=decision_id,
+                distance=distance,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def cancel_pending_setup(
+        decision_id: str,
+        confirm_live_trade: bool,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Cancel one still-flat pending setup by captured IDs.
+
+        Entry IDs are captured before cancellation and position state is re-read after
+        each cancel. If an entry fills concurrently, SL/TP children are retained. Only
+        dormant children captured while a fresh read remains flat are cleaned up.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _cancel_pending_setup_impl(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def cancel_decision(
+        decision_id: str,
+        confirm_live_trade: bool,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Cancel all labelled legs and verify flat atomically.
+
+        The decision outcome changes to ``cancelled`` only after every captured
+        parent/OTOCO child is absent and a fresh read confirms no open position.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _cancel_decision_impl(
+                app_ctx,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def close_position_and_cancel_protection(
+        decision_id: str,
+        confirm_live_trade: bool,
+        order_type: str = "market",
+        price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Close first, then cancel protection after flat verify.
+
+        If a close is partial, pending, or otherwise leaves exposure, all protective
+        orders stay untouched. Cleanup is performed only from captured IDs while fresh
+        position reads continue to confirm the account is flat.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _close_position_and_cancel_protection_impl(
+                app_ctx,
+                decision_id=decision_id,
+                order_type=order_type,
+                price=price,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
+            )
+        )
+
+    @server.tool()
+    async def replace_bracket(
+        decision_id: str,
+        tp_trigger_price: float,
+        confirm_live_trade: bool,
+        trigger_source: str = "mark_price",
+        sl_type: str = "stop_market",
+        sl_trigger_price: Optional[float] = None,
+        sl_trigger_offset: Optional[float] = None,
+        sl_limit_price: Optional[float] = None,
+        tp_type: str = "take_market",
+        client_order_id: Optional[str] = None,
+        expected_state_token: Optional[str] = None,
+        ctx: Any = None,
+    ) -> str:
+        """Mutates exchange state. Replace live SL/TP with create-first OCO protection.
+
+        A new reduce-only OCO is placed and its full SL and TP coverage is re-read
+        before captured old order IDs are cancelled. The operation is intentionally
+        reported as ``protection_gap=false`` and ``exchange_atomic=false``: Deribit
+        creates each OCO atomically, while this safe replacement spans verified calls.
+        If new coverage cannot be verified, old protection is retained.
+        """
+        app_ctx = _ctx(ctx)
+        return _json(
+            await _replace_bracket_impl(
+                app_ctx,
+                decision_id=decision_id,
+                tp_trigger_price=tp_trigger_price,
+                trigger_source=trigger_source,
+                sl_type=sl_type,
+                sl_trigger_price=sl_trigger_price,
+                sl_trigger_offset=sl_trigger_offset,
+                sl_limit_price=sl_limit_price,
+                tp_type=tp_type,
+                client_order_id=client_order_id,
+                confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -2542,6 +5380,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -2553,6 +5392,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=False,
             client_order_id=client_order_id,
             use_idempotency=True,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return _json(cached)
@@ -2574,6 +5414,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         amount: Optional[float] = None,
         price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        trigger_offset: Optional[float] = None,
         instrument: Optional[str] = None,
         post_only: Optional[bool] = None,
         reject_post_only: Optional[bool] = None,
@@ -2581,6 +5423,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         advanced: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -2606,6 +5449,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             use_idempotency=True,
             instrument=checked_instrument,
             amount=amount,
+            expected_state_token=expected_state_token,
         )
         if cached is not None:
             return _json(cached)
@@ -2613,6 +5457,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             "order_id": order_id,
             "amount": amount,
             "price": price,
+            "trigger_price": trigger_price,
+            "trigger_offset": trigger_offset,
             "instrument": checked_instrument,
             "decision_id": decision_id,
             "client_order_id": actual_id,
@@ -2630,6 +5476,8 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 order_id,
                 amount=amount,
                 price=price,
+                trigger_price=trigger_price,
+                trigger_offset=trigger_offset,
                 post_only=post_only,
                 reject_post_only=reject_post_only,
                 reduce_only=reduce_only,
@@ -2647,12 +5495,14 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         amount: Optional[float] = None,
         price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
         post_only: Optional[bool] = None,
         reject_post_only: Optional[bool] = None,
         reduce_only: Optional[bool] = None,
         advanced: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Edit the open order labelled by decision_id.
@@ -2664,9 +5514,10 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         Currency is required to scope the preflight call.
 
         Deribit's edit_by_label endpoint requires `amount` (or `contracts`)
-        even for price-only edits. If you pass only `price`, the tool
-        backfills `amount` from the preflight order — the caller's intent
-        and the effective value are both kept in the audit row.
+        even for price-only or trigger-only edits. If you pass only `price`
+        or `trigger_price`, the tool backfills `amount` from the preflight
+        order — the caller's intent and the effective value are both kept in
+        the audit row.
         """
         app_ctx = _ctx(ctx)
         return _json(
@@ -2677,12 +5528,14 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 amount=amount,
                 price=price,
+                trigger_price=trigger_price,
                 post_only=post_only,
                 reject_post_only=reject_post_only,
                 reduce_only=reduce_only,
                 advanced=advanced,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -2692,6 +5545,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Cancel open orders labelled by decision_id.
@@ -2711,6 +5565,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 
@@ -2723,6 +5578,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         order_type: Optional[str] = None,
         confirm_cancel_all: bool = False,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -2735,6 +5591,9 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=True,
             global_cancel_all=global_cancel,
             confirm_cancel_all=confirm_cancel_all,
+            expected_state_token=expected_state_token,
+            instrument=instrument,
+            currency=currency,
         )
         request = {
             "currency": currency,
@@ -2766,6 +5625,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         order_type: str = "market",
         price: Optional[float] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Subject to configured trading guards."""
@@ -2777,6 +5637,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
             decision_required=True,
             instrument=instrument,
             close_position=True,
+            expected_state_token=expected_state_token,
         )
         request = {
             "instrument": instrument,
@@ -2799,6 +5660,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
         confirm_live_trade: bool = False,
+        expected_state_token: Optional[str] = None,
         ctx: Any = None,
     ) -> str:
         """Mutates exchange state. Create or fetch a Deribit combo instrument."""
@@ -2810,6 +5672,7 @@ def build_mcp(lifespan=deribit_lifespan) -> FastMCP:
                 decision_id=decision_id,
                 client_order_id=client_order_id,
                 confirm_live_trade=confirm_live_trade,
+                expected_state_token=expected_state_token,
             )
         )
 

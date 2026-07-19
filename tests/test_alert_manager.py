@@ -369,7 +369,7 @@ async def test_refresh_from_rest_fires_alert_when_ws_was_stale():
     alert._last_price = 77589.0
     mgr.alerts[alert.id] = alert
 
-    rest = _StubRestClient({"BTC-PERPETUAL": {"mark_price": 77200.0}})
+    rest = _StubRestClient({"BTC-PERPETUAL": {"last_price": 77200.0}})
     refreshed = await mgr.refresh_from_rest(rest)
 
     assert refreshed == 1
@@ -417,7 +417,7 @@ async def test_refresh_from_rest_skips_time_and_non_active_alerts():
     mgr.alerts[time_alert.id] = time_alert
     mgr.alerts[active.id] = active
 
-    rest = _StubRestClient({"ETH-PERPETUAL": {"mark_price": 1.0}})
+    rest = _StubRestClient({"ETH-PERPETUAL": {"last_price": 1.0}})
     refreshed = await mgr.refresh_from_rest(rest)
 
     assert refreshed == 1
@@ -440,7 +440,7 @@ async def test_refresh_from_rest_survives_per_instrument_errors():
     rest = _StubRestClient(
         {
             "BTC-PERPETUAL": RuntimeError("boom"),
-            "ETH-PERPETUAL": {"mark_price": 1500.0},
+            "ETH-PERPETUAL": {"last_price": 1500.0},
         }
     )
 
@@ -450,6 +450,88 @@ async def test_refresh_from_rest_survives_per_instrument_errors():
     assert refreshed == 1
     assert sorted(rest.calls) == ["BTC-PERPETUAL", "ETH-PERPETUAL"]
     assert a2._last_price == 1500.0
+
+
+@pytest.mark.asyncio
+async def test_alert_uses_only_configured_trigger_source_and_forwards_all_prices():
+    fired: list[dict] = []
+
+    async def cb(channel, message, alert, **kwargs):
+        fired.append(kwargs)
+        return True
+
+    mgr = AlertManager(cb)
+    alert = _alert(
+        condition=AlertCondition.ABOVE,
+        threshold=100.0,
+        trigger_source="last_price",
+    )
+    mgr.alerts[alert.id] = alert
+
+    await mgr.process_price_update(
+        "BTC-PERPETUAL",
+        {"last_price": 99.0, "mark_price": 101.0, "index_price": 98.0},
+    )
+    assert fired == []
+
+    await mgr.process_price_update(
+        "BTC-PERPETUAL",
+        {"last_price": 102.0, "mark_price": 103.0, "index_price": 101.5},
+    )
+
+    assert fired[0]["triggered_price"] == 102.0
+    assert fired[0]["price_snapshot"] == {
+        "last_price": 102.0,
+        "mark_price": 103.0,
+        "index_price": 101.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_alert_rejects_unknown_trigger_source():
+    mgr = AlertManager(lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="Invalid trigger_source"):
+        await mgr.add_alert("BTC-PERPETUAL", "above", 100.0, trigger_source="mid_price")
+
+
+@pytest.mark.asyncio
+async def test_upsert_monitor_plan_replaces_only_matching_named_plan_in_memory():
+    mgr = AlertManager(lambda *args, **kwargs: None)
+    old = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.ABOVE,
+        threshold=101,
+        monitor_plan_name="breakout",
+        decision_id="decision-1",
+    )
+    unrelated = PriceAlert(
+        instrument="BTC-PERPETUAL",
+        condition=AlertCondition.ABOVE,
+        threshold=200,
+        monitor_plan_name="other",
+        decision_id="decision-1",
+    )
+    mgr.alerts = {old.id: old, unrelated.id: unrelated}
+
+    created = await mgr.upsert_monitor_plan(
+        name="breakout",
+        instrument="BTC-PERPETUAL",
+        upper_threshold=110,
+        lower_threshold=90,
+        fire_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        decision_id="decision-1",
+    )
+
+    assert old.id not in mgr.alerts
+    assert unrelated.id in mgr.alerts
+    assert {alert.condition for alert in created} == {
+        AlertCondition.CROSSES_ABOVE,
+        AlertCondition.CROSSES_BELOW,
+        AlertCondition.TIME,
+    }
+    assert all(alert.monitor_plan_name == "breakout" for alert in created)
+    assert {alert.id for alert in created} <= set(mgr.alerts)
 
 
 @pytest.mark.asyncio

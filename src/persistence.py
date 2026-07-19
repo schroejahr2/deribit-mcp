@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +47,7 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self.conn: Optional[aiosqlite.Connection] = None
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self.path != ":memory:":
@@ -71,6 +74,21 @@ class Database:
             raise RuntimeError("database is not connected")
         return self.conn
 
+    @asynccontextmanager
+    async def write_transaction(self, *, immediate: bool = False):
+        """Serialize transaction boundaries on the shared aiosqlite connection."""
+
+        async with self._write_lock:
+            conn = self.require_conn()
+            if immediate:
+                await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def bootstrap(self) -> None:
         conn = self.require_conn()
         await conn.executescript("""
@@ -80,6 +98,7 @@ class Database:
               condition TEXT NOT NULL,
               threshold REAL,
               fire_at TEXT,
+              decision_id TEXT,
               notification_channel TEXT NOT NULL,
               status TEXT NOT NULL,
               message TEXT,
@@ -90,6 +109,8 @@ class Database:
               last_trigger_time TEXT,
               last_price REAL,
               last_price_at TEXT,
+              trigger_source TEXT NOT NULL DEFAULT 'mark_price',
+              monitor_plan_name TEXT,
               schema_version INTEGER NOT NULL DEFAULT 1
             );
 
@@ -145,6 +166,7 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS event_outbox (
               event_id TEXT PRIMARY KEY,
+              event_sequence INTEGER,
               created_at TEXT NOT NULL,
               type TEXT NOT NULL,
               severity TEXT NOT NULL,
@@ -163,6 +185,29 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_event_outbox_expires
               ON event_outbox(expires_at);
+
+            CREATE TABLE IF NOT EXISTS event_sequence_counter (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              value INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO event_sequence_counter (singleton, value)
+              VALUES (1, 0);
+
+            CREATE TABLE IF NOT EXISTS trading_event_state (
+              entity_key TEXT PRIMARY KEY,
+              entity_type TEXT NOT NULL,
+              decision_id TEXT,
+              instrument TEXT,
+              state_json TEXT NOT NULL,
+              last_event_sequence INTEGER,
+              updated_at TEXT NOT NULL,
+              schema_version INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_trading_event_state_decision
+              ON trading_event_state(decision_id)
+              WHERE decision_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS event_consumers (
               consumer_id TEXT PRIMARY KEY,
@@ -257,7 +302,107 @@ class Database:
         await self._migrate_drop_briefings(conn)
         await self._migrate_news_add_dedupe_key(conn)
         await self._migrate_alerts_add_last_price_at(conn)
+        await self._migrate_alerts_add_decision_id(conn)
+        await self._migrate_alerts_add_trigger_source(conn)
+        await self._migrate_alerts_add_monitor_plan_name(conn)
+        await self._migrate_event_outbox_sequence(conn)
         await conn.commit()
+
+    async def _migrate_event_outbox_sequence(self, conn: aiosqlite.Connection) -> None:
+        """Add a durable gap-free sequence assigned only after a successful insert.
+
+        The trigger runs as part of the same SQLite statement that inserts the
+        outbox row. ``INSERT OR IGNORE`` dedupe conflicts therefore never fire
+        the trigger and never advance the counter.
+        """
+        cursor = await conn.execute("PRAGMA table_info(event_outbox)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "event_sequence" not in columns:
+            await conn.execute("ALTER TABLE event_outbox ADD COLUMN event_sequence INTEGER")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_sequence_counter (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              value INTEGER NOT NULL
+            )
+            """)
+        await conn.execute(
+            "INSERT OR IGNORE INTO event_sequence_counter (singleton, value) VALUES (1, 0)"
+        )
+
+        cursor = await conn.execute(
+            "SELECT COALESCE(MAX(event_sequence), 0) AS value FROM event_outbox"
+        )
+        next_sequence = int((await cursor.fetchone())["value"])
+        cursor = await conn.execute("""
+            SELECT event_id
+            FROM event_outbox
+            WHERE event_sequence IS NULL
+            ORDER BY created_at, rowid
+            """)
+        for row in await cursor.fetchall():
+            next_sequence += 1
+            await conn.execute(
+                """
+                UPDATE event_outbox
+                SET event_sequence = ?,
+                    payload_json = CASE
+                      WHEN json_valid(payload_json)
+                      THEN json_set(payload_json, '$.event_sequence', ?)
+                      ELSE payload_json
+                    END
+                WHERE event_id = ?
+                """,
+                (next_sequence, next_sequence, row["event_id"]),
+            )
+
+        await conn.execute("""
+            UPDATE event_outbox
+            SET payload_json = json_set(payload_json, '$.event_sequence', event_sequence)
+            WHERE event_sequence IS NOT NULL
+              AND json_valid(payload_json)
+              AND COALESCE(json_extract(payload_json, '$.event_sequence'), -1) != event_sequence
+            """)
+        await conn.execute(
+            """
+            UPDATE event_sequence_counter
+            SET value = MAX(value, ?)
+            WHERE singleton = 1
+            """,
+            (next_sequence,),
+        )
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_event_outbox_sequence
+              ON event_outbox(event_sequence)
+              WHERE event_sequence IS NOT NULL
+            """)
+        await conn.execute("DROP TRIGGER IF EXISTS trg_event_outbox_assign_sequence")
+        await conn.execute("""
+            CREATE TRIGGER trg_event_outbox_assign_sequence
+            AFTER INSERT ON event_outbox
+            FOR EACH ROW
+            WHEN NEW.event_sequence IS NULL
+            BEGIN
+              UPDATE event_sequence_counter
+              SET value = value + 1
+              WHERE singleton = 1;
+
+              UPDATE event_outbox
+              SET event_sequence = (
+                    SELECT value FROM event_sequence_counter WHERE singleton = 1
+                  ),
+                  payload_json = CASE
+                    WHEN json_valid(payload_json)
+                    THEN json_set(
+                      payload_json,
+                      '$.event_sequence',
+                      (SELECT value FROM event_sequence_counter WHERE singleton = 1)
+                    )
+                    ELSE payload_json
+                  END
+              WHERE event_id = NEW.event_id;
+            END
+            """)
 
     async def _migrate_alerts_add_last_price_at(self, conn: aiosqlite.Connection) -> None:
         """Stamp the last price-sample arrival so operators can detect stale alerts."""
@@ -265,6 +410,38 @@ class Database:
         columns = {row["name"] for row in await cursor.fetchall()}
         if "last_price_at" not in columns:
             await conn.execute("ALTER TABLE alerts ADD COLUMN last_price_at TEXT")
+
+    async def _migrate_alerts_add_decision_id(self, conn: aiosqlite.Connection) -> None:
+        """Persist the strategy decision associated with price and time alerts."""
+        cursor = await conn.execute("PRAGMA table_info(alerts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "decision_id" not in columns:
+            await conn.execute("ALTER TABLE alerts ADD COLUMN decision_id TEXT")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_decision_id "
+            "ON alerts(decision_id) WHERE decision_id IS NOT NULL"
+        )
+
+    async def _migrate_alerts_add_trigger_source(self, conn: aiosqlite.Connection) -> None:
+        """Preserve legacy mark-first alert semantics while new alerts default to last price."""
+        cursor = await conn.execute("PRAGMA table_info(alerts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "trigger_source" not in columns:
+            await conn.execute(
+                "ALTER TABLE alerts ADD COLUMN trigger_source TEXT NOT NULL " "DEFAULT 'mark_price'"
+            )
+
+    async def _migrate_alerts_add_monitor_plan_name(self, conn: aiosqlite.Connection) -> None:
+        """Add the durable identity used for atomic monitor-plan replacement."""
+        cursor = await conn.execute("PRAGMA table_info(alerts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "monitor_plan_name" not in columns:
+            await conn.execute("ALTER TABLE alerts ADD COLUMN monitor_plan_name TEXT")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_monitor_plan "
+            "ON alerts(monitor_plan_name, instrument, decision_id, status) "
+            "WHERE monitor_plan_name IS NOT NULL"
+        )
 
     async def _migrate_news_add_dedupe_key(self, conn: aiosqlite.Connection) -> None:
         """Add dedupe_key column + unique partial index to pre-existing news table."""
@@ -309,19 +486,24 @@ class AlertRepo:
         self.db = db
 
     async def save(self, alert: Any) -> None:
-        conn = self.db.require_conn()
+        async with self.db.write_transaction() as conn:
+            await self._save_one(conn, alert)
+
+    async def _save_one(self, conn: aiosqlite.Connection, alert: Any) -> None:
         await conn.execute(
             """
             INSERT INTO alerts (
-              id, instrument, condition, threshold, fire_at, notification_channel,
+              id, instrument, condition, threshold, fire_at, decision_id, notification_channel,
               status, message, repeat, cooldown_seconds, created_at, triggered_at,
-              last_trigger_time, last_price, last_price_at, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+              last_trigger_time, last_price, last_price_at, trigger_source,
+              monitor_plan_name, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(id) DO UPDATE SET
               instrument=excluded.instrument,
               condition=excluded.condition,
               threshold=excluded.threshold,
               fire_at=excluded.fire_at,
+              decision_id=excluded.decision_id,
               notification_channel=excluded.notification_channel,
               status=excluded.status,
               message=excluded.message,
@@ -330,7 +512,9 @@ class AlertRepo:
               triggered_at=excluded.triggered_at,
               last_trigger_time=excluded.last_trigger_time,
               last_price=excluded.last_price,
-              last_price_at=excluded.last_price_at
+              last_price_at=excluded.last_price_at,
+              trigger_source=excluded.trigger_source,
+              monitor_plan_name=excluded.monitor_plan_name
             """,
             (
                 alert.id,
@@ -338,6 +522,7 @@ class AlertRepo:
                 alert.condition.value,
                 alert.threshold,
                 to_iso(alert.fire_at),
+                alert.decision_id,
                 alert.notification_channel,
                 alert.status.value,
                 alert.message,
@@ -348,9 +533,34 @@ class AlertRepo:
                 to_iso(alert.last_trigger_time),
                 alert._last_price,
                 to_iso(alert._last_price_at),
+                alert.trigger_source,
+                alert.monitor_plan_name,
             ),
         )
-        await conn.commit()
+
+    async def replace_monitor_plan(
+        self,
+        *,
+        name: str,
+        instrument: str,
+        decision_id: Optional[str],
+        alerts: list[Any],
+    ) -> None:
+        """Cancel the prior named plan and insert its replacement in one transaction."""
+        async with self.db.write_transaction(immediate=True) as conn:
+            await conn.execute(
+                """
+                UPDATE alerts
+                SET status = 'cancelled'
+                WHERE monitor_plan_name = ?
+                  AND instrument = ?
+                  AND decision_id IS ?
+                  AND status = 'active'
+                """,
+                (name, instrument, decision_id),
+            )
+            for alert in alerts:
+                await self._save_one(conn, alert)
 
     async def load_active(self) -> list[Any]:
         from .alerts import AlertCondition, AlertStatus, PriceAlert
@@ -377,6 +587,9 @@ class AlertRepo:
                 cooldown_seconds=row["cooldown_seconds"],
                 last_trigger_time=parse_iso(row["last_trigger_time"]),
                 fire_at=parse_iso(row["fire_at"]),
+                decision_id=row["decision_id"],
+                trigger_source=row["trigger_source"],
+                monitor_plan_name=row["monitor_plan_name"],
             )
             alert._last_price = row["last_price"]
             alert._last_price_at = parse_iso(row["last_price_at"])
@@ -423,6 +636,9 @@ class AlertRepo:
                 cooldown_seconds=row["cooldown_seconds"],
                 last_trigger_time=parse_iso(row["last_trigger_time"]),
                 fire_at=parse_iso(row["fire_at"]),
+                decision_id=row["decision_id"],
+                trigger_source=row["trigger_source"],
+                monitor_plan_name=row["monitor_plan_name"],
             )
             alert._last_price = row["last_price"]
             alert._last_price_at = parse_iso(row["last_price_at"])
@@ -435,18 +651,16 @@ class AlertRepo:
         last_price: float,
         last_price_at: Optional[datetime] = None,
     ) -> None:
-        conn = self.db.require_conn()
         stamp = to_iso(last_price_at or utc_now())
-        await conn.execute(
-            "UPDATE alerts SET last_price = ?, last_price_at = ? WHERE id = ?",
-            (last_price, stamp, alert_id),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                "UPDATE alerts SET last_price = ?, last_price_at = ? WHERE id = ?",
+                (last_price, stamp, alert_id),
+            )
 
     async def mark_cancelled(self, alert_id: str) -> None:
-        conn = self.db.require_conn()
-        await conn.execute("UPDATE alerts SET status = 'cancelled' WHERE id = ?", (alert_id,))
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute("UPDATE alerts SET status = 'cancelled' WHERE id = ?", (alert_id,))
 
     async def mark_triggered(self, alert: Any) -> None:
         await self.save(alert)
@@ -494,6 +708,12 @@ VALID_ACTIONS = {
     "edit_order",
     "edit_order_by_label",
     "close_position",
+    "move_stop",
+    "move_stop_to_breakeven",
+    "trail_stop",
+    "cancel_pending_setup",
+    "close_position_and_cancel_protection",
+    "replace_bracket",
     "create_combo",
     "hold",
     "observe",
@@ -501,6 +721,8 @@ VALID_ACTIONS = {
 
 VALID_OUTCOMES = {
     # Execution-state outcomes (what happened to the order itself).
+    "submitted",
+    "failed",
     "filled",
     "cancelled",
     "rejected",
@@ -549,26 +771,25 @@ class DecisionRepo:
     ) -> str:
         if action_taken not in VALID_ACTIONS:
             raise ValueError(f"Invalid action_taken: {action_taken}")
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            INSERT INTO decisions (
-              id, created_at, alert_id, instrument, reasoning, action_taken,
-              related_order_id, metadata_json, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                decision_id,
-                to_iso(utc_now()),
-                alert_id,
-                instrument.upper(),
-                reasoning,
-                action_taken,
-                related_order_id,
-                json.dumps(metadata) if metadata is not None else None,
-            ),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO decisions (
+                  id, created_at, alert_id, instrument, reasoning, action_taken,
+                  related_order_id, metadata_json, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    decision_id,
+                    to_iso(utc_now()),
+                    alert_id,
+                    instrument.upper(),
+                    reasoning,
+                    action_taken,
+                    related_order_id,
+                    json.dumps(metadata) if metadata is not None else None,
+                ),
+            )
         return decision_id
 
     async def exists(self, decision_id: Optional[str]) -> bool:
@@ -587,16 +808,15 @@ class DecisionRepo:
     ) -> None:
         if outcome not in VALID_OUTCOMES:
             raise ValueError(f"Invalid outcome: {outcome}")
-        conn = self.db.require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE decisions
-            SET outcome = ?, outcome_note = ?, outcome_recorded_at = ?
-            WHERE id = ?
-            """,
-            (outcome, outcome_note, to_iso(utc_now()), decision_id),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE decisions
+                SET outcome = ?, outcome_note = ?, outcome_recorded_at = ?
+                WHERE id = ?
+                """,
+                (outcome, outcome_note, to_iso(utc_now()), decision_id),
+            )
         if cursor.rowcount == 0:
             raise ValueError(f"Unknown decision_id: {decision_id}")
 
@@ -671,28 +891,31 @@ class OrderAuditRepo:
         decision_id: Optional[str] = None,
         client_order_id: Optional[str] = None,
     ) -> None:
-        conn = self.db.require_conn()
         client_order_id = client_order_id or request.get("client_order_id")
-        await conn.execute(
-            """
-            INSERT INTO order_audit (
-              created_at, tool_name, client_order_id, request_json, response_json, error,
-              deribit_order_id, deribit_order_ids_json, decision_id, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                to_iso(utc_now()),
-                tool_name,
-                client_order_id,
-                json.dumps(request, sort_keys=True, default=str),
-                json.dumps(response, sort_keys=True, default=str) if response is not None else None,
-                error,
-                deribit_order_id,
-                json.dumps(deribit_order_ids) if deribit_order_ids is not None else None,
-                decision_id,
-            ),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO order_audit (
+                  created_at, tool_name, client_order_id, request_json, response_json, error,
+                  deribit_order_id, deribit_order_ids_json, decision_id, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    to_iso(utc_now()),
+                    tool_name,
+                    client_order_id,
+                    json.dumps(request, sort_keys=True, default=str),
+                    (
+                        json.dumps(response, sort_keys=True, default=str)
+                        if response is not None
+                        else None
+                    ),
+                    error,
+                    deribit_order_id,
+                    json.dumps(deribit_order_ids) if deribit_order_ids is not None else None,
+                    decision_id,
+                ),
+            )
 
     async def find_by_client_order_id(self, client_order_id: str) -> Optional[dict[str, Any]]:
         conn = self.db.require_conn()
@@ -716,6 +939,31 @@ class OrderAuditRepo:
         row = await cursor.fetchone()
         if not row:
             return None
+        return self._row_to_dict(row)
+
+    async def find_successful_place_bracket_by_decision_id(
+        self,
+        decision_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Recover an accepted bracket after the short idempotency cache expires."""
+        conn = self.db.require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT * FROM order_audit
+            WHERE decision_id = ?
+              AND tool_name = 'place_bracket'
+              AND error IS NULL
+              AND response_json IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (decision_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
+    @staticmethod
+    def _row_to_dict(row: Any) -> dict[str, Any]:
         item = dict(row)
         if item.get("request_json"):
             item["request"] = json.loads(item["request_json"])
@@ -750,33 +998,31 @@ class IdempotencyRepo:
         return json.loads(row["response_json"])
 
     async def set(self, client_order_id: str, response: dict[str, Any]) -> None:
-        conn = self.db.require_conn()
         now = utc_now()
         expires = now + timedelta(seconds=self.ttl_seconds)
-        await conn.execute(
-            """
-            INSERT INTO idempotency_keys (
-              client_order_id, created_at, expires_at, response_json, schema_version
-            ) VALUES (?, ?, ?, ?, 1)
-            ON CONFLICT(client_order_id) DO UPDATE SET
-              expires_at=excluded.expires_at,
-              response_json=excluded.response_json
-            """,
-            (
-                client_order_id,
-                to_iso(now),
-                to_iso(expires),
-                json.dumps(response, sort_keys=True, default=str),
-            ),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO idempotency_keys (
+                  client_order_id, created_at, expires_at, response_json, schema_version
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(client_order_id) DO UPDATE SET
+                  expires_at=excluded.expires_at,
+                  response_json=excluded.response_json
+                """,
+                (
+                    client_order_id,
+                    to_iso(now),
+                    to_iso(expires),
+                    json.dumps(response, sort_keys=True, default=str),
+                ),
+            )
 
     async def prune_expired(self) -> None:
-        conn = self.db.require_conn()
-        await conn.execute(
-            "DELETE FROM idempotency_keys WHERE expires_at <= ?", (to_iso(utc_now()),)
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                "DELETE FROM idempotency_keys WHERE expires_at <= ?", (to_iso(utc_now()),)
+            )
 
 
 VALID_NOTE_CATEGORIES = {
@@ -833,26 +1079,25 @@ class NoteRepo:
         import uuid as _uuid
 
         note_id = str(_uuid.uuid4())
-        conn = self.db.require_conn()
-        await conn.execute(
-            """
-            INSERT INTO notes (
-              id, created_at, updated_at, category, instrument,
-              alert_id, decision_id, body, tags_json, schema_version
-            ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                note_id,
-                to_iso(utc_now()),
-                category,
-                instrument.upper() if instrument else None,
-                alert_id,
-                decision_id,
-                body,
-                _normalize_tags(tags),
-            ),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO notes (
+                  id, created_at, updated_at, category, instrument,
+                  alert_id, decision_id, body, tags_json, schema_version
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    note_id,
+                    to_iso(utc_now()),
+                    category,
+                    instrument.upper() if instrument else None,
+                    alert_id,
+                    decision_id,
+                    body,
+                    _normalize_tags(tags),
+                ),
+            )
         return note_id
 
     async def get(self, note_id: str) -> Optional[dict[str, Any]]:
@@ -890,15 +1135,13 @@ class NoteRepo:
             params.append(_normalize_tags(tags))
         params.append(note_id)
 
-        conn = self.db.require_conn()
-        cursor = await conn.execute(f"UPDATE notes SET {', '.join(sets)} WHERE id = ?", params)
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(f"UPDATE notes SET {', '.join(sets)} WHERE id = ?", params)
         return cursor.rowcount > 0
 
     async def delete(self, note_id: str) -> bool:
-        conn = self.db.require_conn()
-        cursor = await conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
         return cursor.rowcount > 0
 
     async def list(
@@ -1008,54 +1251,59 @@ class NewsRepo:
         if dedupe_key is not None and not dedupe_key.strip():
             raise ValueError("dedupe_key must be a non-empty string when provided")
 
-        conn = self.db.require_conn()
-        if dedupe_key:
-            cursor = await conn.execute("SELECT id FROM news WHERE dedupe_key = ?", (dedupe_key,))
-            row = await cursor.fetchone()
-            if row:
-                return (row["id"], False)
-
         try:
-            await conn.execute(
-                """
-                INSERT INTO news (
-                  id, created_at, status, source, instrument, headline, summary,
-                  url, score, dedupe_key, content_json, context_json, tags_json,
-                  model, notification_channel, pushed_at, error, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1)
-                """,
-                (
-                    news_id,
-                    to_iso(utc_now()),
-                    status,
-                    source,
-                    instrument,
-                    headline,
-                    summary,
-                    url,
-                    score,
-                    dedupe_key,
+            async with self.db.write_transaction() as conn:
+                if dedupe_key:
+                    cursor = await conn.execute(
+                        "SELECT id FROM news WHERE dedupe_key = ?", (dedupe_key,)
+                    )
+                    row = await cursor.fetchone()
+                    if row:
+                        return (row["id"], False)
+                await conn.execute(
+                    """
+                    INSERT INTO news (
+                      id, created_at, status, source, instrument, headline, summary,
+                      url, score, dedupe_key, content_json, context_json, tags_json,
+                      model, notification_channel, pushed_at, error, schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1)
+                    """,
                     (
-                        json.dumps(content, sort_keys=True, default=str)
-                        if content is not None
-                        else None
+                        news_id,
+                        to_iso(utc_now()),
+                        status,
+                        source,
+                        instrument,
+                        headline,
+                        summary,
+                        url,
+                        score,
+                        dedupe_key,
+                        (
+                            json.dumps(content, sort_keys=True, default=str)
+                            if content is not None
+                            else None
+                        ),
+                        (
+                            json.dumps(context, sort_keys=True, default=str)
+                            if context is not None
+                            else None
+                        ),
+                        (
+                            json.dumps(tags, sort_keys=True, default=str)
+                            if tags is not None
+                            else None
+                        ),
+                        model,
+                        notification_channel,
+                        error,
                     ),
-                    (
-                        json.dumps(context, sort_keys=True, default=str)
-                        if context is not None
-                        else None
-                    ),
-                    json.dumps(tags, sort_keys=True, default=str) if tags is not None else None,
-                    model,
-                    notification_channel,
-                    error,
-                ),
-            )
-            await conn.commit()
+                )
             return (news_id, True)
         except aiosqlite.IntegrityError:
             if not dedupe_key:
                 raise
+            conn = self.db.require_conn()
             cursor = await conn.execute("SELECT id FROM news WHERE dedupe_key = ?", (dedupe_key,))
             row = await cursor.fetchone()
             if row:
@@ -1119,15 +1367,14 @@ class NewsRepo:
         notification_channel: str,
         pushed_at: Optional[datetime] = None,
     ) -> None:
-        conn = self.db.require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE news
-            SET notification_channel = ?, pushed_at = ?
-            WHERE id = ?
-            """,
-            (notification_channel, to_iso(pushed_at or utc_now()), news_id),
-        )
-        await conn.commit()
+        async with self.db.write_transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE news
+                SET notification_channel = ?, pushed_at = ?
+                WHERE id = ?
+                """,
+                (notification_channel, to_iso(pushed_at or utc_now()), news_id),
+            )
         if cursor.rowcount == 0:
             raise ValueError(f"Unknown news_id: {news_id}")

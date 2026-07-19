@@ -122,6 +122,53 @@ async def test_place_otoco_uses_json_rpc_post_and_omits_none():
 
 
 @pytest.mark.asyncio
+async def test_place_oco_submits_reduce_only_pair_in_one_json_rpc_request():
+    client = RecordingClient(responses=[{"order": {"order_id": "sl-new"}}])
+
+    await client.place_oco(
+        side="sell",
+        instrument="BTC-PERPETUAL",
+        amount=10,
+        primary_type="stop_market",
+        secondary_type="take_market",
+        label="decision-1",
+        trigger_source="mark_price",
+        primary_trigger_price=75_000,
+        secondary_trigger_price=82_000,
+    )
+
+    method, params, kwargs = client.calls[0]
+    assert method == "private/sell"
+    assert params == {}
+    assert kwargs["http_method"] == "POST"
+    body = kwargs["json_body"]
+    assert body["params"]["linked_order_type"] == "one_cancels_other"
+    assert body["params"]["trigger_fill_condition"] == "incremental"
+    assert body["params"]["reduce_only"] is True
+    assert body["params"]["trigger_price"] == 75_000
+    assert body["params"]["otoco_config"] == [
+        {
+            "amount": 10,
+            "direction": "sell",
+            "type": "stop_market",
+            "label": "decision-1",
+            "reduce_only": True,
+            "trigger": "mark_price",
+            "trigger_price": 75_000,
+        },
+        {
+            "amount": 10,
+            "direction": "sell",
+            "type": "take_market",
+            "label": "decision-1",
+            "reduce_only": True,
+            "trigger": "mark_price",
+            "trigger_price": 82_000,
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_combo_json_rpc_methods_and_read_methods_route():
     client = RecordingClient(
         responses=[

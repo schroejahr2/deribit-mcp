@@ -23,6 +23,9 @@ dependencies = [
     "pydantic-settings>=2.0.0",
 ]
 
+[project.scripts]
+deribit-codex-bridge = "src.codex_event_bridge:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",

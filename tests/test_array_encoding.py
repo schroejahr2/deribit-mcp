@@ -28,8 +28,8 @@ class CapturingSession:
 
 
 class _CtxResp:
-    def __init__(self, payload: dict[str, Any]):
-        self.status = 200
+    def __init__(self, payload: dict[str, Any], status: int = 200):
+        self.status = status
         self.headers: dict[str, str] = {}
         self._payload = payload
 
@@ -117,3 +117,27 @@ async def test_post_path_keeps_native_bools_in_json_body():
     assert session.last_request is not None
     body = session.last_request["json"]
     assert body == {"flag": True, "name": "x"}, "POST body must keep native bools"
+
+
+@pytest.mark.asyncio
+async def test_error_data_string_is_reported_without_attribute_error():
+    client = DeribitRestClient()
+    client.access_token = "fake-token-for-test"
+    client.token_expiry = float("inf")
+    session = CapturingSession(
+        {
+            "error": {
+                "code": -32000,
+                "message": "Invalid params",
+                "data": "trigger_price is not editable for this order",
+            }
+        }
+    )
+    client.session = session  # type: ignore[assignment]
+
+    with pytest.raises(
+        Exception,
+        match="Deribit API error: Invalid params "
+        r"\(trigger_price is not editable for this order\)",
+    ):
+        await client._request("private/edit", {"order_id": "order-1", "trigger_price": 49_500})

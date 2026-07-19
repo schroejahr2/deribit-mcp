@@ -33,6 +33,14 @@ class DeribitAuthError(RuntimeError):
     """Raised when a private endpoint is invoked without a valid access token."""
 
 
+class DeribitAPIError(RuntimeError):
+    """Raised when Deribit accepts an RPC request but rejects the operation."""
+
+    def __init__(self, message: str, *, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+
 class DeribitRestClient:
     """REST API client for Deribit exchange."""
 
@@ -159,7 +167,13 @@ class DeribitRestClient:
                         err = data["error"] or {}
                         code = err.get("code")
                         msg = err.get("message", "Unknown error")
-                        reason = (err.get("data") or {}).get("reason")
+                        error_data = err.get("data")
+                        if isinstance(error_data, dict):
+                            reason = error_data.get("reason")
+                        elif error_data:
+                            reason = str(error_data)
+                        else:
+                            reason = None
                         detail = f"{msg} ({reason})" if reason else msg
 
                         rate_limited = code == RATE_LIMIT_ERROR_CODE or response.status == 429
@@ -177,7 +191,7 @@ class DeribitRestClient:
                             f"API error on {method}: {detail} "
                             f"(code={code}, HTTP {response.status})"
                         )
-                        raise Exception(f"Deribit API error: {detail}")
+                        raise DeribitAPIError(f"Deribit API error: {detail}", code=code)
 
                     if response.status == 429 and attempt <= MAX_RETRIES:
                         wait = float(response.headers.get("Retry-After", "") or backoff)
@@ -552,6 +566,87 @@ class DeribitRestClient:
             params["trigger_price"] = entry_trigger_price
         return await self._rpc(f"private/{side}", params)
 
+    async def place_oco(
+        self,
+        *,
+        side: str,
+        instrument: str,
+        amount: float,
+        primary_type: str,
+        secondary_type: str,
+        label: str,
+        trigger_source: str,
+        primary_trigger_price: Optional[float] = None,
+        primary_trigger_offset: Optional[float] = None,
+        primary_price: Optional[float] = None,
+        secondary_trigger_price: Optional[float] = None,
+        secondary_trigger_offset: Optional[float] = None,
+        secondary_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Place a native reduce-only OCO protection pair in one request.
+
+        Deribit requires exactly two entries in ``otoco_config`` for
+        ``linked_order_type=one_cancels_other``. The entries are the full-size
+        SL and TP legs; both use the same direction and label and are
+        reduce-only. Incremental fill handling keeps sibling amounts aligned
+        after a partial exit.
+        """
+        from .trading import validate_trigger_params
+
+        if side not in {"buy", "sell"}:
+            raise ValueError("side must be 'buy' or 'sell'")
+        validate_trigger_params(
+            primary_type,
+            trigger=trigger_source,
+            trigger_price=primary_trigger_price,
+            trigger_offset=primary_trigger_offset,
+            price=primary_price,
+        )
+        validate_trigger_params(
+            secondary_type,
+            trigger=trigger_source,
+            trigger_price=secondary_trigger_price,
+            trigger_offset=secondary_trigger_offset,
+            price=secondary_price,
+        )
+        primary = {
+            "amount": amount,
+            "direction": side,
+            "type": primary_type,
+            "label": label,
+            "price": primary_price,
+            "reduce_only": True,
+            "trigger": trigger_source,
+            "trigger_price": primary_trigger_price,
+            "trigger_offset": primary_trigger_offset,
+        }
+        secondary = {
+            "amount": amount,
+            "direction": side,
+            "type": secondary_type,
+            "label": label,
+            "price": secondary_price,
+            "reduce_only": True,
+            "trigger": trigger_source,
+            "trigger_price": secondary_trigger_price,
+            "trigger_offset": secondary_trigger_offset,
+        }
+        params: Dict[str, Any] = {
+            "instrument_name": instrument,
+            "amount": amount,
+            "type": primary_type,
+            "label": label,
+            "price": primary_price,
+            "reduce_only": True,
+            "trigger": trigger_source,
+            "trigger_price": primary_trigger_price,
+            "trigger_offset": primary_trigger_offset,
+            "linked_order_type": "one_cancels_other",
+            "trigger_fill_condition": "incremental",
+            "otoco_config": [primary, secondary],
+        }
+        return await self._rpc(f"private/{side}", params)
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel an order."""
         params = {"order_id": order_id}
@@ -562,19 +657,27 @@ class DeribitRestClient:
         order_id: str,
         amount: Optional[float] = None,
         price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        trigger_offset: Optional[float] = None,
         post_only: Optional[bool] = None,
         reject_post_only: Optional[bool] = None,
         reduce_only: Optional[bool] = None,
         advanced: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Edit an existing order."""
-        if amount is None and price is None:
-            raise ValueError("amount or price is required for edit_order")
+        if amount is None and price is None and trigger_price is None and trigger_offset is None:
+            raise ValueError(
+                "amount, price, trigger_price or trigger_offset is required for edit_order"
+            )
         params: Dict[str, Any] = {"order_id": order_id}
         if amount is not None:
             params["amount"] = amount
         if price is not None:
             params["price"] = price
+        if trigger_price is not None:
+            params["trigger_price"] = trigger_price
+        if trigger_offset is not None:
+            params["trigger_offset"] = trigger_offset
         if post_only is not None:
             params["post_only"] = post_only
         if reject_post_only is not None:
@@ -591,6 +694,7 @@ class DeribitRestClient:
         label: str,
         amount: Optional[float] = None,
         price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
         post_only: Optional[bool] = None,
         reject_post_only: Optional[bool] = None,
         reduce_only: Optional[bool] = None,
@@ -601,14 +705,16 @@ class DeribitRestClient:
             raise ValueError("instrument is required")
         if not label:
             raise ValueError("label is required")
-        if amount is None and price is None:
-            raise ValueError("amount or price is required for edit_order_by_label")
+        if amount is None and price is None and trigger_price is None:
+            raise ValueError("amount, price or trigger_price is required for edit_order_by_label")
 
         params: Dict[str, Any] = {"instrument_name": instrument, "label": label}
         if amount is not None:
             params["amount"] = amount
         if price is not None:
             params["price"] = price
+        if trigger_price is not None:
+            params["trigger_price"] = trigger_price
         if post_only is not None:
             params["post_only"] = post_only
         if reject_post_only is not None:
@@ -763,6 +869,16 @@ class DeribitRestClient:
         **filters: Any,
     ) -> List[Dict[str, Any]]:
         """Get user trades routed by currency or instrument with route-specific filters."""
+        page = await self.get_user_trades_page(currency, instrument, **filters)
+        return page["trades"]
+
+    async def get_user_trades_page(
+        self,
+        currency: Optional[str] = None,
+        instrument: Optional[str] = None,
+        **filters: Any,
+    ) -> Dict[str, Any]:
+        """Get one user-trade page without discarding Deribit's ``has_more`` flag."""
         if currency and instrument:
             raise ValueError("Specify either currency or instrument, not both")
         if not currency and not instrument:
@@ -802,7 +918,16 @@ class DeribitRestClient:
             params = {"currency": currency, **filters}
             result = await self._request("private/get_user_trades_by_currency", params)
 
-        return result.get("trades", []) if isinstance(result, dict) else result
+        if isinstance(result, dict):
+            trades = result.get("trades", [])
+            return {
+                "trades": trades if isinstance(trades, list) else [],
+                "has_more": bool(result.get("has_more")),
+            }
+        return {
+            "trades": result if isinstance(result, list) else [],
+            "has_more": False,
+        }
 
     async def get_settlement_history(
         self,
@@ -901,6 +1026,7 @@ class DeribitRestClient:
         end_timestamp: int,
         query: Optional[str] = None,
         count: Optional[int] = None,
+        continuation: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Get transaction log entries."""
         params: Dict[str, Any] = {
@@ -912,6 +1038,8 @@ class DeribitRestClient:
             params["query"] = query
         if count is not None:
             params["count"] = count
+        if continuation is not None:
+            params["continuation"] = continuation
         return await self._request("private/get_transaction_log", params)
 
     async def get_order_margin(self, order_ids: List[str]) -> Dict[str, Any]:

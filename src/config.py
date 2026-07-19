@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Transport / HTTP integration
     mcp_transport: str = "stdio"
     mcp_http_json_response: bool = False
+    mcp_http_stateless: bool = False
     mcp_shared_secret: str = ""
 
     # Persistence
@@ -42,6 +43,13 @@ class Settings(BaseSettings):
     deribit_event_admin_token: str = ""
     deribit_event_retention_days: int = 7
     deribit_event_stream_claim_seconds: int = 90
+    # Channel wakeup freshness: ``news_ready`` events older than this are NOT
+    # delivered to outbox consumers. Stops stale-news storms when a consumer
+    # reconnects or is re-registered after a long offline gap (the full
+    # retention-window backlog would otherwise replay as live wakeups).
+    # Order/trade and alert events are always delivered (durable catch-up).
+    # 0 disables the news freshness window (legacy: deliver all stored news).
+    deribit_news_max_delivery_age_hours: float = 6.0
     deribit_trading_event_outbox_enabled: bool = True
     deribit_trading_event_channels: str = (
         "user.changes.future.any.100ms,"
@@ -122,6 +130,8 @@ class Settings(BaseSettings):
             raise ValueError("DERIBIT_ALERT_STALE_THRESHOLD_SECONDS must be >= 0")
         if self.deribit_price_cache_max_age_seconds < 0:
             raise ValueError("DERIBIT_PRICE_CACHE_MAX_AGE_SECONDS must be >= 0")
+        if self.deribit_news_max_delivery_age_hours < 0:
+            raise ValueError("DERIBIT_NEWS_MAX_DELIVERY_AGE_HOURS must be >= 0")
         if self.deribit_trading_event_outbox_enabled:
             channels = [
                 channel.strip()

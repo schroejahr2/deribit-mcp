@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, MutableMapping
 
-from .alerts import AlertCondition, AlertManager
+from .alerts import AlertManager
 from .config import settings
 from .deribit_rest import DeribitRestClient
 from .deribit_ws import DeribitWebSocketClient
@@ -27,6 +27,7 @@ from .persistence import (
     OrderAuditRepo,
 )
 from .scheduler import TimeAlertScheduler
+from .trading_state import TradingStateBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,123 @@ class AppContext:
     scheduler: TimeAlertScheduler
     instrument_cache: Dict[str, tuple[float, dict[str, Any]]]
     market_stream_manager: MarketStreamManager
+    trading_state_builder: TradingStateBuilder
+    trading_locks: Dict[str, asyncio.Lock]
 
 
 CONSUMER_STALE_TTL_SECONDS = 3600
+
+
+async def _price_update_worker(
+    queue: asyncio.Queue[tuple[str, Dict[str, Any]]],
+    price_cache: MutableMapping[str, float],
+    alert_manager: AlertManager,
+) -> None:
+    """Process ticker updates in order without blocking the WebSocket reader."""
+    while True:
+        instrument, tick_data = await queue.get()
+        try:
+            price = next(
+                (
+                    tick_data[key]
+                    for key in ("mark_price", "last_price", "index_price")
+                    if tick_data.get(key) is not None
+                ),
+                None,
+            )
+            if price is None:
+                continue
+            numeric_price = float(price)
+            price_cache[instrument] = numeric_price
+            await alert_manager.process_price_update(instrument, tick_data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Error processing price update for %s: %s",
+                instrument,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            queue.task_done()
+
+
+def _trading_event_scope(data: Any) -> tuple[str | None, str | None]:
+    """Return an unambiguous instrument/decision scope for one WS batch."""
+
+    items: list[dict[str, Any]] = []
+    if isinstance(data, dict) and any(key in data for key in ("orders", "trades", "positions")):
+        for key in ("orders", "trades", "positions"):
+            value = data.get(key)
+            if isinstance(value, dict):
+                items.append(value)
+            elif isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+    elif isinstance(data, dict):
+        items.append(data)
+    elif isinstance(data, list):
+        items.extend(item for item in data if isinstance(item, dict))
+
+    instruments = {
+        str(item.get("instrument_name") or item.get("instrument")).upper()
+        for item in items
+        if item.get("instrument_name") or item.get("instrument")
+    }
+    decisions = {str(item.get("label")) for item in items if item.get("label")}
+    return (
+        next(iter(instruments)) if len(instruments) == 1 else None,
+        next(iter(decisions)) if len(decisions) == 1 else None,
+    )
+
+
+async def _trading_event_worker(
+    queue: asyncio.Queue[tuple[str, Any]],
+    event_outbox_repo: EventOutboxRepo,
+    trading_state_builder: TradingStateBuilder,
+) -> None:
+    """Project user-change batches without blocking the WebSocket reader."""
+
+    while True:
+        channel, data = await queue.get()
+        try:
+            instrument, decision_id = _trading_event_scope(data)
+            snapshot = None
+            try:
+                snapshot = await trading_state_builder.capture(
+                    instrument=instrument,
+                    decision_id=decision_id,
+                    include_day_pnl=bool(instrument),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to capture trading-event state for %s: %s",
+                    channel,
+                    exc,
+                    exc_info=True,
+                )
+            event_ids = await event_outbox_repo.insert_deribit_subscription_events(
+                channel,
+                data,
+                snapshot=snapshot,
+            )
+            if event_ids:
+                logger.info(
+                    "Wrote %d Deribit trading event(s) from %s to outbox",
+                    len(event_ids),
+                    channel,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Failed to write Deribit trading event from %s to outbox: %s",
+                channel,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            queue.task_done()
 
 
 async def _maintenance_reaper_loop(
@@ -187,8 +302,18 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
     event_outbox_repo = EventOutboxRepo(db)
     note_repo = NoteRepo(db)
     news_repo = NewsRepo(db)
+    rest_client = DeribitRestClient()
+    trading_state_builder = TradingStateBuilder(
+        rest_client,
+        decision_repo=decision_repo,
+        alert_repo=alert_repo,
+    )
 
-    notification_manager = NotificationManager(event_outbox_repo=event_outbox_repo)
+    notification_manager = NotificationManager(
+        event_outbox_repo=event_outbox_repo,
+        rest_client=rest_client,
+        trading_state_builder=trading_state_builder,
+    )
     logger.info("Available notification channels: %s", notification_manager.list_channels())
 
     if "telegram" in notification_manager.list_channels():
@@ -202,7 +327,6 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             logger.error("Telegram startup notification failed: %s", exc, exc_info=True)
 
     ws_client = DeribitWebSocketClient()
-    rest_client = DeribitRestClient()
     price_cache: MutableMapping[str, float] = PriceCache()
     instrument_cache: Dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -212,6 +336,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
         alert: Any,
         *,
         triggered_price: float | None = None,
+        price_snapshot: dict[str, float | None] | None = None,
     ) -> bool:
         try:
             result = await notification_manager.send_notification(
@@ -219,6 +344,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 message,
                 alert=alert,
                 triggered_price=triggered_price,
+                price_snapshot=price_snapshot,
             )
             if result:
                 logger.info("Notification sent via %s for alert %s", channel, alert.id)
@@ -234,19 +360,14 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
     market_stream_manager = MarketStreamManager(ws_client)
     reaper_task: asyncio.Task | None = None
     stale_alert_task: asyncio.Task | None = None
+    price_update_task: asyncio.Task | None = None
+    trading_event_task: asyncio.Task | None = None
+    price_update_queue: asyncio.Queue[tuple[str, Dict[str, Any]]] = asyncio.Queue()
+    trading_event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
-    async def on_price_update(instrument: str, tick_data: Dict[str, Any]):
-        try:
-            price = (
-                tick_data.get("mark_price")
-                or tick_data.get("last_price")
-                or tick_data.get("index_price")
-            )
-            if price:
-                price_cache[instrument] = float(price)
-                await alert_manager.process_price_update(instrument, float(price))
-        except Exception as exc:
-            logger.error("Error processing price update for %s: %s", instrument, exc, exc_info=True)
+    def on_price_update(instrument: str, tick_data: Dict[str, Any]) -> None:
+        trading_state_builder.observe_ticker(instrument, tick_data)
+        price_update_queue.put_nowait((instrument, dict(tick_data)))
 
     async def on_ws_state(state: str, payload: Dict[str, Any]) -> None:
         try:
@@ -279,24 +400,13 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             except Exception as exc:
                 logger.error("Alert refresh after WS reconnect failed: %s", exc, exc_info=True)
 
-    async def on_deribit_user_change(channel: str, data: Dict[str, Any]) -> None:
-        try:
-            event_ids = await event_outbox_repo.insert_deribit_subscription_events(channel, data)
-            if event_ids:
-                logger.info(
-                    "Wrote %d Deribit trading event(s) from %s to outbox",
-                    len(event_ids),
-                    channel,
-                )
-        except Exception as exc:
-            logger.error(
-                "Failed to write Deribit trading event from %s to outbox: %s",
-                channel,
-                exc,
-                exc_info=True,
-            )
+    async def on_deribit_user_change(channel: str, data: Any) -> None:
+        trading_event_queue.put_nowait((channel, data))
 
     try:
+        price_update_task = asyncio.create_task(
+            _price_update_worker(price_update_queue, price_cache, alert_manager)
+        )
         ws_client.set_price_update_callback(on_price_update)
         ws_client.set_state_callback(on_ws_state)
         await ws_client.connect()
@@ -308,6 +418,14 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             and settings.effective_api_key
             and settings.effective_api_secret
         ):
+            trading_event_task = asyncio.create_task(
+                _trading_event_worker(
+                    trading_event_queue,
+                    event_outbox_repo,
+                    trading_state_builder,
+                ),
+                name="deribit-trading-event-worker",
+            )
             for channel in _trading_event_channels():
                 try:
                     await ws_client.subscribe(channel, on_deribit_user_change)
@@ -334,11 +452,7 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
         await alert_manager.load_active(active_alerts)
         logger.info("Rehydrated %d active alerts from SQLite", len(active_alerts))
 
-        price_instruments = {
-            alert.instrument
-            for alert in active_alerts
-            if alert.condition != AlertCondition.TIME and alert.instrument
-        }
+        price_instruments = {alert.instrument for alert in active_alerts if alert.instrument}
         for instrument in sorted(price_instruments):
             await ws_client.subscribe_ticker(instrument, on_price_update)
             try:
@@ -349,8 +463,9 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                     or ticker.get("index_price")
                 )
                 if current_price:
+                    trading_state_builder.observe_ticker(instrument, ticker)
                     price_cache[instrument] = float(current_price)
-                    await alert_manager.process_price_update(instrument, float(current_price))
+                    await alert_manager.process_price_update(instrument, ticker)
             except Exception as exc:
                 logger.error("Initial price check failed for %s: %s", instrument, exc)
 
@@ -379,6 +494,8 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
             scheduler=scheduler,
             instrument_cache=instrument_cache,
             market_stream_manager=market_stream_manager,
+            trading_state_builder=trading_state_builder,
+            trading_locks={},
         )
         if hasattr(app_or_server, "state"):
             app_or_server.state.deribit = ctx
@@ -399,9 +516,21 @@ async def deribit_lifespan(app_or_server: Any) -> AsyncIterator[AppContext]:
                 await stale_alert_task
             except asyncio.CancelledError:
                 pass
+        if trading_event_task is not None:
+            trading_event_task.cancel()
+            try:
+                await trading_event_task
+            except asyncio.CancelledError:
+                pass
         await scheduler.stop()
         await market_stream_manager.stop()
         await ws_client.disconnect()
+        if price_update_task is not None:
+            price_update_task.cancel()
+            try:
+                await price_update_task
+            except asyncio.CancelledError:
+                pass
         await rest_client.disconnect()
         await db.close()
         logger.info("Shutdown complete")

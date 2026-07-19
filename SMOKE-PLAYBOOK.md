@@ -1032,14 +1032,13 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
 ### 18.A Bracket happy-path (market entry + SL + TP)
 
 ```
-18.A.1 mark = derebit-get_current_price(BTC-PERPETUAL).mark_price
-18.A.2 decision_id_br = derebit-record_decision(
-         instrument="BTC-PERPETUAL",
-         reasoning="Phase 18A bracket market long with SL/TP",
-         action_taken="place_bracket"
-       )
-18.A.3 br = derebit-place_bracket(
-         decision_id=decision_id_br,
+18.A.1 state = derebit-get_trading_state(instrument="BTC-PERPETUAL")
+       mark = state.market.mark_price
+18.A.2 br = derebit-place_bracket(
+         decision={
+           "reasoning": "Phase 18A one-call bracket market long with SL/TP",
+           "metadata": {"setup": "smoke", "risk_basis": "3% fixed stop"}
+         },
          instrument="BTC-PERPETUAL",
          side="buy",
          amount=10,
@@ -1049,18 +1048,30 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
          tp_type="take_market",
          tp_trigger_price=mark*1.03,
          trigger_source="mark_price",
+         expected_state_token=state.state_token,
          confirm_live_trade=true
        )
+       decision_id_br = br.decision_id
+       → assert br.decision_id is a non-empty string
+       → assert br.client_order_id is a non-empty string
        → assert br.entry_order_id is a non-empty string
        → assert br.child_order_ids has keys {"sl", "tp"}
        → assert br.child_order_ids_resolved is True
-         (False = trigger_history hydration timed out → see 18.A.4 fallback)
+         (False = trigger_history hydration timed out → see 18.A.3 fallback)
        → assert br.deribit_order_ids ==
                 [br.entry_order_id, br.child_order_ids.sl, br.child_order_ids.tp]
        → NOTE: br.result.order.oto_order_ids contains OTO-... slot refs.
          These are NOT cancelable; do NOT pass them to get_order_state /
          cancel_order. Use br.child_order_ids.{sl,tp} instead.
-18.A.4 # verify operative children via the hydrated ids
+       retry = derebit-place_bracket(
+         decision_id=br.decision_id,
+         instrument="BTC-PERPETUAL", side="buy", amount=10,
+         entry_type="market", sl_type="stop_market", sl_trigger_price=mark*0.97,
+         tp_type="take_market", tp_trigger_price=mark*1.03,
+         trigger_source="mark_price", confirm_live_trade=true
+       )
+       → assert retry.entry_order_id == br.entry_order_id (no duplicate submit)
+18.A.3 # verify operative children via the hydrated ids
        sl_id = br.child_order_ids.sl
        tp_id = br.child_order_ids.tp
        if br.child_order_ids_resolved:
@@ -1077,7 +1088,7 @@ notional-guard on SL/TP trigger prices, and reject-on-margin behavior.
          hist = derebit-get_trigger_order_history(currency="BTC", count=10)
          → assert any(e.label == decision_id_br for e in hist.entries)
          note "hydration timeout — children visible in trigger history"
-18.A.5 # cleanup: cancel SL+TP, close position
+18.A.4 # cleanup: cancel SL+TP, close position
        for cid in (sl_id, tp_id):
          if cid:
            try:
@@ -1556,6 +1567,50 @@ each confirmation in sequence and pause for their reply.
 
 ---
 
+## Phase 23 — Coherent state, semantic events, and managed protection
+
+Run this phase on testnet. Reuse a test decision and test position from the
+earlier phases when available; otherwise mark the mutating checks `SKIPPED`
+instead of opening a position solely for this phase.
+
+```
+23.1  get_trading_state(
+        instrument="BTC-PERPETUAL",
+        decision_id=<test decision>,
+        currency="BTC"
+      )
+      Verify:
+      - capture_id/captured_at/data_age_ms and per-source status are present
+      - positions, open_orders, orders_by_decision, account, market_data,
+        pnl, and risk are structured sections
+      - entry_status/sl_status/tp_status match the decision group
+      - pnl exposes entry/exit/unclassified fees and funding attribution
+      - risk exposes aggregate and decision attribution
+
+23.2  Create a decision-bound time alert and inspect its outbox event.
+      Verify event_type=timer_fired, monotonic event_sequence, the same
+      bounded snapshot shape, and snapshot-derived top-level statuses.
+      Remove the alert after delivery.
+
+23.3  If the test decision has an open protected position:
+      - verify_protection(decision_id)
+      - move_stop(decision_id, <strictly better trigger>, ...)
+      - retry the same client_order_id and verify no duplicate edit
+      - replace_bracket(decision_id, <better SL>, <valid TP>, ...)
+      - verify new SL/TP coverage before old ids disappear
+      - close_position_and_cancel_protection(decision_id, ...)
+      - if the first response is closing, retry the same client_order_id;
+        verify no duplicate close and eventual flat protection cleanup
+
+23.4  Negative checks:
+      - a worse stop is rejected
+      - a long sell stop_limit with limit above trigger is rejected
+      - a short buy stop_limit with limit below trigger is rejected
+      - replace_bracket never reports protection_gap=true
+```
+
+---
+
 ## Final report
 
 Print a structured summary:
@@ -1616,6 +1671,7 @@ Phase 21 (Tier-B Nice-to-have):
 Phase 22 (Operator handoff):
   22.A telegram path (op confirm):   PASS / FAIL / SKIPPED — op absent
   22.B persistence + restart:        PASS / FAIL / SKIPPED — op absent
+Phase 23 (State/events/protection):  PASS / FAIL / SKIPPED
 
 Total mutating tool calls:           ~N
 Total decisions recorded:            ~N

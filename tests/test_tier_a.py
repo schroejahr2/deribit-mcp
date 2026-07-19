@@ -151,6 +151,74 @@ async def test_get_open_orders_by_label_omits_empty_label_and_requires_currency(
 
 
 @pytest.mark.asyncio
+async def test_get_user_trades_page_preserves_has_more_and_legacy_list_shape():
+    client = RecordingClient(
+        responses=[
+            {"trades": [{"trade_id": "trade-1"}], "has_more": True},
+            {"trades": [{"trade_id": "trade-2"}], "has_more": False},
+        ]
+    )
+
+    page = await client.get_user_trades_page(
+        instrument="BTC-PERPETUAL",
+        start_timestamp=100,
+        end_timestamp=200,
+        count=100,
+    )
+    trades = await client.get_user_trades(currency="BTC", historical=False)
+
+    assert page == {"trades": [{"trade_id": "trade-1"}], "has_more": True}
+    assert trades == [{"trade_id": "trade-2"}]
+    assert client.calls == [
+        (
+            "private/get_user_trades_by_instrument",
+            {
+                "instrument_name": "BTC-PERPETUAL",
+                "start_timestamp": 100,
+                "end_timestamp": 200,
+                "count": 100,
+            },
+            {},
+        ),
+        (
+            "private/get_user_trades_by_currency",
+            {"currency": "BTC", "historical": False},
+            {},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_transaction_log_routes_continuation():
+    client = RecordingClient(responses=[{"logs": [], "continuation": 42}])
+
+    result = await client.get_transaction_log(
+        "BTC",
+        100,
+        200,
+        query="trade",
+        count=50,
+        continuation=21,
+    )
+
+    assert result["continuation"] == 42
+    assert client.calls == [
+        (
+            "private/get_transaction_log",
+            {
+                "currency": "BTC",
+                "start_timestamp": 100,
+                "end_timestamp": 200,
+                "query": "trade",
+                "count": 50,
+                "continuation": 21,
+            },
+            {},
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cancel_by_label_wraps_numeric_result():
     client = RecordingClient(responses=[2.0])
 
@@ -161,6 +229,26 @@ async def test_cancel_by_label_wraps_numeric_result():
         (
             "private/cancel_by_label",
             {"label": "decision-1", "currency": "BTC"},
+            {},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_order_routes_trigger_reprice_params():
+    client = RecordingClient(responses=[{"order": {"order_id": "order-1"}, "trades": []}])
+
+    result = await client.edit_order(
+        "order-1",
+        trigger_price=49_500,
+        trigger_offset=250,
+    )
+
+    assert result["order"]["order_id"] == "order-1"
+    assert client.calls == [
+        (
+            "private/edit",
+            {"order_id": "order-1", "trigger_price": 49_500, "trigger_offset": 250},
             {},
         )
     ]
@@ -186,6 +274,32 @@ async def test_edit_by_label_routes_params():
                 "label": "decision-1",
                 "price": 49_500,
                 "post_only": True,
+            },
+            {},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_by_label_routes_trigger_price():
+    client = RecordingClient(responses=[{"order": {"order_id": "order-1"}, "trades": []}])
+
+    result = await client.edit_by_label(
+        "BTC-PERPETUAL",
+        "decision-1",
+        amount=100,
+        trigger_price=49_500,
+    )
+
+    assert result["order"]["order_id"] == "order-1"
+    assert client.calls == [
+        (
+            "private/edit_by_label",
+            {
+                "instrument_name": "BTC-PERPETUAL",
+                "label": "decision-1",
+                "amount": 100,
+                "trigger_price": 49_500,
             },
             {},
         )

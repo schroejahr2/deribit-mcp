@@ -189,9 +189,23 @@ curl -s -X POST http://<host>:8000/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -50
 ```
 
-You should see ~60 tool names including `get_current_price`, `buy`,
-`sell`, `set_price_alert`, `daily_briefings`. If you see
+You should see the full tool catalog including `get_trading_state`, `get_decision_state`,
+`cancel_decision`, `upsert_monitor_plan`, `tighten_protection_by_label`, `buy`,
+`sell`, `place_bracket`, `move_stop`, `replace_bracket`, and `set_price_alert`. If you see
 `unauthorized`, the shared secret header is wrong.
+
+`place_bracket` supports the latency-sensitive one-call trade path. Pass exactly one of an
+inline `decision={reasoning, alert_id?, metadata?}` or an existing `decision_id`, plus the
+top-level order fields, latest `expected_state_token`, and `confirm_live_trade`. The server
+derives `action_taken=place_bracket`, uses the decision ID as the Deribit label/default
+idempotency key, and returns the decision, client, entry, and child order IDs together.
+Retries by either `decision_id` or `client_order_id` reconcile without placing a duplicate.
+
+`tighten_protection_by_label` edits ordinary fixed stops directly. For filled
+`place_bracket` protection whose OTOCO children use `trigger_fill_condition=incremental`,
+it automatically creates an exact two-leg, full-position, reduce-only SL/TP OCO pair,
+verifies the new coverage, and only then cancels the old children. The positive-net-PnL,
+state-token, trading-confirmation, amount/notional, and idempotency guards apply to both paths.
 
 ---
 

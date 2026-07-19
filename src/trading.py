@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -77,6 +78,44 @@ def instrument_family(meta: dict[str, Any]) -> str:
     if quote_currency == "USD" and settlement_currency and settlement_currency != "USD":
         return "inverse"
     return "linear"
+
+
+def position_order_amount(meta: dict[str, Any], position: dict[str, Any]) -> float:
+    """Return the absolute position size in Deribit's order-amount units.
+
+    Deribit reports futures ``size`` in quote currency and ``size_currency``
+    in base currency. Linear futures are ordered in base currency, while
+    inverse futures are ordered in quote currency; options use ``size``.
+    Keeping this conversion in one pure helper prevents protection coverage
+    and close-position guards from comparing unlike units.
+    """
+
+    family = instrument_family(meta)
+    if family == "linear":
+        raw_size = position.get("size_currency")
+        if raw_size is None:
+            raw_size = position.get("size")
+    else:
+        raw_size = position.get("size")
+        if raw_size is None:
+            raw_size = position.get("size_currency")
+
+    instrument = (
+        position.get("instrument_name") or meta.get("instrument_name") or "unknown instrument"
+    )
+    if raw_size is None:
+        raise TradingValidationError(f"Could not determine open position size for {instrument}")
+    if isinstance(raw_size, bool):
+        raise TradingValidationError(f"Invalid open position size for {instrument}: {raw_size!r}")
+    try:
+        amount = abs(float(raw_size))
+    except (TypeError, ValueError) as exc:
+        raise TradingValidationError(
+            f"Invalid open position size for {instrument}: {raw_size!r}"
+        ) from exc
+    if not math.isfinite(amount):
+        raise TradingValidationError(f"Invalid open position size for {instrument}: {raw_size!r}")
+    return amount
 
 
 def max_amount_for_family(family: str) -> Optional[float]:
@@ -246,6 +285,206 @@ PRICE_FORBIDDEN_TYPES = frozenset(
 )
 SUPPORTED_ORDER_TYPES = {"limit", "market", "market_limit"} | TRIGGER_ORDER_TYPES
 VALID_TRIGGER_VALUES = frozenset({"index_price", "mark_price", "last_price"})
+STOP_LOSS_ORDER_TYPES = frozenset({"stop_market", "stop_limit", "trailing_stop"})
+TAKE_PROFIT_ORDER_TYPES = frozenset({"take_market", "take_limit"})
+ACTIVE_ORDER_STATES = frozenset({"open", "untriggered"})
+TERMINAL_ORDER_STATES = frozenset({"filled", "cancelled", "rejected"})
+
+
+def _finite_number(
+    value: Any,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
+    if isinstance(value, bool):
+        raise TradingValidationError(f"{name} must be a finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TradingValidationError(f"{name} must be a finite number") from exc
+    if not math.isfinite(numeric):
+        raise TradingValidationError(f"{name} must be a finite number")
+    if positive and numeric <= 0:
+        raise TradingValidationError(f"{name} must be greater than zero")
+    if nonnegative and numeric < 0:
+        raise TradingValidationError(f"{name} must be greater than or equal to zero")
+    return numeric
+
+
+def _position_side(position_direction: str) -> str:
+    direction = str(position_direction or "").lower()
+    if direction in {"buy", "long"}:
+        return "long"
+    if direction in {"sell", "short"}:
+        return "short"
+    raise TradingValidationError("position_direction must be buy/long or sell/short")
+
+
+def classify_order_role_status(
+    order: dict[str, Any],
+    *,
+    position_open: Optional[bool] = None,
+    primary_order_state: Optional[str] = None,
+) -> dict[str, str]:
+    """Classify one Deribit order into a stable trading role and lifecycle.
+
+    ``is_secondary_oto`` children are conservatively considered dormant until
+    either the primary is known to have filled/triggered or an open position is
+    confirmed. Regular open/untriggered stops are active protection, not
+    dormant orders.
+    """
+
+    order_type = str(order.get("order_type") or order.get("type") or "").lower()
+    reduce_only = order.get("reduce_only") is True
+    if not reduce_only:
+        role = "entry"
+    elif order_type in STOP_LOSS_ORDER_TYPES:
+        role = "sl"
+    elif order_type in TAKE_PROFIT_ORDER_TYPES:
+        role = "tp"
+    elif order_type in {"market", "market_limit", "limit"}:
+        role = "exit"
+    else:
+        role = "unknown"
+
+    raw_state = str(order.get("order_state") or order.get("state") or "").lower()
+    if raw_state in TERMINAL_ORDER_STATES:
+        status = raw_state
+    elif raw_state == "triggered":
+        status = "triggered"
+    elif raw_state in ACTIVE_ORDER_STATES:
+        if order.get("is_secondary_oto") is True:
+            primary_state = str(primary_order_state or "").lower()
+            if primary_state in {"filled", "triggered"}:
+                status = "active"
+            elif primary_state in ACTIVE_ORDER_STATES:
+                status = "dormant"
+            elif position_open is True:
+                status = "active"
+            else:
+                status = "dormant"
+        else:
+            status = "active"
+    else:
+        status = "unknown"
+    return {"role": role, "status": status}
+
+
+def validate_stop_improvement(
+    position_direction: str,
+    current_trigger: float,
+    new_trigger: float,
+    *,
+    current_price: float,
+) -> None:
+    """Reject stop changes that loosen protection or cross the live price.
+
+    Equality is accepted so a replay of an already-applied edit remains a safe
+    no-op. A long stop must move upward and stay below the live trigger-source
+    price; a short stop must move downward and stay above it.
+    """
+
+    side = _position_side(position_direction)
+    current = _finite_number(current_trigger, "current_trigger", positive=True)
+    proposed = _finite_number(new_trigger, "new_trigger", positive=True)
+    live = _finite_number(current_price, "current_price", positive=True)
+
+    if side == "long":
+        if proposed < current:
+            raise TradingValidationError(
+                f"new stop {proposed:g} would worsen long protection below "
+                f"current trigger {current:g}"
+            )
+        if proposed >= live:
+            raise TradingValidationError(
+                f"new stop {proposed:g} must stay below current price {live:g} "
+                "for a long position"
+            )
+        return
+
+    if proposed > current:
+        raise TradingValidationError(
+            f"new stop {proposed:g} would worsen short protection above "
+            f"current trigger {current:g}"
+        )
+    if proposed <= live:
+        raise TradingValidationError(
+            f"new stop {proposed:g} must stay above current price {live:g} " "for a short position"
+        )
+
+
+def breakeven_trigger(
+    position_direction: str,
+    average_price: float,
+    offset: float = 0.0,
+) -> float:
+    """Return a directional break-even stop target in instrument price units."""
+
+    side = _position_side(position_direction)
+    entry = _finite_number(average_price, "average_price", positive=True)
+    adjustment = _finite_number(offset, "offset", nonnegative=True)
+    target = entry + adjustment if side == "long" else entry - adjustment
+    if target <= 0:
+        raise TradingValidationError("breakeven trigger must be greater than zero")
+    return target
+
+
+def validate_trailing_distance(current_distance: float, new_distance: float) -> None:
+    """Reject a server-side trailing-stop edit that would widen its distance."""
+
+    current = _finite_number(current_distance, "current_distance", positive=True)
+    proposed = _finite_number(new_distance, "new_distance", positive=True)
+    if proposed > current:
+        raise TradingValidationError(
+            f"new trailing distance {proposed:g} would worsen protection above "
+            f"current distance {current:g}"
+        )
+
+
+def validate_bracket_price_geometry(
+    *,
+    side: str,
+    entry_price: float,
+    sl_trigger_price: Optional[float],
+    tp_trigger_price: float,
+) -> None:
+    """Require fixed bracket exits to remain protective around the entry.
+
+    ``sl_trigger_price`` is optional for a native trailing stop, whose positive
+    distance is validated separately. Equality is rejected because it can make
+    a child trigger immediately as soon as the entry fills.
+    """
+
+    entry = _finite_number(entry_price, "entry_price", positive=True)
+    take = _finite_number(tp_trigger_price, "tp_trigger_price", positive=True)
+    stop = (
+        None
+        if sl_trigger_price is None
+        else _finite_number(sl_trigger_price, "sl_trigger_price", positive=True)
+    )
+    if side == "buy":
+        if stop is not None and stop >= entry:
+            raise TradingValidationError(
+                f"long stop-loss trigger {stop:g} must stay below entry price {entry:g}"
+            )
+        if take <= entry:
+            raise TradingValidationError(
+                f"long take-profit trigger {take:g} must stay above entry price {entry:g}"
+            )
+        return
+    if side == "sell":
+        if stop is not None and stop <= entry:
+            raise TradingValidationError(
+                f"short stop-loss trigger {stop:g} must stay above entry price {entry:g}"
+            )
+        if take >= entry:
+            raise TradingValidationError(
+                f"short take-profit trigger {take:g} must stay below entry price {entry:g}"
+            )
+        return
+    raise TradingValidationError("side must be 'buy' or 'sell'")
 
 
 def validate_trigger_params(
@@ -349,23 +588,7 @@ async def enforce_close_position_limit(app_ctx: Any, instrument: str) -> None:
         raise TradingValidationError(f"Could not load position for {instrument}")
 
     family = instrument_family(meta)
-    # Deribit `size` units differ by family: futures report `size` in quote
-    # currency (USD), with `size_currency` carrying the base-currency amount.
-    # Linear order amounts are denominated in base currency, so the guard must
-    # compare against `size_currency`; inverse amounts are USD (`size`); option
-    # `size` is already base currency.
-    if family == "linear":
-        raw_size = position.get("size_currency")
-        if raw_size is None:
-            raw_size = position.get("size")
-    else:
-        raw_size = position.get("size")
-        if raw_size is None:
-            raw_size = position.get("size_currency")
-    if raw_size is None:
-        raise TradingValidationError(f"Could not determine open position size for {instrument}")
-
-    amount = abs(float(raw_size))
+    amount = position_order_amount(meta, position)
     if amount == 0:
         return
 
